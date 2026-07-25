@@ -3749,8 +3749,17 @@ class MemoryStore:
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
-    async def list_memory_buckets(self, limit: int = 160) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._list_memory_buckets_sync, limit)
+    async def list_memory_buckets(
+        self,
+        limit: int = 160,
+        *,
+        include_raw_events: bool = False,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._list_memory_buckets_sync,
+            limit,
+            include_raw_events,
+        )
 
     async def preferred_private_session_id(self, user_id: str) -> str:
         return await asyncio.to_thread(self._preferred_private_session_id_sync, user_id)
@@ -3782,20 +3791,15 @@ class MemoryStore:
                 return clean_text(row["session_id"], 200)
         return ""
 
-    def _list_memory_buckets_sync(self, limit: int) -> list[dict[str, Any]]:
+    def _list_memory_buckets_sync(
+        self,
+        limit: int,
+        include_raw_events: bool = False,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT
-                    scope,
-                    target_id,
-                    target_name,
-                    sample_session_id,
-                    sample_group_id,
-                    COUNT(*) AS memory_count,
-                    SUM(CASE WHEN lifecycle='archived' THEN 1 ELSE 0 END) AS archived_count,
-                    MAX(occurred_at) AS latest_at
-                FROM (
+                WITH normalized AS (
                     SELECT
                         scope,
                         CASE
@@ -3827,20 +3831,99 @@ class MemoryStore:
                         END AS target_name,
                         session_id AS sample_session_id,
                         group_id AS sample_group_id,
+                        CASE
+                            WHEN json_valid(metadata)
+                                 AND COALESCE(CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT), '') NOT IN ('', 'self')
+                            THEN CAST(json_extract(metadata, '$.owner_bot_id') AS TEXT)
+                            WHEN subject_kind='bot' AND subject_id NOT IN ('', 'self') THEN subject_id
+                            WHEN object_kind='bot' AND object_id NOT IN ('', 'self') THEN object_id
+                            ELSE ''
+                        END AS sample_bot_id,
                         review_status,
                         lifecycle,
+                        visibility,
+                        CASE
+                            WHEN lifecycle!='archived'
+                                 AND visibility!='internal'
+                                 AND (?=1 OR lifecycle!='raw_event')
+                            THEN 1
+                            ELSE 0
+                        END AS is_searchable,
                         occurred_at
                     FROM memories
                     WHERE scope IN ('private', 'group')
                       AND review_status!='pending'
+                ), ranked AS (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY scope, target_id, sample_bot_id
+                            ORDER BY
+                                CASE
+                                    WHEN is_searchable=1 THEN 0
+                                    ELSE 1
+                                END ASC,
+                                occurred_at DESC,
+                                sample_session_id DESC
+                        ) AS sample_rank,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY scope, target_id, sample_bot_id
+                            ORDER BY
+                                CASE WHEN target_name!='' THEN 0 ELSE 1 END ASC,
+                                occurred_at DESC,
+                                sample_session_id DESC
+                        ) AS name_rank
+                    FROM normalized
+                    WHERE target_id!=''
                 )
-                WHERE target_id!=''
-                GROUP BY scope, target_id
-                ORDER BY scope ASC, latest_at DESC
-                    LIMIT ?
-                    """,
-                    (max(1, int(limit)) * 4,),
-                ).fetchall()
+                SELECT
+                    scope,
+                    target_id,
+                    MAX(CASE WHEN name_rank=1 THEN target_name ELSE '' END) AS target_name,
+                    MAX(CASE WHEN name_rank=1 THEN occurred_at ELSE '' END) AS name_latest_at,
+                    MAX(CASE WHEN sample_rank=1 THEN sample_session_id ELSE '' END) AS sample_session_id,
+                    MAX(CASE WHEN sample_rank=1 THEN sample_group_id ELSE '' END) AS sample_group_id,
+                    sample_bot_id,
+                    COUNT(*) AS memory_count,
+                    SUM(CASE WHEN lifecycle='archived' THEN 1 ELSE 0 END) AS archived_count,
+                    SUM(
+                        is_searchable
+                    ) AS searchable_count,
+                    MAX(
+                        CASE
+                            WHEN is_searchable=1 THEN occurred_at
+                            ELSE ''
+                        END
+                    ) AS active_latest_at,
+                    MAX(occurred_at) AS latest_at
+                FROM ranked
+                GROUP BY scope, target_id, sample_bot_id
+                ORDER BY
+                    scope ASC,
+                    CASE
+                        WHEN MAX(
+                            CASE
+                                WHEN is_searchable=1 THEN occurred_at
+                                ELSE ''
+                            END
+                        )!='' THEN 0
+                        ELSE 1
+                    END ASC,
+                    COALESCE(
+                        NULLIF(
+                            MAX(
+                                CASE
+                                    WHEN is_searchable=1 THEN occurred_at
+                                    ELSE ''
+                                END
+                            ),
+                            ''
+                        ),
+                        MAX(occurred_at)
+                    ) DESC
+                """,
+                (1 if include_raw_events else 0,),
+            ).fetchall()
             merged: dict[tuple[str, str], dict[str, Any]] = {}
             for raw in rows:
                 bucket = dict(raw)
@@ -3850,25 +3933,122 @@ class MemoryStore:
                 if parsed_scope == scope and clean_text(parsed_target, 120):
                     target_id = clean_text(parsed_target, 120)
                 key = (scope, target_id)
+                sample_context = {
+                    "bot_id": clean_text(bucket.get("sample_bot_id"), 120),
+                    "session_id": clean_text(bucket.get("sample_session_id"), 200),
+                    "group_id": clean_text(bucket.get("sample_group_id"), 120),
+                    "memory_count": int(bucket.get("memory_count") or 0),
+                    "archived_count": int(bucket.get("archived_count") or 0),
+                    "searchable_count": int(bucket.get("searchable_count") or 0),
+                    "active_latest_at": clean_text(bucket.get("active_latest_at"), 80),
+                    "latest_at": clean_text(bucket.get("latest_at"), 80),
+                }
+                candidate_priority = (
+                    bool(sample_context["active_latest_at"]),
+                    sample_context["active_latest_at"] or sample_context["latest_at"],
+                )
                 current = merged.get(key)
                 if current is None:
                     bucket["target_id"] = target_id
+                    bucket["sample_contexts"] = [sample_context]
+                    bucket["_sample_has_active"] = candidate_priority[0]
+                    bucket["_sample_latest_at"] = candidate_priority[1]
+                    bucket["_name_latest_at"] = clean_text(bucket.get("name_latest_at"), 80)
                     merged[key] = bucket
                     continue
                 current["memory_count"] = int(current.get("memory_count") or 0) + int(bucket.get("memory_count") or 0)
                 current["archived_count"] = int(current.get("archived_count") or 0) + int(bucket.get("archived_count") or 0)
-                if clean_text(bucket.get("latest_at"), 80) > clean_text(current.get("latest_at"), 80):
-                    current["latest_at"] = bucket.get("latest_at")
+                current["searchable_count"] = int(current.get("searchable_count") or 0) + int(bucket.get("searchable_count") or 0)
+                current["active_latest_at"] = max(
+                    clean_text(current.get("active_latest_at"), 80),
+                    clean_text(bucket.get("active_latest_at"), 80),
+                )
+                current["latest_at"] = max(
+                    clean_text(current.get("latest_at"), 80),
+                    clean_text(bucket.get("latest_at"), 80),
+                )
+                current_priority = (
+                    bool(current.get("_sample_has_active")),
+                    clean_text(current.get("_sample_latest_at"), 80),
+                )
+                if candidate_priority > current_priority:
                     current["sample_session_id"] = bucket.get("sample_session_id")
                     current["sample_group_id"] = bucket.get("sample_group_id")
+                    current["sample_bot_id"] = bucket.get("sample_bot_id")
+                    current["_sample_has_active"] = candidate_priority[0]
+                    current["_sample_latest_at"] = candidate_priority[1]
+                contexts = current.setdefault("sample_contexts", [])
+                existing_context = next(
+                    (
+                        item
+                        for item in contexts
+                        if clean_text(item.get("bot_id"), 120) == sample_context["bot_id"]
+                    ),
+                    None,
+                )
+                if existing_context is None:
+                    contexts.append(sample_context)
+                else:
+                    existing_priority = (
+                        bool(clean_text(existing_context.get("active_latest_at"), 80)),
+                        clean_text(existing_context.get("active_latest_at"), 80)
+                        or clean_text(existing_context.get("latest_at"), 80),
+                    )
+                    existing_context["memory_count"] = int(existing_context.get("memory_count") or 0) + sample_context["memory_count"]
+                    existing_context["archived_count"] = int(existing_context.get("archived_count") or 0) + sample_context["archived_count"]
+                    existing_context["searchable_count"] = int(existing_context.get("searchable_count") or 0) + sample_context["searchable_count"]
+                    existing_context["active_latest_at"] = max(
+                        clean_text(existing_context.get("active_latest_at"), 80),
+                        sample_context["active_latest_at"],
+                    )
+                    existing_context["latest_at"] = max(
+                        clean_text(existing_context.get("latest_at"), 80),
+                        sample_context["latest_at"],
+                    )
+                    if candidate_priority > existing_priority:
+                        existing_context["session_id"] = sample_context["session_id"]
+                        existing_context["group_id"] = sample_context["group_id"]
                 candidate_name = clean_text(bucket.get("target_name"), 120)
-                if candidate_name and candidate_name not in {target_id, clean_text(bucket.get("sample_session_id"), 200)}:
+                candidate_name_at = clean_text(bucket.get("name_latest_at"), 80)
+                current_name = clean_text(current.get("target_name"), 120)
+                current_name_at = clean_text(current.get("_name_latest_at"), 80)
+                if (
+                    candidate_name
+                    and candidate_name not in {target_id, clean_text(bucket.get("sample_session_id"), 200)}
+                    and (not current_name or candidate_name_at > current_name_at)
+                ):
                     current["target_name"] = candidate_name
+                    current["_name_latest_at"] = candidate_name_at
             buckets = list(merged.values())
-            buckets.sort(key=lambda item: clean_text(item.get("latest_at"), 80), reverse=True)
-            buckets.sort(key=lambda item: clean_text(item.get("scope"), 40))
+            for bucket in buckets:
+                contexts = bucket.get("sample_contexts") or []
+                contexts.sort(
+                    key=lambda item: (
+                        bool(clean_text(item.get("active_latest_at"), 80)),
+                        clean_text(item.get("active_latest_at"), 80)
+                        or clean_text(item.get("latest_at"), 80),
+                    ),
+                    reverse=True,
+                )
+                bucket.pop("_sample_has_active", None)
+                bucket.pop("_sample_latest_at", None)
+                bucket.pop("_name_latest_at", None)
+                bucket.pop("name_latest_at", None)
+            buckets.sort(
+                key=lambda item: (
+                    bool(int(item.get("searchable_count") or 0)),
+                    clean_text(item.get("active_latest_at"), 80)
+                    or clean_text(item.get("latest_at"), 80),
+                    clean_text(item.get("scope"), 40),
+                    clean_text(item.get("target_id"), 160),
+                ),
+                reverse=True,
+            )
             buckets = buckets[: max(1, int(limit))]
             for bucket in buckets:
+                bucket.pop("active_latest_at", None)
+                for context in bucket.get("sample_contexts") or []:
+                    context.pop("active_latest_at", None)
                 bucket["target_name"] = self._resolve_bucket_target_name_sync(
                     clean_text(bucket.get("scope"), 40),
                     clean_text(bucket.get("target_id"), 160),

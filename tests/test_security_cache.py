@@ -8,6 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,7 @@ if "quart" not in sys.modules:
     quart_stub.send_file = _send_file
     sys.modules["quart"] = quart_stub
 
+import astrbot_plugin_remember_you.page_api as page_api_module
 from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SessionContext
 from astrbot_plugin_remember_you.core.service import MemoryCompanionService
 from astrbot_plugin_remember_you.page_api import PluginPageApi
@@ -42,6 +44,23 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addCleanup(service.close)
         return service
+
+    async def page_search(self, payload: dict):
+        service = SimpleNamespace(
+            search_with_diagnostics=AsyncMock(return_value=([], [])),
+        )
+        api = PluginPageApi(SimpleNamespace(service=service))
+        fake_request = SimpleNamespace(get_json=AsyncMock(return_value=payload))
+
+        class JsonResponse(dict):
+            status_code = 200
+
+        with (
+            patch.object(page_api_module, "request", fake_request),
+            patch.object(page_api_module, "jsonify", side_effect=lambda body: JsonResponse(body)),
+        ):
+            response = await api.search()
+        return response, service.search_with_diagnostics
 
     @staticmethod
     def group_memory(content: str = "唯一锚点蓝风铃") -> MemoryRecord:
@@ -125,6 +144,257 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         before = await service.store.memory_revision()
         await service.store.mark_accessed([memory_id])
         self.assertEqual(before, await service.store.memory_revision())
+
+    async def test_page_search_without_context_uses_authenticated_admin_scope(self) -> None:
+        response, search = await self.page_search({"query": "显微镜锚点", "scope": "unknown"})
+
+        self.assertTrue(search.await_args.kwargs["admin_read_all"])
+        context = search.await_args.args[1]
+        self.assertEqual("unknown", context.scope)
+        self.assertEqual("", context.session_id)
+        self.assertEqual("all", response["search_context"]["mode"])
+
+        response, search = await self.page_search(
+            {
+                "query": "显微镜锚点",
+                "context_mode": "all",
+                "bot_id": "不应进入管理检索上下文",
+            }
+        )
+        context = search.await_args.args[1]
+        self.assertEqual("", context.bot_id)
+        self.assertEqual("", response["search_context"]["bot_id"])
+
+    async def test_page_search_preserves_private_and_group_visibility_contexts(self) -> None:
+        cases = (
+            (
+                {
+                    "query": "私聊锚点",
+                    "scope": "private",
+                    "session_id": "qq:FriendMessage:u1",
+                    "user_id": "u1",
+                    "bot_id": "bot-private",
+                    "admin_read_all": True,
+                },
+                "private",
+                "u1",
+                "",
+                "bot-private",
+            ),
+            (
+                {
+                    "query": "群聊锚点",
+                    "context_mode": "session",
+                    "scope": "group",
+                    "session_id": "qq:GroupMessage:g1",
+                    "group_id": "g1",
+                    "bot_id": "bot-group",
+                    "admin_read_all": True,
+                },
+                "group",
+                "",
+                "g1",
+                "bot-group",
+            ),
+        )
+        for payload, scope, user_id, group_id, bot_id in cases:
+            with self.subTest(scope=scope):
+                response, search = await self.page_search(payload)
+                self.assertFalse(search.await_args.kwargs["admin_read_all"])
+                context = search.await_args.args[1]
+                self.assertEqual(scope, context.scope)
+                self.assertEqual(user_id, context.user_id)
+                self.assertEqual(group_id, context.group_id)
+                self.assertEqual(bot_id, context.bot_id)
+                self.assertEqual("session", response["search_context"]["mode"])
+                self.assertEqual(bot_id, response["search_context"]["bot_id"])
+
+    async def test_page_search_rejects_incomplete_or_invalid_context_intent(self) -> None:
+        for payload in (
+            {"query": "锚点", "context_mode": "session", "scope": "private"},
+            {"query": "锚点", "scope": "group"},
+            {"query": "锚点", "bot_id": "bot-without-session"},
+            {
+                "query": "锚点",
+                "context_mode": "session",
+                "scope": "group",
+                "session_id": "qq:FriendMessage:u1",
+                "group_id": "g1",
+            },
+            {
+                "query": "锚点",
+                "context_mode": "session",
+                "scope": "private",
+                "session_id": "qq:FriendMessage:u1",
+                "user_id": "u2",
+            },
+            {"query": "锚点", "context_mode": "invalid"},
+        ):
+            with self.subTest(payload=payload):
+                response, search = await self.page_search(payload)
+                self.assertEqual(400, response.status_code)
+                search.assert_not_awaited()
+
+    async def test_session_diagnostics_uses_bucket_bot_owner(self) -> None:
+        service = self.make_service({"retrieval": {"mode": "basic"}})
+        first = self.group_memory("多 Bot 甲号所有权锚点")
+        first.id = "multi-bot-a"
+        first.occurred_at = "2026-07-20T10:00:00+00:00"
+        first.metadata = {"owner_bot_id": "bot-a"}
+        first_id = await service.store.insert_memory(first)
+        second = self.group_memory("多 Bot 乙号所有权锚点")
+        second.id = "multi-bot-b"
+        second.occurred_at = "2026-07-21T10:00:00+00:00"
+        second.metadata = {"owner_bot_id": "bot-b"}
+        second_id = await service.store.insert_memory(second)
+        archived = self.group_memory("已归档 Bot 不得抢占样本")
+        archived.id = "multi-bot-archived"
+        archived.occurred_at = "2026-07-25T10:00:00+00:00"
+        archived.lifecycle = "archived"
+        archived.metadata = {"owner_bot_id": "bot-archived"}
+        await service.store.insert_memory(archived)
+        internal = self.group_memory("内部记录不得生成可检索上下文")
+        internal.id = "multi-bot-internal"
+        internal.occurred_at = "2026-07-26T10:00:00+00:00"
+        internal.visibility = "internal"
+        internal.metadata = {"owner_bot_id": "bot-internal"}
+        await service.store.insert_memory(internal)
+        raw_event = self.group_memory("默认关闭的原始事件不得生成可检索上下文")
+        raw_event.id = "multi-bot-raw-event"
+        raw_event.occurred_at = "2026-07-27T10:00:00+00:00"
+        raw_event.lifecycle = "raw_event"
+        raw_event.metadata = {"owner_bot_id": "bot-raw"}
+        await service.store.insert_memory(raw_event)
+
+        buckets = await service.store.list_memory_buckets()
+        bucket = next(item for item in buckets if item["target_id"] == "g1")
+        self.assertEqual("bot-b", bucket["sample_bot_id"])
+        contexts = {item["bot_id"]: item for item in bucket["sample_contexts"]}
+        self.assertEqual(
+            {"bot-a", "bot-b", "bot-archived", "bot-internal", "bot-raw"},
+            set(contexts),
+        )
+        self.assertEqual(2, bucket["searchable_count"])
+        self.assertEqual(1, contexts["bot-a"]["searchable_count"])
+        self.assertEqual(1, contexts["bot-b"]["searchable_count"])
+        self.assertEqual(0, contexts["bot-archived"]["searchable_count"])
+        self.assertEqual(0, contexts["bot-internal"]["searchable_count"])
+        self.assertEqual(0, contexts["bot-raw"]["searchable_count"])
+
+        raw_enabled_buckets = await service.store.list_memory_buckets(
+            include_raw_events=True,
+        )
+        raw_enabled_bucket = next(
+            item for item in raw_enabled_buckets if item["target_id"] == "g1"
+        )
+        raw_enabled_contexts = {
+            item["bot_id"]: item for item in raw_enabled_bucket["sample_contexts"]
+        }
+        self.assertEqual("bot-raw", raw_enabled_bucket["sample_bot_id"])
+        self.assertEqual(1, raw_enabled_contexts["bot-raw"]["searchable_count"])
+
+        first_context = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            bot_id="bot-a",
+        )
+        second_context = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            bot_id="bot-b",
+        )
+        other_context = SessionContext(
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            platform="qq",
+            group_id="g1",
+            bot_id="bot-other",
+        )
+        first_visible, _ = await service.search_with_diagnostics(
+            "多 Bot 甲号所有权锚点",
+            first_context,
+            8,
+        )
+        second_visible, _ = await service.search_with_diagnostics(
+            "多 Bot 乙号所有权锚点",
+            second_context,
+            8,
+        )
+        hidden, blocked = await service.search_with_diagnostics(
+            "多 Bot 甲号所有权锚点",
+            other_context,
+            8,
+        )
+
+        self.assertIn(first_id, {item.memory.id for item in first_visible})
+        self.assertIn(second_id, {item.memory.id for item in second_visible})
+        self.assertNotIn(first_id, {item.memory.id for item in hidden})
+        self.assertTrue(any("other_bot_owner" in item.get("reason", "") for item in blocked))
+
+    async def test_admin_diagnostics_can_retrieve_private_and_group_memories(self) -> None:
+        service = self.make_service({"retrieval": {"mode": "basic"}})
+        private_id = await service.store.insert_memory(
+            MemoryRecord(
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1", name="测试用户"),
+                object=EntityRef(kind="bot", id="self", name="Bot"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="显微镜全库锚点来自私聊",
+                importance=0.9,
+            )
+        )
+        group_id = await service.store.insert_memory(
+            self.group_memory("显微镜全库锚点来自群聊")
+        )
+        internal_id = await service.store.insert_memory(
+            MemoryRecord(
+                memory_type="internal_note",
+                subject=EntityRef(kind="bot", id="self", name="Bot"),
+                object=EntityRef(kind="bot", id="self", name="Bot"),
+                scope="private",
+                session_id="qq:FriendMessage:u1",
+                visibility="internal",
+                lifecycle="stable_memory",
+                content="显微镜全库锚点内部记录",
+                importance=0.9,
+            )
+        )
+        archived_id = await service.store.insert_memory(
+            MemoryRecord(
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u2", name="归档用户"),
+                object=EntityRef(kind="bot", id="self", name="Bot"),
+                scope="private",
+                session_id="qq:FriendMessage:u2",
+                visibility="private_pair",
+                lifecycle="archived",
+                content="显微镜全库锚点归档记录",
+                importance=0.9,
+            )
+        )
+        context = SessionContext(session_id="", scope="unknown", message_text="显微镜全库锚点")
+
+        regular, _ = await service.search_with_diagnostics("显微镜全库锚点", context, 10)
+        admin, _ = await service.search_with_diagnostics(
+            "显微镜全库锚点",
+            context,
+            10,
+            admin_read_all=True,
+        )
+
+        self.assertFalse({private_id, group_id} & {item.memory.id for item in regular})
+        admin_ids = {item.memory.id for item in admin}
+        self.assertTrue({private_id, group_id}.issubset(admin_ids))
+        self.assertNotIn(internal_id, admin_ids)
+        self.assertNotIn(archived_id, admin_ids)
 
     async def test_service_clear_resets_persisted_and_runtime_state(self) -> None:
         service = self.make_service()

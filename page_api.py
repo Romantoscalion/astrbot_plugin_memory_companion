@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from quart import jsonify, request, send_file
 
 from .core.bridge import serialize_memory
-from .core.identity import normalize_session_context_fields
+from .core.identity import normalize_session_context_fields, parse_scope_from_session
 from .core.models import SessionContext, clean_text
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
@@ -352,7 +352,13 @@ class PluginPageApi:
         """Return all windows, ACL rules and policies in one shot for topology visualization."""
         try:
             store = self.plugin.service.store
-            buckets = await store.list_memory_buckets(limit=200)
+            buckets = await store.list_memory_buckets(
+                limit=200,
+                include_raw_events=self.plugin.service.config.bool(
+                    "memory_injection.include_raw_events",
+                    False,
+                ),
+            )
             windows: list[dict[str, Any]] = []
             for b in buckets:
                 scope = clean_text(b.get("scope"), 40)
@@ -398,7 +404,13 @@ class PluginPageApi:
             return self._err(f"权限矩阵读取失败: {exc}", 500)
 
     async def buckets(self):
-        buckets = await self.plugin.service.store.list_memory_buckets(limit=self._query_int("limit", 160))
+        buckets = await self.plugin.service.store.list_memory_buckets(
+            limit=self._query_int("limit", 160),
+            include_raw_events=self.plugin.service.config.bool(
+                "memory_injection.include_raw_events",
+                False,
+            ),
+        )
         for bucket in buckets:
             bucket.pop("pending_count", None)
         return self._ok({"buckets": buckets})
@@ -551,13 +563,83 @@ class PluginPageApi:
         query = clean_text(payload.get("query"), 500)
         if not query:
             return self._err("missing query", 400)
-        normalized = normalize_session_context_fields(
-            session_id=clean_text(payload.get("session_id"), 200),
-            scope=clean_text(payload.get("scope"), 40) or "unknown",
-            platform=clean_text(payload.get("platform"), 80),
-            user_id=clean_text(payload.get("user_id"), 120),
-            group_id=clean_text(payload.get("group_id"), 120),
+        raw_context = {
+            "session_id": clean_text(payload.get("session_id"), 200),
+            "scope": clean_text(payload.get("scope"), 40).lower() or "unknown",
+            "platform": clean_text(payload.get("platform"), 80),
+            "user_id": clean_text(payload.get("user_id"), 120),
+            "group_id": clean_text(payload.get("group_id"), 120),
+        }
+        requested_bot_id = clean_text(payload.get("bot_id"), 120)
+        context_mode = clean_text(
+            payload.get("context_mode") or payload.get("search_mode"),
+            20,
+        ).lower() or "auto"
+        context_mode = {"context": "session", "window": "session"}.get(context_mode, context_mode)
+        if context_mode not in {"auto", "all", "session"}:
+            return self._err("invalid context_mode", 400)
+        parsed_scope, parsed_target = parse_scope_from_session(raw_context["session_id"])
+        has_context_intent = (
+            raw_context["scope"] in {"private", "group"}
+            or any(raw_context[key] for key in ("session_id", "user_id", "group_id"))
+            or bool(requested_bot_id)
         )
+        if context_mode != "all":
+            if raw_context["scope"] not in {"unknown", "private", "group"}:
+                return self._err("invalid search scope", 400)
+            if (
+                parsed_scope in {"private", "group"}
+                and raw_context["scope"] in {"private", "group"}
+                and raw_context["scope"] != parsed_scope
+            ):
+                return self._err("search scope conflicts with session_id", 400)
+            if (
+                parsed_scope == "private"
+                and parsed_target
+                and raw_context["user_id"]
+                and raw_context["user_id"] != parsed_target
+            ):
+                return self._err("private search target conflicts with session_id", 400)
+            if (
+                parsed_scope == "group"
+                and parsed_target
+                and raw_context["group_id"]
+                and raw_context["group_id"] != parsed_target
+            ):
+                return self._err("group search target conflicts with session_id", 400)
+            if raw_context["user_id"] and raw_context["group_id"]:
+                return self._err("search context cannot contain both user_id and group_id", 400)
+            if raw_context["scope"] == "private" and raw_context["group_id"]:
+                return self._err("private search context cannot contain group_id", 400)
+            if raw_context["scope"] == "group" and raw_context["user_id"]:
+                return self._err("group search context cannot contain user_id", 400)
+        normalized = normalize_session_context_fields(**raw_context)
+        if context_mode != "all":
+            if normalized["scope"] == "private" and normalized["group_id"]:
+                return self._err("private search context cannot contain group_id", 400)
+            if normalized["scope"] == "group" and normalized["user_id"]:
+                return self._err("group search context cannot contain user_id", 400)
+        has_session_context = bool(normalized["session_id"]) or (
+            normalized["scope"] == "private" and bool(normalized["user_id"])
+        ) or (
+            normalized["scope"] == "group" and bool(normalized["group_id"])
+        )
+        if context_mode == "session" and not has_session_context:
+            return self._err("missing valid private or group search context", 400)
+        if context_mode == "auto" and has_context_intent and not has_session_context:
+            return self._err("incomplete private or group search context", 400)
+        admin_read_all = context_mode == "all" or (
+            context_mode == "auto" and not has_context_intent
+        )
+        if admin_read_all:
+            normalized = {
+                "session_id": "",
+                "scope": "unknown",
+                "platform": "",
+                "user_id": "",
+                "group_id": "",
+            }
+            requested_bot_id = ""
         ctx = SessionContext(
             session_id=normalized["session_id"],
             scope=normalized["scope"],
@@ -566,13 +648,14 @@ class PluginPageApi:
             user_name=clean_text(payload.get("user_name"), 80),
             group_id=normalized["group_id"],
             group_name=clean_text(payload.get("group_name"), 80),
+            bot_id=requested_bot_id,
             message_text=query,
         )
         results, blocked = await self.plugin.service.search_with_diagnostics(
             query,
             ctx,
-            self._int(payload.get("top_k"), 8),
-            admin_read_all=False,
+            max(1, min(50, self._int(payload.get("top_k"), 8))),
+            admin_read_all=admin_read_all,
         )
         return self._ok(
             {
@@ -581,6 +664,14 @@ class PluginPageApi:
                     for item in results
                 ],
                 "blocked": blocked[:30],
+                "search_context": {
+                    "mode": "all" if admin_read_all else "session",
+                    "scope": normalized["scope"],
+                    "session_id": normalized["session_id"],
+                    "user_id": normalized["user_id"],
+                    "group_id": normalized["group_id"],
+                    "bot_id": requested_bot_id,
+                },
             }
         )
 

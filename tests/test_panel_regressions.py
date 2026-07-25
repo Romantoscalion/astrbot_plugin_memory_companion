@@ -120,7 +120,53 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=1.6.4", page)
+        self.assertIn("app.css?v=1.6.5", page)
+
+    def test_microscope_has_explicit_context_and_non_overlapping_results(self) -> None:
+        page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
+        layout = re.search(
+            r"\.film-app\.is-workspace:not\(\.is-personal-memory\) #view-microscope\.is-active\s*\{([^}]*)\}",
+            styles,
+        )
+
+        self.assertIn('id="microscopeContext"', page)
+        self.assertIn('for="microscopeContext"', page)
+        self.assertIn('aria-describedby="microscopeContextMeta"', page)
+        self.assertIn('id="searchResult" class="result-grid" aria-live="polite"', page)
+        self.assertIn('microscopeBucketId: "all"', script)
+        self.assertIn("function renderMicroscopeContexts", script)
+        self.assertIn("state.buckets.filter(isWindowBucket)", script)
+        self.assertIn('context_mode: "all"', script)
+        self.assertIn('payload.context_mode = "session"', script)
+        self.assertIn('payload.bot_id = bucket.bot_id || ""', script)
+        self.assertIn("function microscopeBuckets()", script)
+        self.assertIn("microscope_contexts: microscopeContexts", script)
+        self.assertIn("microscope_id: microscopeContextId(bucket, sample.bot_id)", script)
+        self.assertIn('invalidateMicroscopeSearch("检索范围已切换，请重新检索。")', script)
+        self.assertIn('invalidateMicroscopeSearch("检索内容已修改，请重新检索。")', script)
+        self.assertIn('invalidateMicroscopeSearch(\n      microscopeContextStillAvailable', script)
+        self.assertIn("const loadToken = ++state.bucketLoadToken", script)
+        self.assertIn("if (loadToken !== state.bucketLoadToken) return false", script)
+        self.assertIn('setMicroscopeSearchBusy(false)', script)
+        self.assertIn('$("#runSearchBtn").addEventListener("click", runSearch)', script)
+        self.assertNotIn('$("#runSearchBtn").addEventListener("click", (event) => withButton', script)
+        self.assertIn("if (searchToken !== state.microscopeSearchToken) return;", script)
+        self.assertIn("data.search_context || {}", script)
+        self.assertIsNotNone(layout)
+        self.assertIn("grid-template-rows:auto auto minmax(0,1fr)", layout.group(1))
+        self.assertIn("#view-microscope.is-active>.section-head{grid-row:1}", styles)
+        self.assertIn("#view-microscope.is-active>.microscope-box{grid-row:2}", styles)
+        self.assertIn("#view-microscope.is-active>#searchResult{grid-row:3}", styles)
+        self.assertIn(".microscope-context-bar", styles)
+        self.assertIn(".microscope-result-context", styles)
+        self.assertRegex(
+            styles,
+            r'#searchResult\[data-microscope-section="hits"\] \[data-result-section="hits"\],\s*'
+            r'#searchResult\[data-microscope-section="blocked"\] \[data-result-section="blocked"\]\{\s*'
+            r'grid-column:1/-1;',
+        )
 
     def test_mobile_workspace_uses_page_scroll_instead_of_clipping_content(self) -> None:
         styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
@@ -194,7 +240,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .projection-stage', styles)
         self.assertIn(".film-app.is-workspace .overview-layout-switch", styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=1.6.4", page)
+        self.assertIn("app.js?v=1.6.5", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")

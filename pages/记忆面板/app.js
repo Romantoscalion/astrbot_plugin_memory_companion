@@ -5,7 +5,7 @@ const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAA
 const VIEWS = {
   objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和拟人维度概览。" },
   film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。" },
-  microscope: { title: "记忆显微镜", hint: "输入一句话，模拟当前对象下的召回和过滤。" },
+  microscope: { title: "记忆显微镜", hint: "对比全库管理检索与指定会话中的实际召回和过滤。" },
   relations: { title: "用户记忆", hint: "聚焦用户画像、偏好、称呼和关系声明。" },
   review: { title: "个人记忆", hint: "查看 Bot 自身的每日生活日程、相册、主观记忆和细化片段。" },
   archive: { title: "维护 / 迁移 / 配置", hint: "执行维护、迁移、清理和导入修复。" },
@@ -166,6 +166,9 @@ const state = {
   overviewLayout: document.documentElement.dataset.overviewLayout === "cinema" ? "cinema" : "standard",
   activeView: "objects",
   activeBucketId: "all",
+  microscopeBucketId: "all",
+  microscopeSearchToken: 0,
+  bucketLoadToken: 0,
   activeMemoryId: "",
   secondaryNav: {},
   companionPersonalAvailable: null,
@@ -860,17 +863,112 @@ function contextParams(extra = {}) {
   return params;
 }
 
-function contextPayload(query) {
-  const bucket = activeBucket();
-  const payload = { query, top_k: 8, scope: "unknown" };
-  if (!bucket || bucket.id === "all") return payload;
-  if (bucket.id === "self") {
-    payload.session_id = "bot_self";
-    payload.scope = "unknown";
-    return payload;
+function microscopeContextId(bucket, botId = "") {
+  if (!bucket || bucket.id === "all" || !botId) return bucket?.id || "all";
+  return JSON.stringify([bucket.id, botId]);
+}
+
+function microscopeBuckets() {
+  const contexts = [];
+  state.buckets.filter(isWindowBucket).forEach((bucket) => {
+    const samples = (bucket.microscope_contexts || []).filter(
+      (item) => Number(item.searchable_count || 0) > 0,
+    );
+    const botSamples = samples.filter((item) => item.bot_id);
+    const selectable = botSamples.length ? botSamples : samples.slice(0, 1);
+    selectable.forEach((sample) => {
+      contexts.push({
+        ...bucket,
+        microscope_id: microscopeContextId(bucket, sample.bot_id),
+        session_id: sample.session_id || bucket.session_id || "",
+        group_id: sample.group_id || bucket.group_id || "",
+        bot_id: sample.bot_id || "",
+        searchable_count: Number(sample.searchable_count || 0),
+      });
+    });
+  });
+  return contexts;
+}
+
+function microscopeBucket() {
+  return microscopeBuckets().find((bucket) => (
+    bucket.microscope_id === state.microscopeBucketId
+  )) || state.buckets.find((bucket) => bucket.id === "all") || {
+    id: "all",
+    label: "全部可检索记忆",
+  };
+}
+
+function microscopeBucketLabel(bucket = microscopeBucket()) {
+  if (!bucket || bucket.id === "all") return "全部可检索记忆";
+  const title = splitWindowBucketTitle(bucket);
+  return [title.primary, title.secondary, bucket.bot_id ? `Bot ${bucket.bot_id}` : ""]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function updateMicroscopeContextMeta() {
+  const meta = $("#microscopeContextMeta");
+  if (!meta) return;
+  const bucket = microscopeBucket();
+  if (bucket.id === "all") {
+    meta.textContent = "管理检索 · 全部可检索记忆";
+    return;
   }
+  meta.textContent = `${windowKindLabel(bucket.scope)}上下文 · ${microscopeBucketLabel(bucket)}`;
+}
+
+function renderMicroscopeContexts() {
+  const select = $("#microscopeContext");
+  if (!select) return;
+  const windows = microscopeBuckets();
+  if (!windows.some((bucket) => bucket.microscope_id === state.microscopeBucketId)) {
+    state.microscopeBucketId = "all";
+  }
+  const groups = ["private", "group"].map((scope) => {
+    const options = windows.filter((bucket) => bucket.scope === scope);
+    if (!options.length) return "";
+    return `
+      <optgroup label="${scope === "group" ? "群聊" : "私聊"}">
+        ${options.map((bucket) => `
+          <option value="${escapeHtml(bucket.microscope_id)}">${escapeHtml(`${microscopeBucketLabel(bucket)} · ${bucket.searchable_count || 0} 条候选`)}</option>
+        `).join("")}
+      </optgroup>
+    `;
+  }).join("");
+  select.innerHTML = `<option value="all">全部可检索记忆（管理检索）</option>${groups}`;
+  select.value = state.microscopeBucketId;
+  updateMicroscopeContextMeta();
+}
+
+function clearMicroscopeResults(message = "选择范围并输入内容后开始检索。") {
+  const result = $("#searchResult");
+  if (!result) return;
+  result.setAttribute("aria-busy", "false");
+  result.innerHTML = `<div class="empty-state">${escapeHtml(message)}</div>`;
+}
+
+function setMicroscopeSearchBusy(busy) {
+  const button = $("#runSearchBtn");
+  if (!button) return;
+  button.disabled = Boolean(busy);
+  button.classList.toggle("is-loading", Boolean(busy));
+  button.textContent = busy ? "检索中" : "开始检索";
+}
+
+function invalidateMicroscopeSearch(message) {
+  state.microscopeSearchToken += 1;
+  setMicroscopeSearchBusy(false);
+  clearMicroscopeResults(message);
+}
+
+function contextPayload(query, bucket = microscopeBucket()) {
+  const payload = { query, top_k: 8, context_mode: "all" };
+  if (!bucket || bucket.id === "all") return payload;
+  payload.context_mode = "session";
   payload.scope = bucket.scope || "unknown";
   payload.session_id = bucket.session_id || "";
+  payload.bot_id = bucket.bot_id || "";
   if (bucket.scope === "private") {
     payload.user_id = bucket.target_id || "";
   }
@@ -989,6 +1087,30 @@ function normalizeBuckets(rawBuckets) {
     const name = cleanWindowDisplayName(item.target_name || item.display_name || "");
     const label = windowDisplayLabel(scope, targetId, name, targetKind);
     const identifierLabel = windowIdentifierLabel(scope, targetId, targetKind);
+    const microscopeContexts = (Array.isArray(item.sample_contexts) ? item.sample_contexts : []).map((context) => ({
+      bot_id: compact(context.bot_id, ""),
+      session_id: compact(context.session_id, ""),
+      group_id: compact(context.group_id, ""),
+      memory_count: Number(context.memory_count || 0),
+      archived_count: Number(context.archived_count || 0),
+      searchable_count: Number(
+        context.searchable_count
+        ?? Math.max(0, Number(context.memory_count || 0) - Number(context.archived_count || 0)),
+      ),
+    }));
+    if (!microscopeContexts.length) {
+      microscopeContexts.push({
+        bot_id: compact(item.sample_bot_id, ""),
+        session_id: compact(item.sample_session_id, ""),
+        group_id: compact(item.sample_group_id, ""),
+        memory_count: Number(item.memory_count || 0),
+        archived_count: Number(item.archived_count || 0),
+        searchable_count: Number(
+          item.searchable_count
+          ?? Math.max(0, Number(item.memory_count || 0) - Number(item.archived_count || 0)),
+        ),
+      });
+    }
     normalized.push({
       id: `${scope}:${targetId}`,
       scope,
@@ -998,6 +1120,8 @@ function normalizeBuckets(rawBuckets) {
       identifier_label: identifierLabel,
       group_id: item.sample_group_id || (scope === "group" ? targetId : ""),
       session_id: item.sample_session_id || "",
+      bot_id: item.sample_bot_id || "",
+      microscope_contexts: microscopeContexts,
       label,
       sublabel: identifierLabel,
       memory_count: item.memory_count || 0,
@@ -1417,10 +1541,23 @@ async function loadStats() {
 }
 
 async function loadBuckets() {
+  const loadToken = ++state.bucketLoadToken;
+  const hadLoadedBuckets = state.buckets.length > 0;
   const data = await apiGet("/buckets?limit=180");
+  if (loadToken !== state.bucketLoadToken) return false;
   state.buckets = normalizeBuckets(data.buckets || []);
   if (!state.buckets.some((bucket) => bucket.id === state.activeBucketId)) {
     state.activeBucketId = "all";
+  }
+  const microscopeContextStillAvailable = state.microscopeBucketId === "all"
+    || microscopeBuckets().some((bucket) => bucket.microscope_id === state.microscopeBucketId);
+  if (!microscopeContextStillAvailable) state.microscopeBucketId = "all";
+  if (hadLoadedBuckets) {
+    invalidateMicroscopeSearch(
+      microscopeContextStillAvailable
+        ? "记忆范围已刷新，请重新检索。"
+        : "原检索范围已失效，请重新选择。",
+    );
   }
   const scope = currentRailScope();
   if ($("#app")?.classList.contains("is-workspace") && scope) {
@@ -1430,7 +1567,9 @@ async function loadBuckets() {
   } else if (state.activeView !== "review") {
     renderBuckets();
   }
+  renderMicroscopeContexts();
   renderStandardRecentBuckets();
+  return true;
 }
 
 async function selectBucket(id) {
@@ -3487,58 +3626,87 @@ function applyMicroscopeView() {
   const box = $("#view-microscope .microscope-box");
   const result = $("#searchResult");
   if (!box || !result) return;
+  renderMicroscopeContexts();
   box.classList.toggle("hidden", active !== "query");
   result.dataset.microscopeSection = active;
-  if (active !== "query" && !result.innerHTML.trim()) {
-    result.innerHTML = `<div class="empty-state">先在“召回测试”里运行一次检索。</div>`;
+  if (!result.innerHTML.trim()) {
+    clearMicroscopeResults(
+      active === "query" ? "选择范围并输入内容后开始检索。" : "先在“召回测试”里运行一次检索。",
+    );
   }
 }
 
 async function runSearch() {
   const query = $("#searchQuery").value.trim();
+  const resultHost = $("#searchResult");
+  if (!resultHost) return;
   if (!query) {
-    $("#searchResult").innerHTML = `<div class="empty-state">先输入一句要测试的话。</div>`;
+    clearMicroscopeResults("先输入一句要测试的话。");
     return;
   }
-  $("#searchResult").innerHTML = loadingState("正在模拟召回...");
-  const data = await apiPost("/search", contextPayload(query));
-  const results = data.results || [];
-  const blocked = data.blocked || [];
-  $("#searchResult").innerHTML = `
-    <section class="result-section film-panel" data-result-section="hits">
-      <div class="personal-zone-head">
-        <h4>命中记忆</h4>
-        <span>${escapeHtml(results.length)} Hits</span>
+  const requestedBucket = microscopeBucket();
+  const requestedLabel = microscopeBucketLabel(requestedBucket);
+  const searchToken = ++state.microscopeSearchToken;
+  setMicroscopeSearchBusy(true);
+  resultHost.setAttribute("aria-busy", "true");
+  resultHost.innerHTML = loadingState("正在模拟召回...");
+  try {
+    const data = await apiPost("/search", contextPayload(query, requestedBucket));
+    if (searchToken !== state.microscopeSearchToken) return;
+    const results = data.results || [];
+    const blocked = data.blocked || [];
+    const returnedContext = data.search_context || {};
+    const contextLabel = returnedContext.mode === "all" ? "全部可检索记忆" : requestedLabel;
+    const contextKind = returnedContext.mode === "all" ? "管理检索" : "会话模拟";
+    resultHost.innerHTML = `
+      <div class="microscope-result-context">
+        <span><b>${escapeHtml(contextLabel)}</b><small>${escapeHtml(contextKind)}</small></span>
+        <em>${escapeHtml(results.length)} 命中 · ${escapeHtml(blocked.length)} 过滤</em>
       </div>
-      ${results.length ? results.map((item) => `
-        <article class="search-card" data-memory-id="${escapeHtml(item.id)}">
-          <span class="item-title">${escapeHtml(item.content)}</span>
-          <div class="item-meta">score ${escapeHtml(item.score)} · ${escapeHtml(item.reason || "")}</div>
-          <div class="badges">
-            <span class="badge teal">${escapeHtml(item.memory_type)}</span>
-            <span class="badge blue">${escapeHtml(item.visibility)}</span>
-            ${memorySignalBadges(item, 4)}
-          </div>
-        </article>
-      `).join("") : `<div class="empty-state">没有命中可读取记忆。</div>`}
-    </section>
-    <section class="result-section film-panel" data-result-section="blocked">
-      <div class="personal-zone-head">
-        <h4>过滤原因</h4>
-        <span>${escapeHtml(blocked.length)} Blocked</span>
-      </div>
-      ${blocked.length ? blocked.map((item) => `
-        <article class="search-card">
-          <span class="item-title">${escapeHtml(item.memory_id || item.id || "blocked")}</span>
-          <div class="item-meta">${escapeHtml(item.reason || JSON.stringify(item))}</div>
-        </article>
-      `).join("") : `<div class="empty-state">没有过滤记录。</div>`}
-    </section>
-  `;
-  $$("#searchResult [data-memory-id]").forEach((card) => {
-    card.addEventListener("click", () => showMemory(card.dataset.memoryId));
-  });
-  applyMicroscopeView();
+      <section class="result-section film-panel" data-result-section="hits">
+        <div class="personal-zone-head">
+          <h4>命中记忆</h4>
+          <span>${escapeHtml(results.length)} Hits</span>
+        </div>
+        ${results.length ? results.map((item) => `
+          <article class="search-card" data-memory-id="${escapeHtml(item.id)}">
+            <span class="item-title">${escapeHtml(item.content)}</span>
+            <div class="item-meta">score ${escapeHtml(item.score)} · ${escapeHtml(item.reason || "")}</div>
+            <div class="badges">
+              <span class="badge teal">${escapeHtml(item.memory_type)}</span>
+              <span class="badge blue">${escapeHtml(item.visibility)}</span>
+              ${memorySignalBadges(item, 4)}
+            </div>
+          </article>
+        `).join("") : `<div class="empty-state">没有命中可读取记忆。</div>`}
+      </section>
+      <section class="result-section film-panel" data-result-section="blocked">
+        <div class="personal-zone-head">
+          <h4>过滤原因</h4>
+          <span>${escapeHtml(blocked.length)} Blocked</span>
+        </div>
+        ${blocked.length ? blocked.map((item) => `
+          <article class="search-card">
+            <span class="item-title">${escapeHtml(item.memory_id || item.id || "blocked")}</span>
+            <div class="item-meta">${escapeHtml(item.reason || JSON.stringify(item))}</div>
+          </article>
+        `).join("") : `<div class="empty-state">没有过滤记录。</div>`}
+      </section>
+    `;
+    $$("#searchResult [data-memory-id]").forEach((card) => {
+      card.addEventListener("click", () => showMemory(card.dataset.memoryId));
+    });
+    applyMicroscopeView();
+  } catch (error) {
+    if (searchToken !== state.microscopeSearchToken) return;
+    resultHost.innerHTML = `<div class="empty-state">检索失败：${escapeHtml(error.message || "未知错误")}。输入内容仍已保留，可直接重试。</div>`;
+    showToast(error.message || "检索失败", "error");
+  } finally {
+    if (searchToken === state.microscopeSearchToken) {
+      resultHost.setAttribute("aria-busy", "false");
+      setMicroscopeSearchBusy(false);
+    }
+  }
 }
 
 async function loadArchive() {
@@ -5780,7 +5948,8 @@ async function executeLivingMemoryImport(path) {
 async function refreshAll() {
   await loadCompanionAvailability();
   await loadStats();
-  await loadBuckets();
+  const bucketsLoaded = await loadBuckets();
+  if (!bucketsLoaded) return;
   await loadActiveView();
 }
 
@@ -5868,7 +6037,22 @@ function bindActions() {
       selectBucket("all");
     }
   });
-  $("#runSearchBtn").addEventListener("click", (event) => withButton(event.currentTarget, "检索中", runSearch));
+  $("#runSearchBtn").addEventListener("click", runSearch);
+  $("#microscopeContext")?.addEventListener("change", (event) => {
+    state.microscopeBucketId = event.currentTarget.value || "all";
+    updateMicroscopeContextMeta();
+    invalidateMicroscopeSearch("检索范围已切换，请重新检索。");
+    $("#searchQuery")?.focus();
+  });
+  $("#searchQuery")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || (!event.ctrlKey && !event.metaKey)) return;
+    event.preventDefault();
+    const button = $("#runSearchBtn");
+    if (button && !button.disabled) runSearch();
+  });
+  $("#searchQuery")?.addEventListener("input", () => {
+    invalidateMicroscopeSearch("检索内容已修改，请重新检索。");
+  });
   $("#maintenanceBtn").addEventListener("click", () => withBusy("正在运行维护...", runMaintenance));
   $("#operationsDiagnosticsBtn").addEventListener("click", () => withBusy("正在生成运维诊断...", runOperationsDiagnostics));
   $$('[data-operation-preset]').forEach((button) => {

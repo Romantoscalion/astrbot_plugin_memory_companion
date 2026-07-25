@@ -17,7 +17,7 @@
       document.documentElement.dataset.overviewLayout = layout;
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=1.6.4" />
+  <link rel="stylesheet" href="./app.css?v=1.6.5" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -222,13 +222,22 @@
           <section id="view-microscope" class="view">
             <div class="section-head">
               <h3>记忆显微镜</h3>
-              <p>输入一句话，模拟当前对象下会召回什么、过滤什么。</p>
+              <p>对比全部可检索记忆与指定私聊、群聊中的实际召回结果。</p>
             </div>
             <div class="microscope-box">
+              <div class="microscope-context-bar">
+                <label class="microscope-context-field" for="microscopeContext">
+                  <span>检索范围</span>
+                  <select id="microscopeContext" aria-describedby="microscopeContextMeta">
+                    <option value="all">全部可检索记忆（管理检索）</option>
+                  </select>
+                </label>
+                <span id="microscopeContextMeta" class="microscope-context-meta" role="status">管理检索 · 全部可检索记忆</span>
+              </div>
               <textarea id="searchQuery" rows="4" placeholder="例如：你最近写了什么 / 那个蓝色渐变小猪是什么"></textarea>
               <button id="runSearchBtn" type="button">开始检索</button>
             </div>
-            <div id="searchResult" class="result-grid"></div>
+            <div id="searchResult" class="result-grid" aria-live="polite" aria-busy="false"></div>
           </section>
 
           <section id="view-relations" class="view">
@@ -452,6 +461,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=1.6.4"></script>
+  <script src="./app.js?v=1.6.5"></script>
 </body>
 </html>

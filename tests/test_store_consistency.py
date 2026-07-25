@@ -32,6 +32,82 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3000, store._conn.execute("PRAGMA busy_timeout").fetchone()[0])
         self.assertEqual(500, store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
 
+    async def test_bucket_limit_applies_after_multi_bot_contexts_are_merged(self) -> None:
+        store = self.make_store()
+        for index in range(9):
+            await store.insert_memory(
+                MemoryRecord(
+                    id=f"g1-bot-{index}",
+                    memory_type="conversation_summary",
+                    subject=EntityRef(kind="user", id="u1"),
+                    object=EntityRef(kind="group", id="g1"),
+                    scope="group",
+                    session_id="qq:GroupMessage:g1",
+                    group_id="g1",
+                    visibility="group_public",
+                    lifecycle="stable_memory",
+                    content=f"群一 Bot {index} 的记忆",
+                    metadata={"owner_bot_id": f"bot-{index}"},
+                )
+            )
+        await store.insert_memory(
+            MemoryRecord(
+                id="g2-bot-old-name",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u2"),
+                object=EntityRef(kind="group", id="g2", name="Zeta Old"),
+                scope="group",
+                session_id="qq:GroupMessage:g2",
+                group_id="g2",
+                visibility="group_public",
+                lifecycle="stable_memory",
+                content="群二的记忆",
+                occurred_at="2026-07-20T10:00:00+00:00",
+                metadata={"owner_bot_id": "bot-g2"},
+            )
+        )
+        await store.insert_memory(
+            MemoryRecord(
+                id="g2-bot-new-name",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u2"),
+                object=EntityRef(kind="group", id="g2", name="Alpha New"),
+                scope="group",
+                session_id="qq:GroupMessage:g2",
+                group_id="g2",
+                visibility="group_public",
+                lifecycle="stable_memory",
+                content="群二更新后的记忆",
+                occurred_at="2026-07-21T10:00:00+00:00",
+                metadata={"owner_bot_id": "bot-g2"},
+            )
+        )
+
+        buckets = await store.list_memory_buckets(limit=2)
+        by_target = {item["target_id"]: item for item in buckets}
+        self.assertEqual({"g1", "g2"}, set(by_target))
+        self.assertEqual(9, by_target["g1"]["memory_count"])
+        self.assertEqual(9, len(by_target["g1"]["sample_contexts"]))
+        self.assertEqual("Alpha New", by_target["g2"]["target_name"])
+
+        await store.insert_memory(
+            MemoryRecord(
+                id="newer-private-bucket",
+                memory_type="user_preference",
+                subject=EntityRef(kind="user", id="private-user", name="私聊用户"),
+                object=EntityRef.bot_self(bot_id="private-bot"),
+                scope="private",
+                session_id="qq:FriendMessage:private-user",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="比群聊更新的私聊记忆",
+                occurred_at="2027-01-01T10:00:00+00:00",
+                metadata={"owner_bot_id": "private-bot"},
+            )
+        )
+        newest = await store.list_memory_buckets(limit=1)
+        self.assertEqual(["private-user"], [item["target_id"] for item in newest])
+
     async def test_internal_dreams_leave_private_buckets_and_legacy_sessions_are_typed(self) -> None:
         store = self.make_store()
         legacy_session_id = "7e6a17fd-d9c9-4753-95cc-5e93922fa72f"
