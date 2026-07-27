@@ -62,6 +62,32 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
             response = await api.search()
         return response, service.search_with_diagnostics
 
+    async def test_conversation_import_targets_use_complete_private_bucket_set(self) -> None:
+        store = SimpleNamespace(
+            list_memory_buckets=AsyncMock(return_value=[
+                {"scope": "private", "target_id": "private-user", "pending_count": 3},
+                {"scope": "group", "target_id": "group-id"},
+            ])
+        )
+        service = SimpleNamespace(
+            store=store,
+            config=SimpleNamespace(bool=lambda *_args: False),
+        )
+        api = PluginPageApi(SimpleNamespace(service=service))
+
+        class JsonResponse(dict):
+            status_code = 200
+
+        with patch.object(page_api_module, "jsonify", side_effect=lambda body: JsonResponse(body)):
+            response = await api.conversation_import_targets()
+
+        store.list_memory_buckets.assert_awaited_once_with(
+            limit=None,
+            include_raw_events=False,
+        )
+        self.assertEqual(["private-user"], [item["target_id"] for item in response["buckets"]])
+        self.assertNotIn("pending_count", response["buckets"][0])
+
     @staticmethod
     def group_memory(content: str = "唯一锚点蓝风铃") -> MemoryRecord:
         return MemoryRecord(

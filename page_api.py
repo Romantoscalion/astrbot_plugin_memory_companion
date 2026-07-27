@@ -87,8 +87,10 @@ class PluginPageApi:
             ("/conversation-import/upload", self.conversation_import_upload, ["POST"], "MemoryCompanion historical chat upload"),
             ("/conversation-import/start", self.conversation_import_start, ["POST"], "MemoryCompanion historical chat start"),
             ("/conversation-import/status", self.conversation_import_status, ["GET"], "MemoryCompanion historical chat status"),
+            ("/conversation-import/targets", self.conversation_import_targets, ["GET"], "MemoryCompanion historical chat private targets"),
             ("/conversation-import/pause", self.conversation_import_pause, ["POST"], "MemoryCompanion historical chat pause"),
             ("/conversation-import/resume", self.conversation_import_resume, ["POST"], "MemoryCompanion historical chat resume"),
+            ("/conversation-import/rebind", self.conversation_import_rebind, ["POST"], "MemoryCompanion historical chat rebind"),
             ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
@@ -214,13 +216,37 @@ class PluginPageApi:
 
     async def conversation_import_status(self):
         batch_id = clean_text(request.args.get("batch_id", ""), 120)
+        upgrade_legacy = self._bool(request.args.get("upgrade_legacy"), True)
         try:
-            result = await self.plugin.service.historical_chat_import_status(batch_id)
+            result = await self.plugin.service.historical_chat_import_status(
+                batch_id,
+                upgrade_legacy=upgrade_legacy,
+            )
             return self._ok({"result": result})
         except ValueError as exc:
             return self._err(str(exc), 404)
         except Exception as exc:
             return self._err(f"读取历史对话导入状态失败: {exc}", 500)
+
+    async def conversation_import_targets(self):
+        try:
+            buckets = await self.plugin.service.store.list_memory_buckets(
+                limit=None,
+                include_raw_events=self.plugin.service.config.bool(
+                    "memory_injection.include_raw_events",
+                    False,
+                ),
+            )
+            private_buckets = []
+            for bucket in buckets:
+                if clean_text(bucket.get("scope"), 40) != "private":
+                    continue
+                item = dict(bucket)
+                item.pop("pending_count", None)
+                private_buckets.append(item)
+            return self._ok({"buckets": private_buckets})
+        except Exception as exc:
+            return self._err(f"读取历史导入目标私聊失败: {exc}", 500)
 
     async def conversation_import_pause(self):
         payload = await self._json()
@@ -241,6 +267,18 @@ class PluginPageApi:
             return self._ok({"result": await self.plugin.service.resume_historical_chat_import(batch_id)})
         except ValueError as exc:
             return self._err(str(exc), 404)
+
+    async def conversation_import_rebind(self):
+        payload = await self._json()
+        try:
+            result = await self.plugin.service.rebind_historical_chat_import(payload)
+            return self._ok({"result": result})
+        except ValueError as exc:
+            message = str(exc)
+            return self._err(message, 404 if message == "导入批次不存在" else 400)
+        except Exception as exc:
+            logger.exception("历史对话导入归属修正失败")
+            return self._err(f"历史对话导入归属修正失败: {exc}", 500)
 
     async def conversation_import_rollback(self):
         payload = await self._json()

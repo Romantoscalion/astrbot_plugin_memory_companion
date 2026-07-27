@@ -3535,6 +3535,11 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .chat-import-callout{display:grid;grid-template-columns:auto 1fr;gap:3px 9px;border-left:3px solid var(--accent);background:rgba(var(--light-rgb),.58);padding:8px 10px;color:var(--muted);font-size:11px;line-height:1.5}
 .chat-import-callout b{color:var(--ink)}.chat-import-callout span{min-width:0;overflow-wrap:anywhere}.chat-import-callout small{grid-column:1/-1}
 .chat-import-callout.is-warning{border-color:#c58a2c;background:rgba(197,138,44,.07)}.chat-import-callout.is-safe{border-color:var(--teal);background:rgba(54,132,118,.07)}.chat-import-callout.is-info{border-color:#668eb5;background:rgba(102,142,181,.07)}
+.chat-import-context-picker{display:grid;gap:7px;border-left:3px solid var(--teal);background:rgba(54,132,118,.06);padding:10px 11px}
+.chat-import-context-picker label{display:grid;grid-template-columns:minmax(150px,.65fr) minmax(220px,1.35fr);gap:10px;align-items:center;color:var(--muted);font-size:11px}
+.chat-import-context-picker label>span{display:grid;gap:2px}.chat-import-context-picker b{color:var(--ink);font-size:12px}.chat-import-context-picker small{font-size:10px;line-height:1.4}
+.chat-import-context-picker select{min-width:0;width:100%}.chat-import-context-picker p{margin:0;color:var(--muted);font-size:10px;line-height:1.5;overflow-wrap:anywhere}
+.chat-import-advanced-identity{border-top:1px solid rgba(var(--edge-rgb),.12);padding-top:7px;color:var(--muted);font-size:11px}.chat-import-advanced-identity summary{cursor:pointer;color:var(--accent-strong)}.chat-import-advanced-identity[open] summary{margin-bottom:8px}
 .chat-import-target-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .chat-import-speakers{display:grid;gap:7px}
 .chat-import-speaker{display:grid;grid-template-columns:minmax(90px,.8fr) minmax(100px,.65fr) minmax(130px,1.2fr);gap:8px;align-items:center;border:1px solid rgba(var(--edge-rgb),.14);border-radius:6px;background:rgba(var(--light-rgb),.38);padding:8px}
@@ -3554,6 +3559,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .chat-import-status-chips{display:flex;flex-wrap:wrap;gap:5px}.chat-import-status-chips span{border:1px solid rgba(var(--edge-rgb),.14);border-radius:999px;background:rgba(var(--light-rgb),.52);padding:3px 7px;color:var(--muted);font-size:9px}.chat-import-status-chips span[data-status="failed"]{border-color:rgba(180,70,55,.28);color:#a3473a}.chat-import-status-chips span[data-status="completed"]{color:var(--teal)}
 .chat-import-memory-breakdown{display:flex;flex-wrap:wrap;align-items:center;gap:5px}.chat-import-memory-breakdown b{margin-right:3px;color:var(--ink);font-size:11px}.chat-import-memory-breakdown span{border-radius:5px;background:rgba(var(--edge-rgb),.06);padding:4px 6px;color:var(--muted);font-size:9px}.chat-import-embedding-note{color:var(--muted);font-size:10px}
 .chat-import-error-details{color:#9f493d;font-size:10px}.chat-import-error-details summary{cursor:pointer}.chat-import-error-details p{display:grid;gap:2px;margin:5px 0;border-left:2px solid currentColor;padding-left:7px}.chat-import-error-details span{color:var(--muted);overflow-wrap:anywhere}
+.chat-import-rebind{border-top:1px solid rgba(var(--edge-rgb),.14);border-bottom:1px solid rgba(var(--edge-rgb),.14);padding:8px 0;color:var(--muted);font-size:11px}.chat-import-rebind summary{cursor:pointer;color:var(--accent-strong);font-weight:700}.chat-import-rebind>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px 10px;align-items:end;margin-top:8px}.chat-import-rebind label{display:grid;gap:5px;min-width:0}.chat-import-rebind select{width:100%;min-width:0}.chat-import-rebind p{grid-column:1/-1;margin:0;font-size:10px;line-height:1.5}.chat-import-rebind button:disabled{cursor:not-allowed;opacity:.46;filter:saturate(.5)}
 .json-box{margin-top:10px;max-height:280px;overflow:auto;border:1px solid var(--line-soft);border-radius:var(--radius);background:rgba(var(--light-rgb),.78);padding:10px;color:var(--muted)}
 .archive-result{
   margin-top:12px;
@@ -4662,6 +4668,10 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .chat-import-speaker{
     grid-template-columns:1fr;
   }
+  .chat-import-context-picker label,
+  .chat-import-rebind>div{
+    grid-template-columns:1fr;
+  }
   .chat-import-summary{
     grid-template-columns:repeat(2,minmax(0,1fr));
   }
@@ -4684,6 +4694,9 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   .chat-import-entry-actions button,
   .chat-import-subhead button,
   .chat-import-inline-fields button,
+  .chat-import-context-picker select,
+  .chat-import-rebind select,
+  .chat-import-rebind button,
   .chat-import-target-grid input,
   .chat-import-speaker select{
     min-height:44px;

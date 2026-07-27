@@ -213,8 +213,13 @@ class MemoryCompanionService:
     async def start_historical_chat_import(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self.chat_importer.start_import(payload)
 
-    async def historical_chat_import_status(self, batch_id: str = "") -> dict[str, Any]:
-        return await self.chat_importer.status(batch_id)
+    async def historical_chat_import_status(
+        self,
+        batch_id: str = "",
+        *,
+        upgrade_legacy: bool = True,
+    ) -> dict[str, Any]:
+        return await self.chat_importer.status(batch_id, upgrade_legacy=upgrade_legacy)
 
     async def pause_historical_chat_import(self, batch_id: str) -> dict[str, Any]:
         return await self.chat_importer.pause_batch(batch_id)
@@ -224,6 +229,32 @@ class MemoryCompanionService:
 
     async def rollback_historical_chat_import(self, batch_id: str) -> dict[str, Any]:
         return await self.chat_importer.rollback_batch(batch_id)
+
+    async def rebind_historical_chat_import(self, payload: dict[str, Any]) -> dict[str, Any]:
+        result = await self.chat_importer.rebind_batch(payload)
+        self._retrieval_result_cache.clear()
+        batch_id = clean_text(result.get("batch_id"), 120)
+        records = await self.store.list_chat_import_memories(batch_id)
+        embeddings_scheduled = 0
+        if self.config.bool("retrieval.embedding_enabled", False):
+            for record in records:
+                self._schedule_memory_embedding(record.id, record)
+                embeddings_scheduled += 1
+        if self.config.bool("knowledge_graph.enabled", True):
+            for record in records:
+                metadata = record.metadata if isinstance(record.metadata, dict) else {}
+                if not any(metadata.get(key) for key in ("topics", "key_facts", "participants")):
+                    continue
+                await self._index_summary_knowledge_graph(
+                    self._context_from_memory_record(record),
+                    record,
+                    metadata,
+                    record.id,
+                )
+        rebind = result.get("rebind")
+        if isinstance(rebind, dict):
+            rebind["embeddings_scheduled"] = embeddings_scheduled
+        return result
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)

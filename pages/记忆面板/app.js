@@ -191,6 +191,8 @@ const state = {
   historicalChatPreview: null,
   historicalChatPreviewSource: "",
   historicalChatBatchId: "",
+  historicalChatTargetContextId: "",
+  historicalChatTargetBuckets: [],
   historicalChatPollTimer: 0,
   historicalChatFile: null,
   conversationImportSource: "qq",
@@ -4927,6 +4929,7 @@ async function selectConversationImportSource(source) {
 }
 
 async function loadConversationImportView() {
+  await loadHistoricalChatTargets();
   applyConversationImportSource();
   const source = conversationImportSource();
   if (source === "qq") {
@@ -4935,6 +4938,16 @@ async function loadConversationImportView() {
     await loadHistoricalChatBatchList();
   }
   showHistoricalChatOutput(Boolean(state.historicalChatPreview || state.historicalChatBatchId));
+}
+
+async function loadHistoricalChatTargets() {
+  try {
+    const data = await apiGet("/conversation-import/targets");
+    state.historicalChatTargetBuckets = normalizeBuckets(data.buckets || []).filter(isWindowBucket);
+  } catch (error) {
+    state.historicalChatTargetBuckets = [];
+    showToast(error.message || "读取目标私聊失败，暂用当前窗口列表", "error");
+  }
 }
 
 function qqHistoryImplementationLabel(adapter = {}) {
@@ -5062,6 +5075,7 @@ async function previewQQHistoryImport() {
   state.historicalChatPreview = data.result || null;
   state.historicalChatPreviewSource = "qq";
   state.historicalChatBatchId = "";
+  state.historicalChatTargetContextId = "";
   renderHistoricalChatPreview(state.historicalChatPreview);
   setHistoricalChatStep(2);
   showToast("QQ 历史读取预览已生成");
@@ -5174,6 +5188,7 @@ function selectHistoricalChatFile(file) {
   state.historicalChatPreview = null;
   state.historicalChatPreviewSource = "";
   state.historicalChatBatchId = "";
+  state.historicalChatTargetContextId = "";
   clearConversationImportResult();
   renderHistoricalChatPreview(null);
   setHistoricalChatStep(0);
@@ -5236,6 +5251,7 @@ async function previewHistoricalChatImport() {
   state.historicalChatPreview = data.result || null;
   state.historicalChatPreviewSource = "file";
   state.historicalChatBatchId = "";
+  state.historicalChatTargetContextId = "";
   renderHistoricalChatPreview(state.historicalChatPreview);
   setHistoricalChatStep(2);
   showToast("对话解析预览已生成");
@@ -5253,6 +5269,119 @@ function historicalChatSuggestedTarget(preview) {
     }
   }
   return targetUsers[0] || { user_id: "", name: "" };
+}
+
+function historicalChatContextId(context) {
+  return JSON.stringify([
+    context?.target_id || "",
+    context?.session_id || "",
+    context?.bot_id || "",
+  ]);
+}
+
+function historicalChatPrivateContexts() {
+  const contexts = [];
+  const seen = new Set();
+  const targetBuckets = state.historicalChatTargetBuckets.length
+    ? state.historicalChatTargetBuckets
+    : state.buckets;
+  targetBuckets
+    .filter((bucket) => bucket.scope === "private" && !["internal", "legacy_live2d"].includes(bucket.target_kind))
+    .forEach((bucket) => {
+      const samples = Array.isArray(bucket.microscope_contexts) && bucket.microscope_contexts.length
+        ? bucket.microscope_contexts
+        : [{ session_id: bucket.session_id, bot_id: bucket.bot_id }];
+      samples.forEach((sample) => {
+        const context = {
+          ...bucket,
+          target_id: bucket.target_id || "",
+          session_id: sample.session_id || bucket.session_id || "",
+          bot_id: sample.bot_id || bucket.bot_id || "",
+        };
+        if (!context.target_id || !context.session_id || !context.bot_id) return;
+        context.context_id = historicalChatContextId(context);
+        if (seen.has(context.context_id)) return;
+        seen.add(context.context_id);
+        contexts.push(context);
+      });
+    });
+  return contexts.sort((left, right) => String(right.latest_at || "").localeCompare(String(left.latest_at || "")));
+}
+
+function historicalChatContextModel(preview, defaults) {
+  const contexts = historicalChatPrivateContexts();
+  const exact = contexts.filter((context) => context.target_id === defaults.user_id);
+  const botIds = new Set(
+    (Array.isArray(preview?.identity_context?.bot?.self_ids) ? preview.identity_context.bot.self_ids : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  );
+  const exactBot = exact.filter((context) => botIds.has(context.bot_id));
+  // 导出侧 Bot QQ 与官方 Bot ID 可能不同；有 Bot 证据时必须同时匹配才可自动绑定。
+  const exactChoices = botIds.size ? exactBot : exact;
+  const normalizedName = String(defaults.user_name || "").trim().toLocaleLowerCase();
+  const sameNameIds = new Set(
+    contexts
+      .filter((context) => normalizedName && String(context.display_name || "").trim().toLocaleLowerCase() === normalizedName)
+      .map((context) => context.context_id),
+  );
+  let selectedId = state.historicalChatTargetContextId;
+  if (!contexts.some((context) => context.context_id === selectedId)) {
+    selectedId = exactChoices.length === 1 ? exactChoices[0].context_id : "";
+  }
+  state.historicalChatTargetContextId = selectedId;
+  return { contexts, selectedId, sameNameIds };
+}
+
+function historicalChatContextLabel(context, sameName = false) {
+  const title = splitWindowBucketTitle(context);
+  return [
+    title.primary,
+    title.secondary,
+    context.bot_id ? `Bot ${shortId(context.bot_id)}` : "",
+    sameName ? "同名候选" : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function historicalChatSelectedContext() {
+  const selectedId = String($("#historicalChatTargetContext")?.value || state.historicalChatTargetContextId || "");
+  return historicalChatPrivateContexts().find((context) => context.context_id === selectedId) || null;
+}
+
+function historicalChatContextHint(context, model) {
+  if (context) return `将合并到 ${historicalChatContextLabel(context)}，无需手动填写 openid 或会话 ID。`;
+  if (model.sameNameIds.size) return "发现同名私聊候选。请确认后手动选择，系统不会只按昵称自动合并。";
+  if (!model.contexts.length) return "尚未发现可绑定的现有私聊，将使用导出身份创建或匹配窗口。";
+  return "已有私聊请直接选择目标窗口；只有确实是新用户时才使用导出身份。";
+}
+
+function historicalChatContextPicker(model) {
+  const options = model.contexts.map((context) => `
+    <option value="${escapeHtml(context.context_id)}" ${context.context_id === model.selectedId ? "selected" : ""}>${escapeHtml(historicalChatContextLabel(context, model.sameNameIds.has(context.context_id)))}</option>
+  `).join("");
+  const selected = model.contexts.find((context) => context.context_id === model.selectedId) || null;
+  return `
+    <div class="chat-import-context-picker">
+      <label for="historicalChatTargetContext">
+        <span><b>记忆归属</b><small>优先选择已经聊过的私聊窗口</small></span>
+        <select id="historicalChatTargetContext">
+          <option value="" ${model.selectedId ? "" : "selected"}>使用导出身份（新用户）</option>
+          ${options ? `<optgroup label="已有私聊窗口">${options}</optgroup>` : ""}
+        </select>
+      </label>
+      <p id="historicalChatContextHint">${escapeHtml(historicalChatContextHint(selected, model))}</p>
+    </div>
+  `;
+}
+
+function historicalChatResolvedDefaults(defaults, context) {
+  if (!context) return defaults;
+  return {
+    ...defaults,
+    user_id: context.target_id,
+    user_name: context.display_name || defaults.user_name,
+    bot_id: context.bot_id,
+  };
 }
 
 function historicalChatIdentityDefaults(preview) {
@@ -5290,6 +5419,9 @@ function renderHistoricalChatPreview(preview) {
   }
   const stats = preview.stats || {};
   const defaults = historicalChatIdentityDefaults(preview);
+  const contextModel = historicalChatContextModel(preview, defaults);
+  const selectedContext = contextModel.contexts.find((context) => context.context_id === contextModel.selectedId) || null;
+  const resolvedDefaults = historicalChatResolvedDefaults(defaults, selectedContext);
   const suggestions = Array.isArray(preview.speaker_suggestions) ? preview.speaker_suggestions : [];
   const segmentPreview = Array.isArray(preview.segment_preview) ? preview.segment_preview : [];
   const warningParts = [];
@@ -5364,12 +5496,16 @@ function renderHistoricalChatPreview(preview) {
     <div class="chat-import-subhead">
       <span><b>绑定到当前 AstrBot 身份</b><small>这里只填写一次，系统会自动应用到上面的用户/Bot 说话人。</small></span>
     </div>
-    <div class="chat-import-target-grid">
-      <label>目标用户 ID<input id="chatImportUserId" type="text" value="${escapeHtml(defaults.user_id)}" placeholder="例如用户 QQ 号" autocomplete="off" /><small>记忆最终归属的真实用户账号</small></label>
-      <label>用户稳定称呼<input id="chatImportUserName" type="text" value="${escapeHtml(defaults.user_name)}" placeholder="例如 烛雨" autocomplete="off" /><small>用于生成自然回忆，不会修改平台昵称</small></label>
-      <label>目标 Bot ID<input id="chatImportBotId" type="text" value="${escapeHtml(defaults.bot_id)}" placeholder="当前 Bot QQ 号" autocomplete="off" /><small>用于多 Bot 隔离，不能与用户 ID 相同</small></label>
-      <label>Bot 人格称呼<input id="chatImportBotName" type="text" value="${escapeHtml(defaults.bot_name)}" placeholder="例如 星缘" autocomplete="off" /><small>填写聊天里对应的人格名称</small></label>
-    </div>
+    ${historicalChatContextPicker(contextModel)}
+    <details class="chat-import-advanced-identity" ${selectedContext ? "" : "open"}>
+      <summary>高级身份信息</summary>
+      <div class="chat-import-target-grid">
+        <label>目标用户 ID<input id="chatImportUserId" type="text" value="${escapeHtml(resolvedDefaults.user_id)}" placeholder="QQ 或平台用户 ID" autocomplete="off" ${selectedContext ? "readonly" : ""} /><small>选择已有私聊后自动填写</small></label>
+        <label>用户稳定称呼<input id="chatImportUserName" type="text" value="${escapeHtml(resolvedDefaults.user_name)}" placeholder="例如 烛雨" autocomplete="off" /><small>用于生成自然回忆，不会修改平台昵称</small></label>
+        <label>目标 Bot ID<input id="chatImportBotId" type="text" value="${escapeHtml(resolvedDefaults.bot_id)}" placeholder="当前 Bot 平台 ID" autocomplete="off" ${selectedContext ? "readonly" : ""} /><small>用于多 Bot 隔离，不能与用户 ID 相同</small></label>
+        <label>Bot 人格称呼<input id="chatImportBotName" type="text" value="${escapeHtml(resolvedDefaults.bot_name)}" placeholder="例如 星缘" autocomplete="off" /><small>填写聊天里对应的人格名称</small></label>
+      </div>
+    </details>
     ${segmentPreview.length ? `
       <details class="chat-import-segment-preview">
         <summary>抽查分段预览（${number(stats.candidate_segment_count)} 个片段）</summary>
@@ -5394,6 +5530,7 @@ function renderHistoricalChatPreview(preview) {
   $("#historicalChatStartBtn")?.addEventListener("click", prepareHistoricalChatImport);
   $("#historicalChatRecentBtn")?.addEventListener("click", loadRecentHistoricalChatBatch);
   $("#historicalChatApplySuggestionsBtn")?.addEventListener("click", applyHistoricalChatSuggestions);
+  $("#historicalChatTargetContext")?.addEventListener("change", applyHistoricalChatTargetContext);
   $$('[data-chat-role], #chatImportUserId, #chatImportUserName, #chatImportBotId, #chatImportBotName, #historicalChatIdentityConfirmed').forEach((control) => {
     control.addEventListener("change", updateHistoricalChatValidation);
     control.addEventListener("input", updateHistoricalChatValidation);
@@ -5401,20 +5538,53 @@ function renderHistoricalChatPreview(preview) {
   updateHistoricalChatValidation();
 }
 
+function applyHistoricalChatTargetContext() {
+  const select = $("#historicalChatTargetContext");
+  state.historicalChatTargetContextId = String(select?.value || "");
+  const preview = state.historicalChatPreview;
+  if (!preview) return;
+  const defaults = historicalChatIdentityDefaults(preview);
+  const context = historicalChatSelectedContext();
+  const resolved = historicalChatResolvedDefaults(defaults, context);
+  const values = {
+    chatImportUserId: resolved.user_id,
+    chatImportUserName: resolved.user_name,
+    chatImportBotId: resolved.bot_id,
+    chatImportBotName: resolved.bot_name,
+  };
+  Object.entries(values).forEach(([id, value]) => {
+    const input = $("#" + id);
+    if (input) input.value = value || "";
+  });
+  for (const id of ["chatImportUserId", "chatImportBotId"]) {
+    const input = $("#" + id);
+    if (input) input.readOnly = Boolean(context);
+  }
+  const advancedIdentity = $(".chat-import-advanced-identity");
+  if (advancedIdentity) advancedIdentity.open = !context;
+  const model = historicalChatContextModel(preview, defaults);
+  const hint = $("#historicalChatContextHint");
+  if (hint) hint.textContent = historicalChatContextHint(context, model);
+  const confirmed = $("#historicalChatIdentityConfirmed");
+  if (confirmed) confirmed.checked = false;
+  updateHistoricalChatValidation();
+}
+
 function applyHistoricalChatSuggestions() {
   const preview = state.historicalChatPreview;
   if (!preview) return;
   const defaults = historicalChatIdentityDefaults(preview);
+  const resolvedDefaults = historicalChatResolvedDefaults(defaults, historicalChatSelectedContext());
   const suggestions = Array.isArray(preview.speaker_suggestions) ? preview.speaker_suggestions : [];
   suggestions.forEach((item, index) => {
     const select = $("#chatRole" + index);
     if (select) select.value = historicalChatSuggestedRole(item);
   });
   const fields = {
-    chatImportUserId: defaults.user_id,
-    chatImportUserName: defaults.user_name,
-    chatImportBotId: defaults.bot_id,
-    chatImportBotName: defaults.bot_name,
+    chatImportUserId: resolvedDefaults.user_id,
+    chatImportUserName: resolvedDefaults.user_name,
+    chatImportBotId: resolvedDefaults.bot_id,
+    chatImportBotName: resolvedDefaults.bot_name,
   };
   Object.entries(fields).forEach(([id, value]) => {
     const input = $("#" + id);
@@ -5433,8 +5603,9 @@ function historicalChatImportPayload({ requireConfirmation = true } = {}) {
     throw new Error("当前预览来自其他导入来源，请切回原来源或重新生成预览");
   }
   const suggestions = Array.isArray(preview.speaker_suggestions) ? preview.speaker_suggestions : [];
-  const userId = String($("#chatImportUserId")?.value || "").trim();
-  const botId = String($("#chatImportBotId")?.value || "").trim();
+  const selectedContext = historicalChatSelectedContext();
+  const userId = selectedContext?.target_id || String($("#chatImportUserId")?.value || "").trim();
+  const botId = selectedContext?.bot_id || String($("#chatImportBotId")?.value || "").trim();
   const userName = String($("#chatImportUserName")?.value || "").trim();
   const botName = String($("#chatImportBotName")?.value || "").trim();
   const speakerMap = {};
@@ -5452,7 +5623,10 @@ function historicalChatImportPayload({ requireConfirmation = true } = {}) {
   return {
     upload_id: preview.upload_id,
     speaker_map: speakerMap,
-    platform: "qq",
+    platform: selectedContext?.session_id?.includes(":")
+      ? selectedContext.session_id.split(":", 1)[0]
+      : "qq",
+    session_id: selectedContext?.session_id || "",
     user_id: userId,
     user_name: userName,
     bot_id: botId,
@@ -5559,7 +5733,10 @@ async function loadRecentHistoricalChatBatch() {
 
 async function refreshHistoricalChatStatus() {
   if (!state.historicalChatBatchId) return;
-  const params = new URLSearchParams({ batch_id: state.historicalChatBatchId });
+  const params = new URLSearchParams({
+    batch_id: state.historicalChatBatchId,
+    upgrade_legacy: "0",
+  });
   const data = await apiGet(`/conversation-import/status?${params.toString()}`);
   renderHistoricalChatStatus(data.result || {});
   const finalStates = new Set(["completed", "completed_with_warnings", "rolled_back", "paused", "failed"]);
@@ -5590,6 +5767,79 @@ function historicalChatSegmentStatusLabel(value) {
   }[value] || value;
 }
 
+function historicalChatRebindContexts(batch) {
+  return historicalChatPrivateContexts().filter((context) => !(
+    context.target_id === String(batch?.user_id || "")
+    && context.session_id === String(batch?.session_id || "")
+    && context.bot_id === String(batch?.bot_id || "")
+  ));
+}
+
+function historicalChatRebindPanel(batch) {
+  if (!["completed", "completed_with_warnings"].includes(batch?.state)) return "";
+  const contexts = historicalChatRebindContexts(batch);
+  if (!contexts.length) return "";
+  return `
+    <details class="chat-import-rebind">
+      <summary>归属不对？修正到已有私聊</summary>
+      <div>
+        <label for="historicalChatRebindContext">目标私聊窗口
+          <select id="historicalChatRebindContext">
+            <option value="">请选择已有私聊</option>
+            ${contexts.map((context) => `<option value="${escapeHtml(context.context_id)}">${escapeHtml(historicalChatContextLabel(context))}</option>`).join("")}
+          </select>
+        </label>
+        <p>升级前已完成的批次也可修正；仅调整当前批次归属，不重新生成记忆，也不影响其他批次。</p>
+        <button id="historicalChatRebindBtn" class="subtle" type="button" disabled>修正本批归属</button>
+      </div>
+    </details>
+  `;
+}
+
+function updateHistoricalChatRebindButton() {
+  const button = $("#historicalChatRebindBtn");
+  if (button) button.disabled = !$("#historicalChatRebindContext")?.value;
+}
+
+function prepareHistoricalChatRebind() {
+  const batchId = state.historicalChatBatchId;
+  const selectedId = String($("#historicalChatRebindContext")?.value || "");
+  const context = historicalChatPrivateContexts().find((item) => item.context_id === selectedId);
+  if (!batchId || !context) {
+    showToast("请先选择目标私聊窗口", "error");
+    return;
+  }
+  showInlineConfirmation({
+    host: "#conversationImportResult",
+    title: "修正本批记忆归属",
+    message: `将当前导入批次合并到 ${historicalChatContextLabel(context)}。不会重新调用模型，也不会移动其他记忆。`,
+    confirmLabel: "确认修正",
+    busyText: "正在修正本批归属...",
+    onConfirm: () => executeHistoricalChatRebind(context),
+  });
+}
+
+async function executeHistoricalChatRebind(context) {
+  const data = await apiPost("/conversation-import/rebind", {
+    batch_id: state.historicalChatBatchId,
+    user_id: context.target_id,
+    user_name: context.display_name || "",
+    session_id: context.session_id,
+    platform: context.session_id.includes(":") ? context.session_id.split(":", 1)[0] : "",
+    bot_id: context.bot_id,
+  });
+  await refreshAll();
+  await refreshHistoricalChatStatus();
+  const relationshipStatus = data.result?.relationship_observations?.status || "";
+  const relationshipNeedsReview = ["failed", "unsupported", "completed_with_warnings"].includes(relationshipStatus);
+  showToast(
+    relationshipNeedsReview
+      ? "记忆已合并；关系候选需要人工核对"
+      : "本批记忆已合并到目标私聊",
+    relationshipNeedsReview ? "warning" : "success",
+  );
+}
+
 function renderHistoricalChatStatus(result) {
   let box = $("#historicalChatStatus");
   if (!box) {
@@ -5598,7 +5848,7 @@ function renderHistoricalChatStatus(result) {
     panel.hidden = false;
     panel.innerHTML = `
       <div class="chat-import-section-head">
-        <span><b>最近一次历史对话任务</b><small>可继续、查看结果或整批回滚</small></span>
+        <span><b>当前历史对话任务</b><small>可修正旧批次归属、继续任务或整批回滚</small></span>
         <button id="historicalChatNewImportBtn" class="subtle" type="button">导入另一份记录</button>
       </div>
       <div id="historicalChatStatus"></div>
@@ -5629,6 +5879,8 @@ function renderHistoricalChatStatus(result) {
         ? 78
         : Math.round(segmentProgress * 70);
   const identityLinks = batch.stats?.identity_links || {};
+  const identityRebind = batch.stats?.identity_rebind || {};
+  const relationshipRebind = batch.stats?.relationship_observation_rebind || {};
   const summaryPerspective = batch.stats?.summary_perspective || {};
   const detailQuality = batch.stats?.detail_quality || {};
   showHistoricalChatOutput(true);
@@ -5672,6 +5924,8 @@ function renderHistoricalChatStatus(result) {
         </div>
       ` : ""}
       ${batch.stats?.embedding?.enabled ? `<small class="chat-import-embedding-note">向量索引 ${number(batch.stats.embedding.indexed)}/${number(batch.stats.embedding.eligible)} · ${escapeHtml(batch.stats.embedding.status || "处理中")}</small>` : ""}
+      ${identityRebind.to ? `<div class="chat-import-callout is-safe"><b>本批归属已修正</b><span>已合并到 ${escapeHtml(identityRebind.to.user_name || identityRebind.to.user_id || "目标用户")} 的私聊窗口，不影响其他批次和现有记忆。</span></div>` : ""}
+      ${["failed", "unsupported", "completed_with_warnings"].includes(relationshipRebind.status) ? `<div class="chat-import-callout is-warning"><b>关系候选需人工核对</b><span>${escapeHtml(relationshipRebind.message || "记忆归属已修正，但陪伴插件中的关系候选未完全自动移动。")}</span></div>` : ""}
       ${Number(identityLinks.version || 0) > 0 ? `<div class="chat-import-callout is-safe"><b>私聊归属已统一</b><span>本批记忆已合并到用户 ${escapeHtml(identityLinks.target_user_id || batch.user_id || "-")} 的现有私聊窗口${Number(identityLinks.repaired_entities || 0) > 0 ? `，修复 ${number(identityLinks.repaired_entities)} 条实体关联` : ""}。</span></div>` : ""}
       ${Number(summaryPerspective.version || 0) > 0 ? `<div class="chat-import-callout is-safe"><b>记忆视角已校正</b><span>可召回正文统一使用明确称呼的第三人称摘要，不会把用户的“我”误认成 Bot。</span></div>` : ""}
       ${Number(detailQuality.version || 0) > 0 ? `<div class="chat-import-callout is-safe"><b>详细回忆已整理</b><span>片段回忆 ${number(detailQuality.conversation_summaries_enriched ?? detailQuality.conversation_summaries ?? batch.summary_memory_count)}/${number(detailQuality.conversation_summaries ?? batch.summary_memory_count)}，日摘要 ${number(detailQuality.daily_digests_enriched ?? detailQuality.daily_digests ?? memoryCounts.daily_digest)}/${number(detailQuality.daily_digests ?? memoryCounts.daily_digest)}；事件与稳定事实继续保持原子化，避免重复和混淆。</span></div>` : ""}
@@ -5683,6 +5937,7 @@ function renderHistoricalChatStatus(result) {
         </details>
       ` : ""}
       ${isFinished ? `<div class="chat-import-callout is-safe"><b>可以开始使用了</b><span>长期记忆已写入；关系候选仍需在陪伴插件关系网页人工确认。</span></div>` : ""}
+      ${historicalChatRebindPanel(batch)}
       <div class="chat-import-primary-actions">
         ${batch.state === "running" ? '<button id="historicalChatPauseBtn" type="button">暂停</button>' : ""}
         ${["paused", "failed", "prepared"].includes(batch.state) ? '<button id="historicalChatResumeBtn" type="button">恢复</button>' : ""}
@@ -5695,6 +5950,8 @@ function renderHistoricalChatStatus(result) {
   $("#historicalChatResumeBtn")?.addEventListener("click", () => withBusy("正在恢复...", resumeHistoricalChatImport));
   $("#historicalChatRefreshBtn")?.addEventListener("click", () => withButton($("#historicalChatRefreshBtn"), "刷新中", refreshHistoricalChatStatus));
   $("#historicalChatRollbackBtn")?.addEventListener("click", prepareHistoricalChatRollback);
+  $("#historicalChatRebindContext")?.addEventListener("change", updateHistoricalChatRebindButton);
+  $("#historicalChatRebindBtn")?.addEventListener("click", prepareHistoricalChatRebind);
 }
 
 function resetHistoricalChatImportView() {
@@ -5702,6 +5959,7 @@ function resetHistoricalChatImportView() {
   state.historicalChatPreview = null;
   state.historicalChatPreviewSource = "";
   state.historicalChatBatchId = "";
+  state.historicalChatTargetContextId = "";
   clearConversationImportResult();
   renderHistoricalChatPreview(null);
   setHistoricalChatStep(0);

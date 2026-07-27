@@ -108,6 +108,30 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         newest = await store.list_memory_buckets(limit=1)
         self.assertEqual(["private-user"], [item["target_id"] for item in newest])
 
+    async def test_bucket_listing_can_return_the_complete_target_set(self) -> None:
+        store = self.make_store()
+        for index in range(3):
+            await store.insert_memory(
+                MemoryRecord(
+                    id=f"private-target-{index}",
+                    memory_type="conversation_summary",
+                    subject=EntityRef(kind="user", id=f"user-{index}"),
+                    object=EntityRef.bot_self(bot_id="bot"),
+                    scope="private",
+                    session_id=f"qq:FriendMessage:user-{index}",
+                    visibility="private_pair",
+                    lifecycle="stable_memory",
+                    content=f"私聊目标 {index}",
+                    metadata={"owner_bot_id": "bot"},
+                )
+            )
+
+        limited = await store.list_memory_buckets(limit=2)
+        complete = await store.list_memory_buckets(limit=None)
+
+        self.assertEqual(2, len(limited))
+        self.assertEqual(3, len(complete))
+
     async def test_internal_dreams_leave_private_buckets_and_legacy_sessions_are_typed(self) -> None:
         store = self.make_store()
         legacy_session_id = "7e6a17fd-d9c9-4753-95cc-5e93922fa72f"

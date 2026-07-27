@@ -393,6 +393,536 @@ class HistoricalChatStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, counts["conversation_summary"])
         self.assertEqual({"summary-1", "event-1"}, {record.id for record in records})
 
+    async def test_completed_batch_rebind_is_scoped_and_rebuild_safe(self) -> None:
+        target_session = "qqbot:FriendMessage:openid-user"
+        await self.store.insert_memory(MemoryRecord(
+            id="target-native", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="openid-user", name="山间之茶"),
+            object=EntityRef.bot_self("official-bot", "捕梦猫"),
+            scope="private", session_id=target_session, platform="qqbot",
+            visibility="private_pair", content="已有官方 Bot 私聊记忆",
+            metadata={"owner_bot_id": "official-bot"},
+        ))
+        await self.store.upsert_chat_import_batch({
+            "id": "batch-rebind", "upload_id": "upload-rebind", "source_name": "qq.json",
+            "state": "completed", "session_id": "qq:FriendMessage:1374758454", "scope": "private",
+            "platform": "qq", "user_id": "1374758454", "user_name": "山间之茶",
+            "bot_id": "2732152361", "bot_name": "捕梦猫neko",
+            "speaker_map": {
+                "山间之茶 [1374758454]": {
+                    "role": "user", "entity_id": "1374758454", "display_name": "山间之茶",
+                },
+                "捕梦猫neko [2732152361]": {
+                    "role": "bot", "entity_id": "2732152361", "display_name": "捕梦猫neko",
+                },
+            },
+            "stats": {"message_count": 2},
+        })
+        await self.store.insert_memory(MemoryRecord(
+            id="imported-memory", memory_type="conversation_summary",
+            subject=EntityRef(kind="user", id="1374758454", name="山间之茶"),
+            object=EntityRef.bot_self("2732152361", "捕梦猫neko"),
+            scope="private", session_id="qq:FriendMessage:1374758454", platform="qq",
+            visibility="private_pair", content="两人聊过一次天气。",
+            metadata={"owner_bot_id": "2732152361", "topics": ["天气"]},
+            import_batch_id="batch-rebind",
+        ))
+        await self.store.insert_memory(MemoryRecord(
+            id="unrelated-memory", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="other-user", name="其他用户"),
+            object=EntityRef.bot_self("other-bot", "其他 Bot"),
+            scope="private", session_id="qq:FriendMessage:other-user", platform="qq",
+            content="不得移动", metadata={"owner_bot_id": "other-bot"},
+        ))
+        timeline_ids = await self.store.add_historical_timeline_events([{
+            "event_type": "user_message", "session_id": "qq:FriendMessage:1374758454",
+            "scope": "private", "subject_id": "1374758454", "object_id": "2732152361",
+            "content": "今天天气不错", "message_id": "rebind-message", "source_sequence": 1,
+            "occurred_at": "2026-07-12T10:37:49+08:00", "retention_class": "historical_archive",
+            "import_batch_id": "batch-rebind", "metadata": {"source_sender_id": "1374758454"},
+        }])
+        unrelated_timeline_id = await self.store.add_timeline_event(
+            event_type="user_message", session_id="qq:FriendMessage:other-user", scope="private",
+            subject_id="other-user", object_id="other-bot", content="不得移动",
+            metadata={"message_id": "other-message"},
+        )
+        relationship_id = await self.store.upsert_relationship(
+            subject=EntityRef(kind="user", id="1374758454", name="山间之茶"),
+            object=EntityRef.bot_self("2732152361", "捕梦猫neko"), relation_type="trust",
+            scope="private", session_id="qq:FriendMessage:1374758454",
+            source_memory_id="imported-memory", metadata={"owner_bot_id": "2732152361"},
+        )
+        source_node = await self.store.upsert_knowledge_node(
+            node_type="person", label="山间之茶", scope="private",
+            session_id="qq:FriendMessage:1374758454",
+        )
+        target_node = await self.store.upsert_knowledge_node(
+            node_type="topic", label="天气", scope="private",
+            session_id="qq:FriendMessage:1374758454",
+        )
+        knowledge_edge_id = await self.store.upsert_knowledge_edge(
+            source_node_id=source_node, target_node_id=target_node, relation_type="mentioned",
+            scope="private", session_id="qq:FriendMessage:1374758454",
+            source_memory_id="imported-memory",
+        )
+        await self.store.upsert_memory_embedding(
+            memory_id="imported-memory", provider_id="test", text_hash="old", vector=[1.0, 0.0]
+        )
+        await self.store.upsert_memory_embedding(
+            memory_id="unrelated-memory", provider_id="test", text_hash="keep", vector=[0.0, 1.0]
+        )
+
+        result = await self.store.rebind_chat_import_batch(
+            batch_id="batch-rebind", session_id=target_session, platform="qqbot",
+            user_id="openid-user", user_name="山间之茶", bot_id="official-bot",
+            bot_name="", backup_path="memory.backup.before-rebind.db",
+        )
+
+        memory = await self.store.get_memory("imported-memory")
+        unrelated = await self.store.get_memory("unrelated-memory")
+        timeline = self.store._conn.execute(
+            "SELECT * FROM timeline WHERE id=?", (timeline_ids["rebind-message"],)
+        ).fetchone()
+        unrelated_timeline = self.store._conn.execute(
+            "SELECT * FROM timeline WHERE id=?", (unrelated_timeline_id,)
+        ).fetchone()
+        relationship = self.store._conn.execute(
+            "SELECT * FROM relationship_edges WHERE id=?", (relationship_id,)
+        ).fetchone()
+        batch = await self.store.get_chat_import_batch("batch-rebind")
+
+        self.assertEqual(1, result["memories"])
+        self.assertEqual(1, result["timeline"])
+        self.assertEqual(0, result["embeddings_removed"])
+        self.assertEqual(1, result["knowledge_edges_removed"])
+        self.assertEqual(("openid-user", "official-bot"), (memory.subject.id, memory.object.id))
+        self.assertEqual((target_session, "qqbot"), (memory.session_id, memory.platform))
+        self.assertEqual("捕梦猫", memory.object.name)
+        self.assertEqual("official-bot", memory.metadata["owner_bot_id"])
+        self.assertEqual("1374758454", memory.metadata["original_import_target"]["user_id"])
+        self.assertEqual("openid-user", memory.metadata["current_import_target"]["user_id"])
+        self.assertEqual("qq:FriendMessage:other-user", unrelated.session_id)
+        self.assertEqual((target_session, "openid-user", "official-bot"), (
+            timeline["session_id"], timeline["subject_id"], timeline["object_id"],
+        ))
+        timeline_metadata = json.loads(timeline["metadata"])
+        self.assertEqual("1374758454", timeline_metadata["source_sender_id"])
+        self.assertEqual("official-bot", timeline_metadata["owner_bot_id"])
+        self.assertEqual("qq:FriendMessage:other-user", unrelated_timeline["session_id"])
+        self.assertEqual(("openid-user", "official-bot", target_session), (
+            relationship["subject_id"], relationship["object_id"], relationship["session_id"],
+        ))
+        self.assertIsNotNone(self.store._conn.execute(
+            "SELECT 1 FROM memory_embeddings WHERE memory_id='imported-memory'"
+        ).fetchone())
+        self.assertIsNotNone(self.store._conn.execute(
+            "SELECT 1 FROM memory_embeddings WHERE memory_id='unrelated-memory'"
+        ).fetchone())
+        self.assertIsNone(self.store._conn.execute(
+            "SELECT 1 FROM knowledge_edges WHERE id=?", (knowledge_edge_id,)
+        ).fetchone())
+        self.assertEqual((target_session, "openid-user", "official-bot"), (
+            batch["session_id"], batch["user_id"], batch["bot_id"],
+        ))
+        self.assertEqual("1374758454", batch["speaker_map"]["山间之茶 [1374758454]"]["source_entity_id"])
+        self.assertEqual("openid-user", batch["speaker_map"]["山间之茶 [1374758454]"]["entity_id"])
+        self.assertEqual(
+            "memory.backup.before-rebind.db",
+            batch["stats"]["identity_rebind"]["backup_path"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "已经属于所选私聊"):
+            await self.store.rebind_chat_import_batch(
+                batch_id="batch-rebind", session_id=target_session, platform="qqbot",
+                user_id="openid-user", bot_id="official-bot",
+            )
+
+    async def test_rebind_rejects_nonterminal_missing_and_incoherent_targets(self) -> None:
+        target_session = "qqbot:FriendMessage:openid-user"
+        await self.store.insert_memory(MemoryRecord(
+            id="validation-target", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="openid-user", name="用户"),
+            object=EntityRef.bot_self("official-bot", "Bot"), scope="private",
+            session_id=target_session, platform="qqbot", content="目标上下文",
+            metadata={"owner_bot_id": "official-bot"},
+        ))
+        for state in ("running", "paused", "rolled_back"):
+            batch_id = f"batch-{state}"
+            await self.store.upsert_chat_import_batch({
+                "id": batch_id, "state": state, "scope": "private",
+                "session_id": "qq:FriendMessage:old-user", "platform": "qq",
+                "user_id": "old-user", "bot_id": "old-bot", "speaker_map": {}, "stats": {},
+            })
+            with self.assertRaisesRegex(ValueError, "仅已完成"):
+                await self.store.rebind_chat_import_batch(
+                    batch_id=batch_id, session_id=target_session, platform="qqbot",
+                    user_id="openid-user", bot_id="official-bot",
+                )
+
+        with self.assertRaisesRegex(ValueError, "导入批次不存在"):
+            await self.store.rebind_chat_import_batch(
+                batch_id="missing", session_id=target_session, platform="qqbot",
+                user_id="openid-user", bot_id="official-bot",
+            )
+        await self.store.upsert_chat_import_batch({
+            "id": "batch-invalid-target", "state": "completed", "scope": "private",
+            "session_id": "qq:FriendMessage:old-user", "platform": "qq",
+            "user_id": "old-user", "bot_id": "old-bot", "speaker_map": {}, "stats": {},
+        })
+        invalid_payloads = (
+            {"session_id": target_session, "platform": "qqbot", "user_id": "different-user", "bot_id": "official-bot"},
+            {"session_id": target_session, "platform": "wrong-platform", "user_id": "openid-user", "bot_id": "official-bot"},
+            {"session_id": target_session, "platform": "qqbot", "user_id": "openid-user", "bot_id": "different-bot"},
+        )
+        for payload in invalid_payloads:
+            with self.assertRaises(ValueError):
+                await self.store.rebind_chat_import_batch(batch_id="batch-invalid-target", **payload)
+
+    async def test_importer_rebind_derives_platform_backs_up_and_syncs_relationship_candidates(self) -> None:
+        target_session = "qqbot:FriendMessage:openid-user"
+        await self.store.insert_memory(MemoryRecord(
+            id="api-target", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="openid-user", name="目标用户"),
+            object=EntityRef.bot_self("official-bot", "官方 Bot"), scope="private",
+            session_id=target_session, platform="qqbot", content="已有窗口",
+            metadata={"owner_bot_id": "official-bot"},
+        ))
+        await self.store.upsert_chat_import_batch({
+            "id": "batch-api-rebind", "state": "completed", "scope": "private",
+            "session_id": "qq:FriendMessage:old-user", "platform": "qq",
+            "user_id": "old-user", "user_name": "旧用户", "bot_id": "old-bot",
+            "bot_name": "旧 Bot", "speaker_map": {}, "stats": {},
+            "relationship_observation_count": 2,
+        })
+        await self.store.insert_memory(MemoryRecord(
+            id="api-imported", memory_type="conversation_summary",
+            subject=EntityRef(kind="user", id="old-user", name="旧用户"),
+            object=EntityRef.bot_self("old-bot", "旧 Bot"), scope="private",
+            session_id="qq:FriendMessage:old-user", platform="qq", content="导入记忆",
+            import_batch_id="batch-api-rebind", metadata={"owner_bot_id": "old-bot"},
+        ))
+
+        class RelationshipAPI:
+            calls = []
+
+            async def rebind_historical_relationship_observations(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"matched": 2, "moved": 2, "deduplicated": 0, "trimmed": 0}
+
+        relationship_api = RelationshipAPI()
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        importer._private_api = lambda: relationship_api
+
+        result = await importer.rebind_batch({
+            "batch_id": "batch-api-rebind", "session_id": target_session,
+            "user_id": "openid-user", "user_name": "目标用户", "bot_id": "official-bot",
+        })
+
+        self.assertEqual("qqbot", result["target"]["platform"])
+        self.assertEqual("completed", result["relationship_observations"]["status"])
+        self.assertEqual(2, result["relationship_observations"]["moved"])
+        self.assertEqual("old-user", relationship_api.calls[0]["old_user_id"])
+        self.assertEqual("openid-user", relationship_api.calls[0]["user_id"])
+        self.assertTrue(Path(result["backup_path"]).is_file())
+        batch = await self.store.get_chat_import_batch("batch-api-rebind")
+        self.assertEqual(
+            "completed",
+            batch["stats"]["relationship_observation_rebind"]["status"],
+        )
+
+    async def test_legacy_batches_remain_listed_and_status_inspection_does_not_upgrade(self) -> None:
+        batch_count = 1001
+        for index in range(batch_count):
+            await self.store.upsert_chat_import_batch({
+                "id": f"legacy-list-{index:04d}",
+                "state": "completed",
+                "scope": "private",
+                "session_id": f"qq:FriendMessage:legacy-{index}",
+                "platform": "qq",
+                "user_id": f"legacy-{index}",
+                "bot_id": "legacy-bot",
+                "speaker_map": {},
+                "stats": {},
+            })
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        started: list[str] = []
+        importer._start_worker = started.append
+
+        listing = await importer.status()
+        inspected = await importer.status("legacy-list-0000", upgrade_legacy=False)
+        limited = await self.store.list_chat_import_batches(7)
+
+        self.assertEqual(batch_count, len(listing["batches"]))
+        self.assertIn("legacy-list-0000", {item["id"] for item in listing["batches"]})
+        self.assertEqual(7, len(limited))
+        self.assertEqual("completed", inspected["batch"]["state"])
+        self.assertEqual({}, inspected["batch"]["stats"])
+        self.assertEqual([], started)
+
+    async def test_relationship_observation_cleanup_requests_complete_batch_history(self) -> None:
+        for batch_id in ("cleanup-batch-a", "cleanup-batch-b"):
+            await self.store.upsert_chat_import_batch({
+                "id": batch_id,
+                "state": "completed",
+                "scope": "private",
+                "session_id": f"qq:FriendMessage:{batch_id}",
+                "platform": "qq",
+                "user_id": batch_id,
+                "bot_id": "cleanup-bot",
+                "speaker_map": {},
+                "stats": {},
+            })
+
+        requested_limits: list[int | None] = []
+        original_listing = self.store.list_chat_import_batches
+
+        async def tracked_listing(limit: int | None = 20):
+            requested_limits.append(limit)
+            return await original_listing(limit)
+
+        rolled_back: list[str] = []
+
+        class RelationshipAPI:
+            def rollback_historical_relationship_observations(self, batch_id: str):
+                rolled_back.append(batch_id)
+                return {"removed": 1}
+
+        self.store.list_chat_import_batches = tracked_listing
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        importer._private_api = RelationshipAPI
+
+        removed = await importer.clear_relationship_observations()
+
+        self.assertEqual([None], requested_limits)
+        self.assertEqual({"cleanup-batch-a", "cleanup-batch-b"}, set(rolled_back))
+        self.assertEqual(2, removed)
+
+    async def test_legacy_warning_batch_without_observation_count_still_rebinds(self) -> None:
+        target_session = "qqbot:FriendMessage:target-user"
+        await self.store.insert_memory(MemoryRecord(
+            id="legacy-target", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="target-user", name="目标用户"),
+            object=EntityRef.bot_self("target-bot", "目标 Bot"), scope="private",
+            session_id=target_session, platform="qqbot", content="目标窗口",
+            metadata={"owner_bot_id": "target-bot"},
+        ))
+        await self.store.upsert_chat_import_batch({
+            "id": "legacy-warning-rebind", "state": "completed_with_warnings", "scope": "private",
+            "session_id": "qq:FriendMessage:old-user", "platform": "qq",
+            "user_id": "", "user_name": "旧用户", "bot_id": "old-bot", "bot_name": "旧 Bot",
+            "speaker_map": {
+                "旧用户": {"role": "user", "entity_id": "old-user", "display_name": "旧用户"},
+                "旧 Bot": {"role": "bot", "entity_id": "old-bot", "display_name": "旧 Bot"},
+            },
+            "stats": {"message_count": 1},
+        })
+        await self.store.insert_memory(MemoryRecord(
+            id="legacy-warning-memory", memory_type="conversation_summary",
+            subject=EntityRef(kind="unknown", id="", name="旧用户"),
+            object=EntityRef(kind="unknown", id="", name="旧 Bot"), scope="private",
+            session_id="qq:FriendMessage:old-user", platform="qq", content="旧版导入记忆",
+            import_batch_id="legacy-warning-rebind", metadata={"owner_bot_id": "old-bot"},
+        ))
+        relationship_id = await self.store.upsert_relationship(
+            subject=EntityRef(kind="unknown", id="", name="旧用户"),
+            object=EntityRef(kind="unknown", id="", name="旧 Bot"),
+            relation_type="trust", scope="private", session_id="qq:FriendMessage:old-user",
+            source_memory_id="legacy-warning-memory", metadata={"owner_bot_id": "old-bot"},
+        )
+
+        class RelationshipAPI:
+            calls: list[dict[str, object]] = []
+
+            async def rebind_historical_relationship_observations(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"matched": 1, "moved": 1, "deduplicated": 0, "trimmed": 0}
+
+        relationship_api = RelationshipAPI()
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        importer._private_api = lambda: relationship_api
+
+        result = await importer.rebind_batch({
+            "batch_id": "legacy-warning-rebind",
+            "session_id": target_session,
+            "user_id": "target-user",
+            "user_name": "目标用户",
+            "bot_id": "target-bot",
+        })
+
+        self.assertEqual("completed_with_warnings", result["state"])
+        self.assertEqual(1, result["relationship_observations"]["moved"])
+        self.assertEqual("old-user", relationship_api.calls[0]["old_user_id"])
+        memory = await self.store.get_memory("legacy-warning-memory")
+        relationship = self.store._conn.execute(
+            "SELECT * FROM relationship_edges WHERE id=?", (relationship_id,)
+        ).fetchone()
+        self.assertEqual(("user", "target-user"), (memory.subject.kind, memory.subject.id))
+        self.assertEqual(("bot", "target-bot"), (memory.object.kind, memory.object.id))
+        self.assertEqual(("user", "target-user"), (relationship["subject_kind"], relationship["subject_id"]))
+        self.assertEqual(("bot", "target-bot"), (relationship["object_kind"], relationship["object_id"]))
+
+    async def test_rebind_rejects_completed_batch_without_linked_records(self) -> None:
+        target_session = "qqbot:FriendMessage:target-user"
+        await self.store.insert_memory(MemoryRecord(
+            id="empty-rebind-target", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="target-user", name="目标用户"),
+            object=EntityRef.bot_self("target-bot", "目标 Bot"), scope="private",
+            session_id=target_session, platform="qqbot", content="目标窗口",
+            metadata={"owner_bot_id": "target-bot"},
+        ))
+        await self.store.upsert_chat_import_batch({
+            "id": "empty-completed-batch", "state": "completed", "scope": "private",
+            "session_id": "qq:FriendMessage:old-user", "platform": "qq",
+            "user_id": "old-user", "bot_id": "old-bot", "speaker_map": {}, "stats": {},
+        })
+
+        with self.assertRaisesRegex(ValueError, "没有可修正"):
+            await self.store.rebind_chat_import_batch(
+                batch_id="empty-completed-batch", session_id=target_session, platform="qqbot",
+                user_id="target-user", bot_id="target-bot",
+            )
+
+        batch = await self.store.get_chat_import_batch("empty-completed-batch")
+        self.assertEqual(("old-user", "old-bot"), (batch["user_id"], batch["bot_id"]))
+
+    async def test_relationship_rebind_warns_when_target_profile_is_full(self) -> None:
+        class RelationshipAPI:
+            async def rebind_historical_relationship_observations(self, **_kwargs):
+                return {
+                    "matched": 0,
+                    "moved": 0,
+                    "confirmed_matched": 1,
+                    "confirmed_moved": 0,
+                    "confirmed_trimmed": 1,
+                }
+
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        importer._private_api = lambda: RelationshipAPI()
+
+        result = await importer._rebind_relationship_observations(
+            batch_id="full-target-batch",
+            old_user_id="old-user",
+            user_id="target-user",
+            user_name="目标用户",
+            observation_count=0,
+        )
+
+        self.assertEqual("completed_with_warnings", result["status"])
+        self.assertIn("容量不足", result["message"])
+
+    async def test_relationship_rebind_deduplication_is_not_reported_as_capacity_loss(self) -> None:
+        class RelationshipAPI:
+            async def rebind_historical_relationship_observations(self, **_kwargs):
+                return {
+                    "matched": 1,
+                    "moved": 0,
+                    "deduplicated": 1,
+                    "trimmed": 0,
+                    "confirmed_matched": 1,
+                    "confirmed_moved": 0,
+                    "confirmed_deduplicated": 1,
+                    "confirmed_trimmed": 0,
+                }
+
+        service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
+        importer = HistoricalChatImporter(service)
+        importer._private_api = lambda: RelationshipAPI()
+
+        result = await importer._rebind_relationship_observations(
+            batch_id="deduplicated-batch",
+            old_user_id="old-user",
+            user_id="target-user",
+            user_name="目标用户",
+            observation_count=0,
+        )
+
+        self.assertEqual("completed", result["status"])
+        self.assertNotIn("message", result)
+
+    async def test_rebind_infers_unknown_entities_from_legacy_batch_identity(self) -> None:
+        target_session = "qqbot:FriendMessage:target-user"
+        await self.store.insert_memory(MemoryRecord(
+            id="identity-fallback-target", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="target-user", name="目标用户"),
+            object=EntityRef.bot_self("target-bot", "目标 Bot"), scope="private",
+            session_id=target_session, platform="qqbot", content="目标窗口",
+            metadata={"owner_bot_id": "target-bot"},
+        ))
+        await self.store.upsert_chat_import_batch({
+            "id": "legacy-identity-fallback", "state": "completed", "scope": "private",
+            "session_id": "qq:FriendMessage:old-user", "platform": "qq",
+            "user_id": "old-user", "user_name": "旧用户", "bot_id": "old-bot", "bot_name": "旧 Bot",
+            "speaker_map": {}, "stats": {},
+        })
+        await self.store.insert_memory(MemoryRecord(
+            id="legacy-unknown-memory", memory_type="conversation_summary",
+            subject=EntityRef(kind="unknown", id="", name=""),
+            object=EntityRef(kind="unknown", id="", name=""), scope="private",
+            session_id="qq:FriendMessage:old-user", platform="qq", content="旧版未知实体记忆",
+            import_batch_id="legacy-identity-fallback",
+            metadata={"actor": "旧用户", "object": "旧 Bot", "owner_bot_id": "old-bot"},
+        ))
+
+        await self.store.rebind_chat_import_batch(
+            batch_id="legacy-identity-fallback", session_id=target_session, platform="qqbot",
+            user_id="target-user", user_name="目标用户", bot_id="target-bot", bot_name="目标 Bot",
+        )
+
+        memory = await self.store.get_memory("legacy-unknown-memory")
+        self.assertEqual(("user", "target-user"), (memory.subject.kind, memory.subject.id))
+        self.assertEqual(("bot", "target-bot"), (memory.object.kind, memory.object.id))
+
+    async def test_start_import_validates_explicit_existing_private_context(self) -> None:
+        target_session = "qqbot:FriendMessage:openid-user"
+        await self.store.insert_memory(MemoryRecord(
+            id="explicit-target", memory_type="manual_memory",
+            subject=EntityRef(kind="user", id="openid-user", name="用户"),
+            object=EntityRef.bot_self("official-bot", "Bot"), scope="private",
+            session_id=target_session, platform="qqbot", content="目标上下文",
+            metadata={"owner_bot_id": "official-bot"},
+        ))
+
+        class Service:
+            def __init__(self, data_dir, store):
+                self.data_dir, self.store = data_dir, store
+
+            @staticmethod
+            def _spawn_background(coro, *, label):
+                coro.close()
+                return None
+
+        importer = HistoricalChatImporter(Service(Path(self.temp.name), self.store))
+        preview = importer.stage_upload(
+            filename="chat.txt",
+            content="用户: 2026-01-01 10:00:00\n你好\n\nBot: 2026-01-01 10:00:05\n你好呀\n".encode("utf-8"),
+        )
+        base_payload = {
+            "upload_id": preview["upload_id"],
+            "speaker_map": {
+                "用户": {"role": "user", "entity_id": "openid-user", "display_name": "用户"},
+                "Bot": {"role": "bot", "entity_id": "official-bot", "display_name": "Bot"},
+            },
+            "platform": "qqbot", "session_id": target_session,
+            "user_id": "openid-user", "user_name": "用户",
+            "bot_id": "official-bot", "bot_name": "Bot",
+        }
+        started = await importer.start_import(base_payload)
+        self.assertEqual(target_session, started["batch"]["session_id"])
+
+        mismatched = dict(base_payload)
+        mismatched["user_id"] = "different-user"
+        with self.assertRaisesRegex(ValueError, "用户 ID 与私聊会话不一致"):
+            await importer.start_import(mismatched)
+        wrong_bot = dict(base_payload)
+        wrong_bot["bot_id"] = "different-bot"
+        with self.assertRaisesRegex(ValueError, "私聊上下文不存在"):
+            await importer.start_import(wrong_bot)
+
     async def test_import_reuses_existing_private_session(self) -> None:
         await self.store.insert_memory(MemoryRecord(
             id="native-memory", memory_type="manual_memory",
@@ -424,6 +954,7 @@ class HistoricalChatStoreTests(unittest.IsolatedAsyncioTestCase):
             "bot_id": "b1", "bot_name": "诺星缘",
         })
         self.assertEqual("default:FriendMessage:u1", started["batch"]["session_id"])
+        self.assertEqual("default", started["batch"]["platform"])
 
     async def test_start_import_rejects_same_user_and_bot_id(self) -> None:
         service = type("Service", (), {"data_dir": Path(self.temp.name), "store": self.store})()
