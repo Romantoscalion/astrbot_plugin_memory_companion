@@ -938,6 +938,75 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         bridged = bridge.get_relationship_phase(session_id=private.session_id, scope="private")
         self.assertIs(state, bridged)
 
+    async def test_peek_relationship_phase_is_read_only_and_fails_closed(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:ambiguous-user",
+            scope="private",
+            platform="qq",
+            user_id="ambiguous-user",
+        )
+        fallback = {"observed": False, "phase": "unknown", "momentum_band": "unknown"}
+        self.assertEqual(fallback, service._peek_relationship_phase(ctx))
+        self.assertEqual({}, service._relationship_phase_state)
+        self.assertFalse(service._RELATIONSHIP_PHASE_FILE.exists())
+
+        identity = service._phase_identity(ctx)
+        service._relationship_phase_state = {
+            "candidate-a": {"_identity": dict(identity), "phase": "close", "momentum": 0.2, "touch_count": 1},
+            "candidate-b": {"_identity": dict(identity), "phase": "close", "momentum": 0.2, "touch_count": 1},
+        }
+        before = json.loads(json.dumps(service._relationship_phase_state))
+        self.assertEqual(fallback, service._peek_relationship_phase(ctx))
+        self.assertEqual(before, service._relationship_phase_state)
+
+        service._relationship_phase_state = {
+            service._phase_key(ctx): {"phase": "close", "momentum": "not-a-number", "touch_count": 1}
+        }
+        before = json.loads(json.dumps(service._relationship_phase_state))
+        self.assertEqual(fallback, service._peek_relationship_phase(ctx))
+        self.assertEqual(before, service._relationship_phase_state)
+        self.assertFalse(service._RELATIONSHIP_PHASE_FILE.exists())
+
+    async def test_peek_relationship_phase_rejects_nonfinite_momentum_without_writing(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:nonfinite-user",
+            scope="private",
+            platform="qq",
+            user_id="nonfinite-user",
+        )
+        fallback = {"observed": False, "phase": "unknown", "momentum_band": "unknown"}
+
+        for momentum in (float("nan"), float("inf"), float("-inf")):
+            service._relationship_phase_state = {
+                service._phase_key(ctx): {"phase": "close", "momentum": momentum, "touch_count": 1}
+            }
+            before = json.dumps(service._relationship_phase_state, sort_keys=True)
+            self.assertEqual(fallback, service._peek_relationship_phase(ctx))
+            self.assertEqual(before, json.dumps(service._relationship_phase_state, sort_keys=True))
+            self.assertFalse(service._RELATIONSHIP_PHASE_FILE.exists())
+
+    async def test_peek_relationship_phase_preserves_finite_momentum_bands(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:finite-user",
+            scope="private",
+            platform="qq",
+            user_id="finite-user",
+        )
+
+        for momentum, momentum_band in ((-0.08, "cooling"), (0, "steady"), (0.08, "rising")):
+            service._relationship_phase_state = {
+                service._phase_key(ctx): {"phase": "close", "momentum": momentum, "touch_count": 1}
+            }
+            before = json.dumps(service._relationship_phase_state, sort_keys=True)
+            self.assertEqual(
+                {"observed": True, "phase": "close", "momentum_band": momentum_band, "touch_count": 1},
+                service._peek_relationship_phase(ctx),
+            )
+            self.assertEqual(before, json.dumps(service._relationship_phase_state, sort_keys=True))
+
 
 if __name__ == "__main__":
     unittest.main()

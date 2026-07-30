@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -8456,6 +8457,51 @@ class MemoryCompanionService:
         state = self._relationship_phase_state[key]
         state["_identity"] = identity
         return state
+
+    def _peek_relationship_phase(self, ctx: SessionContext) -> dict[str, Any]:
+        """Project an existing phase without creating or saving state."""
+        fallback = {"observed": False, "phase": "unknown", "momentum_band": "unknown"}
+        try:
+            identity = self._phase_identity(ctx)
+            key = self._phase_key(ctx)
+            state = self._relationship_phase_state.get(key)
+            if type(state) is not dict and not identity["bot_id"]:
+                matches = [
+                    candidate
+                    for candidate in self._relationship_phase_state.values()
+                    if type(candidate) is dict
+                    and type(candidate.get("_identity")) is dict
+                    and all(candidate["_identity"].get(field, "") == identity[field] for field in ("platform", "scope", "target_id", "member_id"))
+                ]
+                if len(matches) == 1:
+                    state = matches[0]
+            if type(state) is not dict:
+                legacy_key = clean_text(f"{ctx.scope}:{ctx.current_target_id or ctx.session_id}", 120)
+                legacy_state = self._relationship_phase_state.get(legacy_key)
+                if type(legacy_state) is dict:
+                    state = legacy_state
+            if type(state) is not dict:
+                return fallback
+            phase = state.get("phase")
+            momentum = state.get("momentum")
+            touch_count = state.get("touch_count")
+            if type(phase) is not str or phase not in self._PHASES:
+                return fallback
+            if type(momentum) not in {int, float} or type(momentum) is bool:
+                return fallback
+            if not math.isfinite(momentum):
+                return fallback
+            if type(touch_count) is not int:
+                return fallback
+        except Exception:
+            return fallback
+        momentum_band = "rising" if momentum >= 0.08 else "cooling" if momentum <= -0.08 else "steady"
+        return {
+            "observed": True,
+            "phase": phase,
+            "momentum_band": momentum_band,
+            "touch_count": max(0, min(256, touch_count)),
+        }
 
     def _update_relationship_phase_momentum(
         self,

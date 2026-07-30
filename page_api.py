@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from quart import jsonify, request, send_file
 
 from .core.bridge import serialize_memory
+from .core.coordination_status import build_coordination_status, project_p6_status
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
 from .core.models import SessionContext, clean_text
 
@@ -78,6 +79,7 @@ class PluginPageApi:
             ("/config/module/update", self.config_module_update, ["POST"], "MemoryCompanion Page config module update"),
             ("/retrieval/config/update", self.retrieval_config_update, ["POST"], "MemoryCompanion Page retrieval config update"),
             ("/operations/diagnostics", self.operations_diagnostics, ["GET"], "MemoryCompanion operations diagnostics"),
+            ("/coordination/status", self.coordination_status, ["GET"], "MemoryCompanion safe coordination status"),
             ("/operations/preset", self.operations_preset, ["GET", "POST"], "MemoryCompanion operations preset"),
             ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
             ("/data/import/preview", self.data_import_preview, ["GET"], "MemoryCompanion portable data preview"),
@@ -119,6 +121,56 @@ class PluginPageApi:
             return self._ok({"diagnostics": await self.plugin.service.operational_report()})
         except Exception as exc:
             return self._err(f"运维诊断失败: {exc}", 500)
+
+    async def coordination_status(self):
+        """Expose a fixed, read-only coordination projection."""
+        try:
+            service = getattr(self.plugin, "service", None)
+            p6_raw, bridge = self._companion_p6_status(service)
+            status = build_coordination_status(
+                config=getattr(service, "config", None),
+                runtime={"compatibility_level": "full"},
+                bridge=bridge,
+                p6_raw=p6_raw,
+            )
+        except Exception:
+            status = build_coordination_status(
+                config=None,
+                runtime=None,
+                bridge={"health": "unverifiable", "reason_code": "bridge_status_unavailable"},
+                p6_raw=None,
+            )
+        return self._ok({"status": status})
+
+    def _companion_p6_status(self, service: Any) -> tuple[Any, dict[str, str]]:
+        config = getattr(service, "config", None)
+        getter = getattr(config, "bool", None)
+        if not callable(getter):
+            return None, {"health": "unverifiable", "reason_code": "bridge_config_unavailable"}
+        try:
+            enabled = getter("private_companion_bridge.enabled", True)
+        except Exception:
+            return None, {"health": "unverifiable", "reason_code": "bridge_config_unreadable"}
+        if type(enabled) is not bool:
+            return None, {"health": "unverifiable", "reason_code": "bridge_config_invalid"}
+        if not enabled:
+            return None, {"health": "degraded", "reason_code": "bridge_disabled"}
+        companion = self._private_companion_status()
+        if type(companion) is not dict or companion.get("available") is not True:
+            return None, {"health": "unverifiable", "reason_code": "companion_api_unavailable"}
+        plugin = companion.get("plugin")
+        extension_api = getattr(plugin, "extension_api", None)
+        status_getter = getattr(extension_api, "get_p6_readonly_status", None)
+        if not callable(status_getter):
+            return None, {"health": "unverifiable", "reason_code": "companion_p6_producer_unavailable"}
+        try:
+            p6_raw = status_getter()
+        except Exception:
+            return None, {"health": "unverifiable", "reason_code": "companion_p6_producer_unreadable"}
+        p6 = project_p6_status(p6_raw)
+        if p6["health"] == "ready":
+            return p6_raw, {"health": "ready", "reason_code": "companion_bridge_available"}
+        return p6_raw, {"health": "degraded", "reason_code": "companion_p6_unverifiable"}
 
     async def operations_preset(self):
         if request.method == "GET":

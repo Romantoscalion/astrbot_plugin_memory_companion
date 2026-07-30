@@ -619,6 +619,66 @@ class MemoryCompanionBridge:
         ctx = normalizer(payload) if callable(normalizer) else SessionContext(**payload)
         return getter(ctx)
 
+    def peek_relationship_phase(
+        self,
+        *,
+        session_id: str = "",
+        scope: str = "private",
+        platform: str = "",
+        user_id: str = "",
+        group_id: str = "",
+        bot_id: str = "",
+    ) -> dict[str, Any]:
+        """Read an existing phase projection without creating default state."""
+        fallback = {"observed": False, "phase": "unknown", "momentum_band": "unknown"}
+        payload = {
+            "session_id": session_id,
+            "scope": scope,
+            "platform": platform,
+            "user_id": user_id,
+            "group_id": group_id,
+            "bot_id": bot_id,
+        }
+        if any(type(value) is not str for value in payload.values()):
+            return fallback
+        try:
+            getter = getattr(self._plugin, "_peek_relationship_phase", None)
+            if not callable(getter):
+                return fallback
+            normalizer = getattr(self._plugin, "session_context_from_bridge", None)
+            ctx = normalizer(payload) if callable(normalizer) else SessionContext(**payload)
+            result = getter(ctx)
+        except Exception:
+            return fallback
+        if type(result) is not dict:
+            return fallback
+        for key in result:
+            if type(key) is not str:
+                return fallback
+
+        observed = result.get("observed")
+        phase = result.get("phase")
+        momentum_band = result.get("momentum_band")
+        if type(observed) is not bool or type(phase) is not str or type(momentum_band) is not str:
+            return fallback
+        if phase not in {"acquaintance", "familiar", "close", "intimate", "deeply_bonded"}:
+            return fallback
+        if momentum_band not in {"rising", "cooling", "steady"}:
+            return fallback
+        if not observed:
+            return fallback
+        projection: dict[str, Any] = {
+            "observed": True,
+            "phase": phase,
+            "momentum_band": momentum_band,
+        }
+        touch_count = result.get("touch_count")
+        if touch_count is not None:
+            if type(touch_count) is not int or not 0 <= touch_count <= 256:
+                return fallback
+            projection["touch_count"] = touch_count
+        return projection
+
     def get_recent_emotional_state(self) -> dict[str, Any]:
         """Return a summary of recent emotional events across ALL sessions.
 
