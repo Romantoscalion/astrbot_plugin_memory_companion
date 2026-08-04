@@ -141,6 +141,76 @@ class RetrievalEngine:
             validated.append({**item, "content": clean_text(memory.content, 120)})
         return validated
 
+    async def filter_visible_candidates(
+        self,
+        candidates: list[MemoryRecord],
+        ctx: SessionContext,
+        *,
+        reason: str = "navigation_candidate",
+    ) -> tuple[list[SearchResult], list[dict[str, str]]]:
+        """Apply the current visibility and ACL state to externally selected rows.
+
+        Graph navigation and direct-ID lookups must pass through the same policy
+        as ordinary retrieval. This helper intentionally returns no blocked
+        content so callers cannot turn visibility diagnostics into a side
+        channel.
+        """
+        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+        visible: list[SearchResult] = []
+        blocked: list[dict[str, str]] = []
+        seen: set[str] = set()
+        route_reason = clean_text(reason, 240) or "navigation_candidate"
+        for memory in candidates or []:
+            memory_id = clean_text(getattr(memory, "id", ""), 120)
+            if not memory_id or memory_id in seen:
+                continue
+            seen.add(memory_id)
+            memory_platform = clean_text(getattr(memory, "platform", ""), 80).lower()
+            current_platform = clean_text(getattr(ctx, "platform", ""), 80).lower()
+            if memory_platform == "unknown":
+                memory_platform = ""
+            if current_platform == "unknown":
+                current_platform = ""
+            if memory_platform and current_platform and memory_platform != current_platform:
+                blocked.append({"id": memory_id, "reason": "other_platform", "content": ""})
+                continue
+            owner_visible, owner_reason = self.policy._bot_owner_visible(memory, ctx)
+            if not owner_visible:
+                blocked.append(
+                    {
+                        "id": memory_id,
+                        "reason": clean_text(owner_reason or "other_bot_owner", 180),
+                        "content": "",
+                    }
+                )
+                continue
+            visibility_reason, blocked_reason = self._search_visibility_reason(memory, ctx, acl_state)
+            if not visibility_reason:
+                blocked.append(
+                    {
+                        "id": memory_id,
+                        "reason": clean_text(blocked_reason or "not_visible", 180),
+                        "content": "",
+                    }
+                )
+                continue
+            score = max(
+                0.01,
+                min(
+                    1.0,
+                    (float(getattr(memory, "confidence", 0.0) or 0.0) * 0.6)
+                    + (float(getattr(memory, "importance", 0.0) or 0.0) * 0.4),
+                ),
+            )
+            visible.append(
+                SearchResult(
+                    memory=memory,
+                    score=score,
+                    reason=f"{visibility_reason};candidate_route={route_reason}",
+                )
+            )
+        return visible, blocked
+
     async def search_with_diagnostics(
         self,
         query: str,

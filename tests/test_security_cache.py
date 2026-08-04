@@ -62,6 +62,29 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
             response = await api.search()
         return response, service.search_with_diagnostics
 
+    async def test_page_search_uses_slot_orchestration_when_service_supports_it(self) -> None:
+        service = SimpleNamespace(
+            search_context_slots=AsyncMock(return_value=([], [], {})),
+            search_with_diagnostics=AsyncMock(return_value=([], [])),
+        )
+        api = PluginPageApi(SimpleNamespace(service=service))
+        fake_request = SimpleNamespace(
+            get_json=AsyncMock(return_value={"query": "共同召回锚点", "context_mode": "all"})
+        )
+
+        class JsonResponse(dict):
+            status_code = 200
+
+        with (
+            patch.object(page_api_module, "request", fake_request),
+            patch.object(page_api_module, "jsonify", side_effect=lambda body: JsonResponse(body)),
+        ):
+            response = await api.search()
+
+        self.assertEqual([], response["results"])
+        service.search_context_slots.assert_awaited_once()
+        service.search_with_diagnostics.assert_not_awaited()
+
     async def test_conversation_import_targets_use_complete_private_bucket_set(self) -> None:
         store = SimpleNamespace(
             list_memory_buckets=AsyncMock(return_value=[

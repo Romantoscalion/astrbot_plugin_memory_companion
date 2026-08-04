@@ -19,6 +19,7 @@ from .astrbot_compat import (
     clean_private_companion_history_text,
     detect_private_companion_request,
     logger,
+    remove_marked_text,
     remove_temp_text,
     sanitize_request_history,
 )
@@ -35,7 +36,17 @@ from .injection import (
     InjectionComposer,
 )
 from .migration_livingmemory import LivingMemoryMigrator
-from .models import EntityRef, MemoryRecord, SearchResult, SessionContext, clean_text, json_dumps, json_loads, utc_now
+from .models import (
+    EntityRef,
+    MemoryRecord,
+    SearchResult,
+    SessionContext,
+    clean_text,
+    json_dumps,
+    json_loads,
+    stable_fingerprint,
+    utc_now,
+)
 from .operations import (
     PRESET_LABELS,
     PortableMemoryArchive,
@@ -95,6 +106,43 @@ _RECENT_FACT_ASSERTION_MARKERS = (
     "没吃",
     "正在",
     "现在在",
+)
+
+_REMEMBER_TOOL_CONTRACT_HEADER = "<MemoryCompanion-Remember-Tool-Contract>"
+_REMEMBER_TOOL_CONTRACT_FOOTER = "</MemoryCompanion-Remember-Tool-Contract>"
+_REMEMBER_TOOL_CONTRACT = "\n".join(
+    (
+        _REMEMBER_TOOL_CONTRACT_HEADER,
+        "用户明确要求长期记住某件事时，应在本轮调用 memory_companion_remember，不要把理解了当前消息当成已经写入长期记忆。",
+        "只有该工具本轮返回的 JSON 明确包含 ok=true，才可以确认“已记住”或作出等价的长期保存承诺。",
+        "如果没有调用、返回 ok=false 或调用异常，应如实说明尚未成功保存；可以结合工具错误建议重试，但不得声称已经写入。",
+        _REMEMBER_TOOL_CONTRACT_FOOTER,
+    )
+)
+
+_RECONSTRUCTION_CONTRACT_HEADER = "<MemoryCompanion-Reconstruction-Contract>"
+_RECONSTRUCTION_CONTRACT_FOOTER = "</MemoryCompanion-Reconstruction-Contract>"
+_RECONSTRUCTION_CONTRACT = "\n".join(
+    (
+        _RECONSTRUCTION_CONTRACT_HEADER,
+        "先使用本轮已经注入的记忆证据；只有证据不足以回答当前明确回忆、时间、个性化或复杂记忆问题时，才调用 memory_companion_navigate。",
+        "每次只选择一个最能补齐证据缺口的动作，并从当前问题与已获得证据中提炼下一条 cue、tag、人物、主题或 memory_id；不要预先并行展开所有方向。",
+        "工具结果只是候选证据，不是必须提及的内容，也不是新的事实。结合来源、时间、现实层和置信度判断，冲突时优先保留不确定性。",
+        "获得足够证据后立即停止导航并回答；不要为了耗尽步数继续查询。普通寒暄、独立创作和当前消息已经足够时不要调用。",
+        "空结果或不可见候选不能证明隐藏记忆存在，也不能据此猜测内容、身份或关系；证据仍不足时应坦诚说明不确定。",
+        _RECONSTRUCTION_CONTRACT_FOOTER,
+    )
+)
+_RECONSTRUCTION_ACTIONS = frozenset(
+    {
+        "search",
+        "tag_events",
+        "event_time",
+        "event_context",
+        "person_aspect",
+        "topic_events",
+        "reverse_cues",
+    }
 )
 
 
@@ -157,6 +205,11 @@ class MemoryCompanionService:
         self._retrieval_result_cache_stats: dict[str, int] = {"hits": 0, "misses": 0, "evictions": 0}
         self._RETRIEVAL_RESULT_CACHE_TTL: float = 45.0
         self._RETRIEVAL_RESULT_CACHE_MAX: int = 128
+        self._reconstruction_states: dict[str, dict[str, Any]] = {}
+        self._reconstruction_lock = asyncio.Lock()
+        self._reconstruction_last_cleanup: float = 0.0
+        self._RECONSTRUCTION_STATE_TTL: float = 600.0
+        self._RECONSTRUCTION_STATE_MAX: int = 512
         self.migrator = LivingMemoryMigrator(self.store, self.plugin_root, self.data_dir)
         self.portable_archive = PortableMemoryArchive(self.store, self.data_dir)
         self.chat_importer = HistoricalChatImporter(self)
@@ -243,7 +296,7 @@ class MemoryCompanionService:
         if self.config.bool("knowledge_graph.enabled", True):
             for record in records:
                 metadata = record.metadata if isinstance(record.metadata, dict) else {}
-                if not any(metadata.get(key) for key in ("topics", "key_facts", "participants")):
+                if not any(metadata.get(key) for key in ("topics", "key_facts", "participants", "associations")):
                     continue
                 await self._index_summary_knowledge_graph(
                     self._context_from_memory_record(record),
@@ -259,6 +312,7 @@ class MemoryCompanionService:
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
+        self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
             return
@@ -272,6 +326,8 @@ class MemoryCompanionService:
                     clean_text(ctx.message_text, 160),
                 )
             return
+
+        self._apply_remember_tool_contract(req)
 
         await self.note_identity(ctx)
         reply_chain = await self._reply_chain_for_event(event)
@@ -288,6 +344,8 @@ class MemoryCompanionService:
                 exc,
                 exc_info=True,
             )
+
+        self._apply_reconstruction_contract(req, ctx, event=event)
 
         if not self.config.bool("memory_capture.enabled", True):
             return
@@ -2606,6 +2664,7 @@ class MemoryCompanionService:
                     "persona_summary": clean_text((payload or {}).get("persona_summary") or (payload or {}).get("summary"), 2000),
                     "topics": (payload or {}).get("topics", []),
                     "key_facts": (payload or {}).get("key_facts", []),
+                    "associations": (payload or {}).get("associations", []),
                     "routine_check_notes": (payload or {}).get("routine_check_notes", []),
                     "bot_self_fact_count": len((payload or {}).get("bot_self_facts", []) or []),
                     "participants": (payload or {}).get("participants", []),
@@ -2756,9 +2815,10 @@ class MemoryCompanionService:
         topics = self._kg_list(payload.get("topics"), limit=8, item_limit=80)
         key_facts = self._kg_list(payload.get("key_facts"), limit=10, item_limit=180)
         participants = self._kg_list(payload.get("participants"), limit=12, item_limit=80)
+        associations = self._kg_associations(payload.get("associations"))
         if ctx.scope == "private" and (ctx.user_name or ctx.user_id):
             participants = self._kg_unique([ctx.user_name or ctx.user_id, *participants], limit=12)
-        if not topics and not key_facts and not participants:
+        if not topics and not key_facts and not participants and not associations:
             return 0
 
         scope = ctx.scope
@@ -2822,6 +2882,7 @@ class MemoryCompanionService:
             )
 
         topic_nodes: list[tuple[str, str]] = []
+        topic_nodes_by_label: dict[str, str] = {}
         for topic in topics:
             node = await self.store.upsert_knowledge_node(
                 node_type="topic",
@@ -2835,6 +2896,7 @@ class MemoryCompanionService:
             if not node:
                 continue
             topic_nodes.append((topic, node))
+            topic_nodes_by_label[topic.casefold()] = node
             edge_count += await self._kg_edge(
                 memory_node,
                 node,
@@ -2845,6 +2907,7 @@ class MemoryCompanionService:
                 0.74,
             )
 
+        fact_nodes_by_label: dict[str, str] = {}
         for fact in key_facts:
             fact_node = await self.store.upsert_knowledge_node(
                 node_type="fact",
@@ -2857,6 +2920,7 @@ class MemoryCompanionService:
             )
             if not fact_node:
                 continue
+            fact_nodes_by_label[fact.casefold()] = fact_node
             edge_count += await self._kg_edge(
                 memory_node,
                 fact_node,
@@ -2888,6 +2952,45 @@ class MemoryCompanionService:
                         fact,
                         0.62,
                     )
+
+        for association in associations:
+            cue = association["cue"]
+            tag = association["tag"]
+            content = association["content"]
+            layer = association["layer"]
+            cue_node = await self.store.upsert_knowledge_node(
+                node_type="cue",
+                label=cue,
+                scope=scope,
+                session_id=session_id,
+                group_id=group_id,
+                confidence=0.7,
+                metadata={"source_memory_id": memory_id, "content_layer": layer},
+            )
+            if not cue_node or not memory_node:
+                continue
+            target_node = fact_nodes_by_label.get(content.casefold())
+            relation = "routes_to_fact"
+            if not target_node:
+                target_node = topic_nodes_by_label.get(content.casefold())
+                relation = "routes_to_topic"
+            if not target_node:
+                target_node = memory_node
+                relation = "routes_to_memory"
+            edge_count += await self._kg_edge(
+                cue_node,
+                target_node,
+                f"{relation}_{stable_fingerprint(tag, content, layer)[:8]}",
+                ctx,
+                memory_id,
+                content,
+                0.7,
+                metadata={
+                    "source": "summary_association_v1",
+                    "associative_tag": tag,
+                    "content_layer": layer,
+                },
+            )
         return edge_count
 
     async def _kg_edge(
@@ -2899,7 +3002,11 @@ class MemoryCompanionService:
         memory_id: str,
         evidence: str,
         confidence: float,
+        metadata: dict[str, Any] | None = None,
     ) -> int:
+        edge_metadata = {"source": "summary_indexer_v1"}
+        if isinstance(metadata, dict):
+            edge_metadata.update(metadata)
         edge_id = await self.store.upsert_knowledge_edge(
             source_node_id=source_node_id,
             target_node_id=target_node_id,
@@ -2911,7 +3018,7 @@ class MemoryCompanionService:
             evidence=evidence,
             confidence=confidence,
             review_status="auto",
-            metadata={"source": "summary_indexer_v1"},
+            metadata=edge_metadata,
         )
         return 1 if edge_id else 0
 
@@ -2921,6 +3028,31 @@ class MemoryCompanionService:
         if not isinstance(value, list):
             return []
         return self._kg_unique([clean_text(item, item_limit) for item in value], limit=limit)
+
+    def _kg_associations(self, value: Any) -> list[dict[str, str]]:
+        if isinstance(value, dict):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        result: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            cue = clean_text(item.get("cue"), 80)
+            tag = clean_text(item.get("tag"), 80)
+            content = clean_text(item.get("content"), 240)
+            layer = clean_text(item.get("layer"), 24).casefold()
+            if not cue or not tag or not content or layer not in {"episodic", "semantic", "abstraction"}:
+                continue
+            key = (cue.casefold(), tag.casefold(), content.casefold(), layer)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"cue": cue, "tag": tag, "content": content, "layer": layer})
+            if len(result) >= 12:
+                break
+        return result
 
     @staticmethod
     def _kg_unique(values: list[str], *, limit: int) -> list[str]:
@@ -3117,53 +3249,699 @@ class MemoryCompanionService:
         self._schedule_memory_embedding(memory_id, record)
         return memory_id
 
+    @staticmethod
+    def _apply_remember_tool_contract(req: Any) -> None:
+        current = getattr(req, "system_prompt", "") or ""
+        if not isinstance(current, str):
+            current = str(current)
+        current = remove_marked_text(
+            current,
+            _REMEMBER_TOOL_CONTRACT_HEADER,
+            _REMEMBER_TOOL_CONTRACT_FOOTER,
+        )
+        req.system_prompt = f"{current}\n\n{_REMEMBER_TOOL_CONTRACT}" if current else _REMEMBER_TOOL_CONTRACT
+
+    def _apply_reconstruction_contract(
+        self,
+        req: Any,
+        ctx: SessionContext,
+        *,
+        event: Any = None,
+    ) -> None:
+        current = getattr(req, "system_prompt", "") or ""
+        if not isinstance(current, str):
+            current = str(current)
+        current = remove_marked_text(
+            current,
+            _RECONSTRUCTION_CONTRACT_HEADER,
+            _RECONSTRUCTION_CONTRACT_FOOTER,
+        )
+        if not self._should_offer_memory_reconstruction(ctx):
+            req.system_prompt = current
+            return
+
+        injection_state = self._memory_companion_injection_payload(req)
+        if not injection_state:
+            injection_state = self._memory_companion_injection_payload(event)
+        selected_ids = injection_state.get("selected_memory_ids") if isinstance(injection_state, dict) else []
+        selected_count = len(selected_ids) if isinstance(selected_ids, list) else 0
+        max_steps = self._reconstruction_max_steps()
+        dynamic_line = (
+            f"本轮正常检索已选出 {selected_count} 条可见记忆；导航最多 {max_steps} 步，这是资源上限而不是目标步数。"
+        )
+        contract = _RECONSTRUCTION_CONTRACT.replace(
+            _RECONSTRUCTION_CONTRACT_FOOTER,
+            f"{dynamic_line}\n{_RECONSTRUCTION_CONTRACT_FOOTER}",
+        )
+        req.system_prompt = f"{current}\n\n{contract}" if current else contract
+
+    def _should_offer_memory_reconstruction(self, ctx: SessionContext) -> bool:
+        if not self.config.bool("memory_reconstruction.enabled", True):
+            return False
+        if not self.config.bool("memory_tools.enable_reconstruction_tool", True):
+            return False
+        text = clean_text(ctx.message_text, 1200)
+        if not text:
+            return False
+        time_intent = parse_time_intent(text)
+        return bool(
+            time_intent.active
+            or self._message_requests_temporal_aggregate(text)
+            or self._message_is_contextual_memory_request(text)
+            or self._message_requests_personalized_context(text)
+            or self._message_is_shared_routine_invocation(text)
+        )
+
+    def _reconstruction_max_steps(self) -> int:
+        return max(1, min(8, self.config.int("memory_reconstruction.max_steps", 3)))
+
+    def _reconstruction_per_step_limit(self, requested: int = 0) -> int:
+        configured = max(1, min(12, self.config.int("memory_reconstruction.per_step_limit", 6)))
+        try:
+            requested_value = int(requested or 0)
+        except (TypeError, ValueError):
+            requested_value = 0
+        if requested_value <= 0:
+            return configured
+        return max(1, min(configured, requested_value))
+
+    def _reconstruction_scan_limit(self) -> int:
+        return max(12, min(200, self.config.int("memory_reconstruction.candidate_scan_limit", 96)))
+
     async def tool_remember(self, event: Any, content: str, *, note_type: str = "memory") -> dict[str, Any]:
-        ctx = await self.identity.resolve_event_context(event)
         content = clean_text(content, 3000)
         note_type = clean_text(note_type, 40) or "memory"
         if not content:
             return {"ok": False, "error": "empty content"}
-        visibility = "internal"
-        if ctx.scope == "private":
-            visibility = "private_pair"
-        elif ctx.scope == "group":
-            visibility = "group_public"
-        record = MemoryRecord(
-            id=self.stable_id("tool", note_type, ctx.session_id, content),
-            memory_type="tool_memory",
-            subject=self._bot_entity(ctx),
-            object=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
-            scope=ctx.scope,
-            session_id=ctx.session_id,
-            platform=ctx.platform,
-            message_id=ctx.message_id,
-            group_id=ctx.group_id,
-            visibility=visibility,
-            sayability="indirect",
-            reality_level="llm_tool_assertion",
-            lifecycle="stable_memory",
-            content=content,
-            evidence=ctx.message_text,
-            confidence=0.62,
-            importance=0.66,
-            review_status="auto",
-            tags=["llm_tool", note_type, ctx.scope],
-            metadata={"tool": "memory_companion_remember", "note_type": note_type, "owner_bot_id": self._bot_subject_id(ctx)},
-        )
-        self.importance.calibrate(record, source="tool_memory")
-        memory_id = await self.store.insert_memory(record)
-        self._schedule_memory_embedding(memory_id, record)
-        return {"ok": True, "memory_id": memory_id, "review_status": record.review_status}
+        ctx = None
+        try:
+            ctx = await self.identity.resolve_event_context(event)
+            visibility = "internal"
+            if ctx.scope == "private":
+                visibility = "private_pair"
+            elif ctx.scope == "group":
+                visibility = "group_public"
+            record = MemoryRecord(
+                id=self.stable_id("tool", note_type, ctx.session_id, content),
+                memory_type="tool_memory",
+                subject=self._bot_entity(ctx),
+                object=EntityRef(kind="user", id=ctx.user_id, name=ctx.user_name, role="conversation_partner"),
+                scope=ctx.scope,
+                session_id=ctx.session_id,
+                platform=ctx.platform,
+                message_id=ctx.message_id,
+                group_id=ctx.group_id,
+                visibility=visibility,
+                sayability="indirect",
+                reality_level="llm_tool_assertion",
+                lifecycle="stable_memory",
+                content=content,
+                evidence=ctx.message_text,
+                confidence=0.62,
+                importance=0.66,
+                review_status="auto",
+                tags=["llm_tool", note_type, ctx.scope],
+                metadata={"tool": "memory_companion_remember", "note_type": note_type, "owner_bot_id": self._bot_subject_id(ctx)},
+            )
+            self.importance.calibrate(record, source="tool_memory")
+            memory_id = await self.store.insert_memory(record)
+            try:
+                self._schedule_memory_embedding(memory_id, record)
+            except Exception as exc:
+                logger.warning(
+                    "[MemoryCompanion] 主动记忆已写入，但向量索引任务启动失败: memory=%s error=%s",
+                    memory_id,
+                    exc,
+                    exc_info=True,
+                )
+            return {"ok": True, "memory_id": memory_id, "review_status": record.review_status}
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] 主动记忆工具写入失败: session=%s error=%s",
+                clean_text(getattr(ctx, "session_id", ""), 120) or "unknown",
+                exc,
+                exc_info=True,
+            )
+            return {"ok": False, "error": "memory write failed"}
 
     async def tool_recall(self, event: Any, query: str, top_k: int = 5) -> dict[str, Any]:
         ctx = await self.identity.resolve_event_context(event)
         query = clean_text(query, 1000)
         if not query:
             return {"ok": False, "error": "empty query", "memories": []}
-        results = await self.search(query, ctx, max(1, min(10, int(top_k or 5))))
+        limit = max(1, min(10, int(top_k or 5)))
+        results, _blocked, slot_map = await self.search_context_slots(
+            query,
+            ctx,
+            limit,
+        )
+        if ctx.scope == "group" and results:
+            filtered, _blocked = self._filter_group_actor_memory_slots(
+                ctx,
+                slot_map,
+                query_text=query,
+            )
+            results = self._flatten_slot_map(filtered)
+        acl_private_candidate = any(
+            "acl_allowed:private:" in clean_text(getattr(item, "reason", ""), 1200)
+            for item in results
+        )
         return {
             "ok": True,
+            "usage": (
+                "群聊中的 acl_allowed 私聊结果只是条件候选：仅当当前发言者的核心意图确实需要其本人相关事实时使用；"
+                "普通陈述、转述、反问或意图不清时忽略，不主动公开或扩展私聊内容。"
+                if acl_private_candidate
+                else ""
+            ),
             "memories": [serialize_memory(item.memory, item.score, item.reason) for item in results],
+        }
+
+    async def tool_navigate(
+        self,
+        event: Any,
+        action: str,
+        *,
+        query: str = "",
+        cue: str = "",
+        tag: str = "",
+        memory_ids: list[str] | str | None = None,
+        node_type: str = "",
+        limit: int = 0,
+    ) -> dict[str, Any]:
+        """Navigate visible memory evidence one bounded step at a time."""
+        if not self.config.bool("memory_reconstruction.enabled", True):
+            return {"ok": False, "error": "memory reconstruction disabled"}
+        if not self.config.bool("memory_tools.enable_reconstruction_tool", True):
+            return {"ok": False, "error": "reconstruction tool disabled"}
+
+        ctx = self._normalized_session_context(await self.identity.resolve_event_context(event))
+        action = clean_text(action, 40).casefold()
+        query = clean_text(query, 1000)
+        cue = clean_text(cue, 160)
+        tag = clean_text(tag, 80)
+        node_type = clean_text(node_type, 40).casefold()
+        normalized_ids = self._normalize_reconstruction_memory_ids(memory_ids)
+        invalid = self._validate_reconstruction_request(
+            action,
+            query=query,
+            cue=cue,
+            tag=tag,
+            memory_ids=normalized_ids,
+        )
+        if invalid:
+            return {"ok": False, "error": invalid, "actions": sorted(_RECONSTRUCTION_ACTIONS)}
+
+        per_step_limit = self._reconstruction_per_step_limit(limit)
+        signature = stable_fingerprint(
+            action,
+            query.casefold(),
+            cue.casefold(),
+            tag.casefold(),
+            node_type,
+            *sorted(normalized_ids),
+            per_step_limit,
+        )
+        budget = await self._reserve_reconstruction_step(event, ctx, signature)
+        if not budget["accepted"]:
+            return {
+                "ok": False,
+                "error": budget["error"],
+                "action": action,
+                "duplicate": bool(budget.get("duplicate")),
+                "step": budget["step"],
+                "max_steps": budget["max_steps"],
+                "remaining_steps": budget["remaining_steps"],
+            }
+
+        try:
+            if action == "search":
+                evidence, hints = await self._navigate_search(
+                    ctx,
+                    query or cue,
+                    per_step_limit=per_step_limit,
+                )
+            elif action == "event_time":
+                evidence, hints = await self._navigate_event_records(
+                    ctx,
+                    action=action,
+                    query=query or cue,
+                    memory_ids=normalized_ids,
+                    per_step_limit=per_step_limit,
+                )
+            elif action == "event_context" and (normalized_ids or not (cue or tag or node_type)):
+                evidence, hints = await self._navigate_event_records(
+                    ctx,
+                    action=action,
+                    query=query or cue,
+                    memory_ids=normalized_ids,
+                    per_step_limit=per_step_limit,
+                )
+            else:
+                evidence, hints = await self._navigate_graph(
+                    ctx,
+                    action=action,
+                    query=query,
+                    cue=cue,
+                    tag=tag,
+                    memory_ids=normalized_ids,
+                    node_type=node_type,
+                    per_step_limit=per_step_limit,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] 记忆重建导航失败: session=%s action=%s error=%s",
+                ctx.session_id,
+                action,
+                exc,
+                exc_info=True,
+            )
+            return {
+                "ok": False,
+                "error": "navigation failed",
+                "action": action,
+                "step": budget["step"],
+                "max_steps": budget["max_steps"],
+                "remaining_steps": budget["remaining_steps"],
+            }
+
+        return {
+            "ok": True,
+            "action": action,
+            "step": budget["step"],
+            "max_steps": budget["max_steps"],
+            "remaining_steps": budget["remaining_steps"],
+            "status": "evidence_found" if evidence else "no_visible_evidence",
+            "usage": "这些内容只是当前可见的候选证据；足够时立即停止导航，不足时从已获证据提炼下一条线索。",
+            "evidence": evidence,
+            "navigation_hints": hints,
+        }
+
+    @staticmethod
+    def _normalize_reconstruction_memory_ids(value: list[str] | str | None) -> list[str]:
+        if isinstance(value, str):
+            text = clean_text(value, 4000)
+            parsed = json_loads(text, None) if text.startswith("[") else None
+            value = parsed if isinstance(parsed, list) else ([text] if text else [])
+        if not isinstance(value, list):
+            return []
+        result: list[str] = []
+        for item in value:
+            memory_id = clean_text(item, 120)
+            if memory_id and memory_id not in result:
+                result.append(memory_id)
+            if len(result) >= 64:
+                break
+        return result
+
+    @staticmethod
+    def _validate_reconstruction_request(
+        action: str,
+        *,
+        query: str,
+        cue: str,
+        tag: str,
+        memory_ids: list[str],
+    ) -> str:
+        if action not in _RECONSTRUCTION_ACTIONS:
+            return "unsupported action"
+        if action == "search" and not (query or cue):
+            return "query or cue required"
+        if action == "reverse_cues" and not memory_ids:
+            return "memory_ids required"
+        if action in {"event_time", "event_context"} and not (query or cue or memory_ids):
+            return "query, cue or memory_ids required"
+        if action in {"tag_events", "person_aspect", "topic_events"} and not (
+            query or cue or tag or memory_ids
+        ):
+            return "query, cue, tag or memory_ids required"
+        return ""
+
+    def _ensure_reconstruction_turn_token(self, event: Any, ctx: SessionContext) -> str:
+        message_id = clean_text(ctx.message_id, 160)
+        if message_id:
+            return message_id
+        attr = "_memory_companion_reconstruction_turn_token"
+        existing = clean_text(getattr(event, attr, ""), 160) if event is not None else ""
+        if existing:
+            return existing
+        token = "turn_" + stable_fingerprint(id(event), ctx.session_id, ctx.message_text)[:20]
+        if event is not None:
+            try:
+                setattr(event, attr, token)
+            except Exception:
+                pass
+        return token
+
+    def _reconstruction_budget_key(self, event: Any, ctx: SessionContext) -> str:
+        turn_token = self._ensure_reconstruction_turn_token(event, ctx)
+        return stable_fingerprint(
+            clean_text(ctx.platform, 80).casefold(),
+            self._bot_subject_id(ctx),
+            clean_text(ctx.session_id, 200),
+            clean_text(ctx.user_id, 160),
+            turn_token,
+        )
+
+    async def _reserve_reconstruction_step(
+        self,
+        event: Any,
+        ctx: SessionContext,
+        signature: str,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        max_steps = self._reconstruction_max_steps()
+        key = self._reconstruction_budget_key(event, ctx)
+        async with self._reconstruction_lock:
+            if (
+                now - self._reconstruction_last_cleanup >= 30.0
+                or len(self._reconstruction_states) > self._RECONSTRUCTION_STATE_MAX
+            ):
+                cutoff = now - self._RECONSTRUCTION_STATE_TTL
+                self._reconstruction_states = {
+                    state_key: state
+                    for state_key, state in self._reconstruction_states.items()
+                    if float(state.get("last_seen") or 0.0) >= cutoff
+                }
+                if len(self._reconstruction_states) > self._RECONSTRUCTION_STATE_MAX:
+                    newest = sorted(
+                        self._reconstruction_states.items(),
+                        key=lambda item: float(item[1].get("last_seen") or 0.0),
+                        reverse=True,
+                    )[: self._RECONSTRUCTION_STATE_MAX]
+                    self._reconstruction_states = dict(newest)
+                self._reconstruction_last_cleanup = now
+
+            state = self._reconstruction_states.setdefault(
+                key,
+                {"steps": 0, "signatures": set(), "last_seen": now},
+            )
+            if len(self._reconstruction_states) > self._RECONSTRUCTION_STATE_MAX:
+                for stale_key, _stale_state in sorted(
+                    self._reconstruction_states.items(),
+                    key=lambda item: float(item[1].get("last_seen") or 0.0),
+                ):
+                    if stale_key == key:
+                        continue
+                    self._reconstruction_states.pop(stale_key, None)
+                    if len(self._reconstruction_states) <= self._RECONSTRUCTION_STATE_MAX:
+                        break
+            state["last_seen"] = now
+            signatures = state.get("signatures")
+            if not isinstance(signatures, set):
+                signatures = set()
+                state["signatures"] = signatures
+            steps = max(0, int(state.get("steps") or 0))
+            if signature in signatures:
+                return {
+                    "accepted": False,
+                    "error": "duplicate navigation call",
+                    "duplicate": True,
+                    "step": steps,
+                    "max_steps": max_steps,
+                    "remaining_steps": max(0, max_steps - steps),
+                }
+            if steps >= max_steps:
+                return {
+                    "accepted": False,
+                    "error": "navigation step budget exhausted",
+                    "duplicate": False,
+                    "step": steps,
+                    "max_steps": max_steps,
+                    "remaining_steps": 0,
+                }
+            signatures.add(signature)
+            steps += 1
+            state["steps"] = steps
+            return {
+                "accepted": True,
+                "error": "",
+                "duplicate": False,
+                "step": steps,
+                "max_steps": max_steps,
+                "remaining_steps": max(0, max_steps - steps),
+            }
+
+    async def _navigate_search(
+        self,
+        ctx: SessionContext,
+        query: str,
+        *,
+        per_step_limit: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        scan_limit = min(self._reconstruction_scan_limit(), max(per_step_limit * 4, per_step_limit))
+        time_intent = parse_time_intent(query)
+        ranked, _blocked = await self.search_with_diagnostics(
+            query,
+            ctx,
+            scan_limit,
+            time_intent=time_intent if time_intent.active else None,
+        )
+        visible = await self._filter_navigation_results(
+            ctx,
+            [item.memory for item in ranked],
+            source_results=ranked,
+        )
+        visible = visible[:per_step_limit]
+        await self.store.mark_accessed([item.memory.id for item in visible])
+        return (
+            [self._serialize_navigation_evidence(item, action="search") for item in visible],
+            [],
+        )
+
+    async def _navigate_event_records(
+        self,
+        ctx: SessionContext,
+        *,
+        action: str,
+        query: str,
+        memory_ids: list[str],
+        per_step_limit: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        if memory_ids:
+            current = await self.store.get_memories_by_ids(memory_ids)
+            candidates = [current[memory_id] for memory_id in memory_ids if memory_id in current]
+            visible = await self._filter_navigation_results(ctx, candidates)
+        else:
+            scan_limit = min(self._reconstruction_scan_limit(), max(per_step_limit * 4, per_step_limit))
+            time_intent = parse_time_intent(query)
+            ranked, _blocked = await self.search_with_diagnostics(
+                query,
+                ctx,
+                scan_limit,
+                time_intent=time_intent if time_intent.active else None,
+            )
+            visible = await self._filter_navigation_results(
+                ctx,
+                [item.memory for item in ranked],
+                source_results=ranked,
+            )
+        visible = visible[:per_step_limit]
+        await self.store.mark_accessed([item.memory.id for item in visible])
+        return (
+            [self._serialize_navigation_evidence(item, action=action) for item in visible],
+            [],
+        )
+
+    async def _navigate_graph(
+        self,
+        ctx: SessionContext,
+        *,
+        action: str,
+        query: str,
+        cue: str,
+        tag: str,
+        memory_ids: list[str],
+        node_type: str,
+        per_step_limit: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        terms = self._reconstruction_terms(query, cue)
+        paths = await self.store.query_knowledge_paths(
+            terms,
+            tag=tag,
+            node_type=node_type,
+            memory_ids=memory_ids,
+            limit=self._reconstruction_scan_limit(),
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            group_id=ctx.group_id,
+            user_id=ctx.user_id,
+        )
+        if action == "reverse_cues":
+            paths = [
+                path
+                for path in paths
+                if clean_text(path.get("source_type"), 40).casefold() == "cue"
+                or clean_text(path.get("target_type"), 40).casefold() == "cue"
+            ]
+        source_ids: list[str] = []
+        paths_by_memory: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for path in paths:
+            memory_id = clean_text(path.get("source_memory_id"), 120)
+            if not memory_id:
+                continue
+            if memory_id not in source_ids:
+                source_ids.append(memory_id)
+            paths_by_memory[memory_id].append(path)
+        current = await self.store.get_memories_by_ids(source_ids)
+        candidates = [current[memory_id] for memory_id in source_ids if memory_id in current]
+        visible = await self._filter_navigation_results(
+            ctx,
+            candidates,
+            relevance_reason="graph_navigation;hits=1",
+        )
+        visible = visible[:per_step_limit]
+        visible_ids = {item.memory.id for item in visible}
+        await self.store.mark_accessed(list(visible_ids))
+        evidence = [
+            self._serialize_navigation_evidence(
+                item,
+                action=action,
+                paths=paths_by_memory.get(item.memory.id, []),
+            )
+            for item in visible
+        ]
+        hints: list[dict[str, str]] = []
+        for memory_id in source_ids:
+            if memory_id not in visible_ids:
+                continue
+            for path in paths_by_memory.get(memory_id, []):
+                hint = self._navigation_hint(memory_id, path)
+                if hint and hint not in hints:
+                    hints.append(hint)
+                if len(hints) >= per_step_limit * 3:
+                    break
+            if len(hints) >= per_step_limit * 3:
+                break
+        return evidence, hints
+
+    async def _filter_navigation_results(
+        self,
+        ctx: SessionContext,
+        candidates: list[MemoryRecord],
+        *,
+        source_results: list[SearchResult] | None = None,
+        relevance_reason: str = "navigation_candidate",
+    ) -> list[SearchResult]:
+        engine = self._retrieval_validation_engine()
+        visible, _blocked = await engine.filter_visible_candidates(
+            candidates,
+            ctx,
+            reason=relevance_reason,
+        )
+        source_by_id = {
+            clean_text(item.memory.id, 120): item
+            for item in (source_results or [])
+            if clean_text(getattr(item.memory, "id", ""), 120)
+        }
+        for item in visible:
+            source = source_by_id.get(clean_text(item.memory.id, 120))
+            if source is not None:
+                item.score = source.score
+                item.reason = f"{item.reason};{source.reason}"
+            elif relevance_reason:
+                item.reason = f"{item.reason};{clean_text(relevance_reason, 240)}"
+        if ctx.scope == "group":
+            current_user_id = clean_text(ctx.user_id, 160)
+            speaker_visible: list[SearchResult] = []
+            for item in visible:
+                memory = item.memory
+                is_private = (
+                    clean_text(memory.scope, 40).casefold() == "private"
+                    or clean_text(memory.visibility, 40).casefold() == "private_pair"
+                )
+                if is_private:
+                    owner_id, _owner_names = self._memory_user_actor(memory)
+                    if not current_user_id or not owner_id or owner_id != current_user_id:
+                        continue
+                speaker_visible.append(item)
+            visible = speaker_visible
+        filtered, _actor_blocked = self._filter_group_actor_memory_slots(
+            ctx,
+            {"stable_memory": visible},
+            query_text=ctx.message_text,
+        )
+        return self._flatten_slot_map(filtered)
+
+    @staticmethod
+    def _reconstruction_terms(query: str, cue: str) -> list[str]:
+        values: list[str] = []
+        for value in (cue, query):
+            text = clean_text(value, 160)
+            if text and text.casefold() not in {item.casefold() for item in values}:
+                values.append(text)
+        return values[:8]
+
+    def _serialize_navigation_evidence(
+        self,
+        item: SearchResult,
+        *,
+        action: str,
+        paths: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        memory = item.memory
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        payload: dict[str, Any] = {
+            "memory_id": memory.id,
+            "memory_type": memory.memory_type,
+            "content": clean_text(memory.content, 1200),
+            "reality_level": memory.reality_level,
+            "confidence": memory.confidence,
+            "occurred_at": memory.occurred_at,
+            "occurred_at_local": self._local_time_label(memory.occurred_at),
+            "time_range": {
+                "start_at": clean_text(metadata.get("start_at"), 80),
+                "end_at": clean_text(metadata.get("end_at"), 80),
+                "start_at_local": clean_text(metadata.get("start_at_local"), 80),
+                "end_at_local": clean_text(metadata.get("end_at_local"), 80),
+                "timezone": clean_text(metadata.get("timezone") or "Asia/Shanghai", 40),
+            },
+            "subject": {
+                "id": clean_text(memory.subject.id, 120),
+                "name": clean_text(memory.subject.name, 80),
+            },
+            "object": {
+                "id": clean_text(memory.object.id, 120),
+                "name": clean_text(memory.object.name, 80),
+            },
+        }
+        if action == "event_context":
+            payload["evidence_preview"] = clean_text(memory.evidence, 1000)
+            payload["canonical_summary"] = clean_text(metadata.get("canonical_summary"), 600)
+        association_hints: list[dict[str, str]] = []
+        for path in paths or []:
+            hint = self._navigation_hint(memory.id, path)
+            if hint and hint not in association_hints:
+                association_hints.append(hint)
+            if len(association_hints) >= 4:
+                break
+        if association_hints:
+            payload["associations"] = association_hints
+        return payload
+
+    @staticmethod
+    def _navigation_hint(memory_id: str, path: dict[str, Any]) -> dict[str, str]:
+        metadata = path.get("edge_metadata") if isinstance(path.get("edge_metadata"), dict) else {}
+        source_type = clean_text(path.get("source_type"), 40).casefold()
+        target_type = clean_text(path.get("target_type"), 40).casefold()
+        cue = ""
+        if source_type == "cue":
+            cue = clean_text(path.get("source_label"), 160)
+        elif target_type == "cue":
+            cue = clean_text(path.get("target_label"), 160)
+        if not cue:
+            cue = clean_text(path.get("source_label") or path.get("target_label"), 160)
+        tag = clean_text(metadata.get("associative_tag") or path.get("relation_type"), 80)
+        content = clean_text(path.get("evidence"), 240)
+        layer = clean_text(metadata.get("content_layer"), 24)
+        if not (cue or tag or content):
+            return {}
+        return {
+            "memory_id": clean_text(memory_id, 120),
+            "cue": cue,
+            "tag": tag,
+            "content": content,
+            "layer": layer,
         }
 
     async def tool_note_create(self, event: Any, title: str, content: str = "") -> dict[str, Any]:
@@ -3364,6 +4142,7 @@ class MemoryCompanionService:
         self._save_relationship_phase_state()
         self._emotional_event_queue.clear()
         self._retrieval_result_cache.clear()
+        self._reconstruction_states.clear()
         self._embedding_backfill_inflight.clear()
         self._embedding_memory_inflight.clear()
         self._embedding_backfill_last_run.clear()
@@ -3436,6 +4215,7 @@ class MemoryCompanionService:
             elif target_type == "group_member" and scope == "group" and normalized["group_id"] == group_id:
                 self._emotional_event_queue.pop(session_id, None)
         self._retrieval_result_cache.clear()
+        self._reconstruction_states.clear()
 
     async def sleep_maintenance(self, *, reason: str = "manual") -> dict[str, Any]:
         backup = ""
@@ -5940,6 +6720,11 @@ class MemoryCompanionService:
         compact = re.sub(r"\s+", "", compact).lower()
         if not compact:
             return set()
+        current_markers = ("今天", "现在", "此刻", "这会", "刚刚", "目前", "现在的", "今天的")
+        if self._message_is_contextual_memory_request(compact) and not any(
+            marker in compact for marker in current_markers
+        ):
+            return set()
         anchors: set[str] = set()
         if any(token in compact for token in ("穿", "衣服", "衣着", "衣装", "制服", "裙", "外套", "裤", "胖次")):
             anchors.update({"穿", "衣服", "衣着", "衣装", "制服", "裙", "外套", "裤", "胖次"})
@@ -5958,7 +6743,6 @@ class MemoryCompanionService:
             anchors.update({"心情", "状态", "感觉", "累", "困", "开心", "难过"})
         if not anchors:
             return set()
-        current_markers = ("今天", "现在", "此刻", "这会", "刚刚", "目前", "现在的", "今天的")
         question_markers = ("什么", "啥", "怎样", "怎么样", "吗", "呢", "？", "?")
         if any(marker in compact for marker in current_markers) or any(marker in compact for marker in question_markers):
             return anchors
@@ -5997,6 +6781,11 @@ class MemoryCompanionService:
                 memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
                 visibility = clean_text(getattr(memory, "visibility", ""), 80).lower()
                 is_private = clean_text(getattr(memory, "scope", ""), 40).lower() == "private" or visibility == "private_pair"
+                acl_authorized_for_sender = self._acl_authorized_private_group_result(
+                    ctx,
+                    memory,
+                    item,
+                )
                 is_user_profile = slot == "user_profile" or memory_type in {
                     "user_profile",
                     "user_preference",
@@ -6007,7 +6796,7 @@ class MemoryCompanionService:
 
                 reason = ""
                 if is_private:
-                    if not contextual_private_use:
+                    if not contextual_private_use and not acl_authorized_for_sender:
                         reason = "group_private_memory_requires_recall_or_personalization"
                     elif not owner_id and not actor_mentioned:
                         reason = "group_private_memory_actor_unknown"
@@ -6028,6 +6817,43 @@ class MemoryCompanionService:
                 kept.append(item)
             cleaned[slot] = kept
         return cleaned, blocked
+
+    def _acl_authorized_private_group_result(
+        self,
+        ctx: SessionContext,
+        memory: Any,
+        item: Any,
+    ) -> bool:
+        """Recognize a relevant private candidate structurally shared to this speaker's group."""
+        if ctx.scope != "group":
+            return False
+        visibility = clean_text(getattr(memory, "visibility", ""), 80).lower()
+        scope = clean_text(getattr(memory, "scope", ""), 40).lower()
+        if scope != "private" and visibility != "private_pair":
+            return False
+        owner_id, _owner_names = self._memory_user_actor(memory)
+        current_user_id = clean_text(ctx.user_id, 160)
+        reader_id = clean_text(ctx.group_id or ctx.session_id, 160)
+        if not owner_id or not current_user_id or owner_id != current_user_id or not reader_id:
+            return False
+        reason = clean_text(getattr(item, "reason", ""), 2000)
+        acl_reason = f"acl_allowed:private:{owner_id}->group:{reader_id}"
+        if acl_reason not in reason:
+            return False
+        if not self._search_result_has_relevance_evidence(reason):
+            return False
+        return True
+
+    def _search_result_has_relevance_evidence(self, reason: str) -> bool:
+        """Require actual lexical or semantic evidence before seamless ACL use."""
+        if re.search(r"(?:^|;)exact=1(?:;|$)", reason):
+            return True
+        hits = re.search(r"(?:^|;)hits=(\d+)(?:;|$)", reason)
+        if hits and int(hits.group(1)) > 0:
+            return True
+        vector = re.search(r"(?:^|;)vector=([0-9]+(?:\.[0-9]+)?)(?:;|$)", reason)
+        threshold = max(0.0, min(1.0, self.config.float("retrieval.embedding_score_threshold", 0.34)))
+        return bool(vector and float(vector.group(1)) >= threshold)
 
     @staticmethod
     def _memory_user_actor(memory: Any) -> tuple[str, list[str]]:
@@ -6103,6 +6929,9 @@ class MemoryCompanionService:
                 "companion_note",
                 "conversation_event",
                 "timeline_event",
+                "explicit_memory",
+                "tool_memory",
+                "manual_memory",
             }
             or tags & {"current_state", "self_timeline", "today", "recent"}
         )
@@ -6616,6 +7445,11 @@ class MemoryCompanionService:
             return "uncertain", "low_confidence"
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
+        acl_authorized_for_sender = self._acl_authorized_private_group_result(
+            ctx,
+            memory,
+            item,
+        )
         short_rest_check = self._message_is_short_rest_check(text)
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
         mention_policy = clean_text(metadata.get("mention_policy"), 60)
@@ -6633,6 +7467,10 @@ class MemoryCompanionService:
             return "tone", "future_arrangement:indirect_background"
         if time_intent.active or decision.layer == "time_window":
             return "mention", "time_window_requested"
+        if acl_authorized_for_sender and not explicit_memory:
+            if mention_policy == "tone_only":
+                return "tone", "mention_policy:tone_only"
+            return "candidate", "acl_authorized_private_candidate"
         if not explicit_memory and mention_policy == "avoid_unless_asked":
             return "tone", "mention_policy:avoid_unless_asked"
         if not explicit_memory and mention_policy == "tone_only":
@@ -6660,7 +7498,12 @@ class MemoryCompanionService:
 
         if confidence < 0.58 or (age_days is not None and age_days >= 45 and score < 1.15):
             return "uncertain", "low_confidence_or_old"
-        if ctx.scope == "group" and slot in {"self_timeline", "user_profile"} and not explicit_memory:
+        if (
+            ctx.scope == "group"
+            and slot in {"self_timeline", "user_profile"}
+            and not explicit_memory
+            and not acl_authorized_for_sender
+        ):
             return "tone", "group_boundary"
         if memory.visibility == "bot_self" or slot == "self_timeline" or reality in {"bot_action", "persona_life", "fictional_content"}:
             if self._memory_has_long_term_explanatory_value(memory, metadata) and (explicit_memory or score >= 1.2):
@@ -6669,7 +7512,7 @@ class MemoryCompanionService:
         if memory_type in {"conversation_summary", "timeline_event"} or "summary" in tags:
             if short_rest_check and not explicit_memory:
                 return "tone", "short_rest_check:summary_tone_only"
-            if explicit_memory or slot == "time_window_timeline":
+            if explicit_memory or acl_authorized_for_sender or slot == "time_window_timeline":
                 return "mention", "summary_requested"
             return "tone", "conversation_continuity_background"
         if memory_type in {"user_profile", "user_preference", "relationship_claim", "explicit_memory", "manual_memory"}:
@@ -6677,10 +7520,10 @@ class MemoryCompanionService:
                 return "tone", "mention_policy:tone_only"
             if mention_policy == "soft_echo" and not explicit_memory and score < 1.0:
                 return "tone", "mention_policy:soft_echo_background"
-            if explicit_memory or score >= 1.0:
+            if explicit_memory or acl_authorized_for_sender or score >= 1.0:
                 return "mention", "stable_user_fact"
             return "tone", "profile_background"
-        if memory.sayability == "indirect" and not explicit_memory:
+        if memory.sayability == "indirect" and not explicit_memory and not acl_authorized_for_sender:
             return "tone", "indirect_memory"
         return "mention", "direct_relevance"
 

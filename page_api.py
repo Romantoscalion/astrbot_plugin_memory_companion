@@ -689,12 +689,22 @@ class PluginPageApi:
             bot_id=requested_bot_id,
             message_text=query,
         )
-        results, blocked = await self.plugin.service.search_with_diagnostics(
-            query,
-            ctx,
-            max(1, min(50, self._int(payload.get("top_k"), 8))),
-            admin_read_all=admin_read_all,
-        )
+        top_k = max(1, min(50, self._int(payload.get("top_k"), 8)))
+        search_context_slots = getattr(self.plugin.service, "search_context_slots", None)
+        if callable(search_context_slots):
+            results, blocked, _slot_map = await search_context_slots(
+                query,
+                ctx,
+                top_k,
+                admin_read_all=admin_read_all,
+            )
+        else:
+            results, blocked = await self.plugin.service.search_with_diagnostics(
+                query,
+                ctx,
+                top_k,
+                admin_read_all=admin_read_all,
+            )
         return self._ok(
             {
                 "results": [

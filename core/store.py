@@ -1837,6 +1837,193 @@ class MemoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    async def query_knowledge_paths(
+        self,
+        terms: list[str],
+        *,
+        tag: str = "",
+        node_type: str = "",
+        memory_ids: list[str] | None = None,
+        limit: int = 80,
+        session_id: str = "",
+        scope: str = "",
+        group_id: str = "",
+        user_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Return bounded one-hop graph paths for active memory reconstruction.
+
+        This storage query intentionally does not decide visibility. Callers must
+        resolve ``source_memory_id`` values to memories and apply the current ACL
+        before exposing any returned evidence.
+        """
+        return await asyncio.to_thread(
+            self._query_knowledge_paths_sync,
+            terms,
+            tag,
+            node_type,
+            memory_ids,
+            limit,
+            session_id,
+            scope,
+            group_id,
+            user_id,
+        )
+
+    def _query_knowledge_paths_sync(
+        self,
+        terms: list[str],
+        tag: str,
+        node_type: str,
+        memory_ids: list[str] | None,
+        limit: int,
+        session_id: str,
+        scope: str,
+        group_id: str,
+        user_id: str,
+    ) -> list[dict[str, Any]]:
+        # Keep placeholder counts comfortably below SQLite's common variable
+        # limit. Repeated tool calls provide traversal depth at the service layer.
+        cleaned_terms: list[str] = []
+        raw_terms = terms if isinstance(terms, list) else []
+        for raw_term in raw_terms:
+            term = clean_text(raw_term, 160).lower()
+            if term and term not in cleaned_terms:
+                cleaned_terms.append(term)
+            if len(cleaned_terms) >= 32:
+                break
+
+        cleaned_memory_ids: list[str] = []
+        raw_memory_ids = memory_ids if isinstance(memory_ids, list) else []
+        for raw_memory_id in raw_memory_ids:
+            memory_id = clean_text(raw_memory_id, 120)
+            if memory_id and memory_id not in cleaned_memory_ids:
+                cleaned_memory_ids.append(memory_id)
+            if len(cleaned_memory_ids) >= 256:
+                break
+
+        tag = clean_text(tag, 80).lower()
+        node_type = clean_text(node_type, 40).lower()
+        session_id = clean_text(session_id, 200)
+        scope = clean_text(scope, 40).lower()
+        group_id = clean_text(group_id, 120)
+        user_id = clean_text(user_id, 160)
+        if not cleaned_terms and not tag and not node_type and not cleaned_memory_ids:
+            return []
+
+        def literal_like(value: str) -> str:
+            escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            return f"%{escaped}%"
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if cleaned_terms:
+            term_clauses: list[str] = []
+            for term in cleaned_terms:
+                term_clauses.append(
+                    "(lower(s.label) LIKE ? ESCAPE '\\' OR lower(t.label) LIKE ? ESCAPE '\\')"
+                )
+                pattern = literal_like(term)
+                params.extend([pattern, pattern])
+            clauses.append("(" + " OR ".join(term_clauses) + ")")
+        if tag:
+            tag_pattern = literal_like(tag)
+            clauses.append(
+                """
+                (
+                    lower(
+                        CASE
+                            WHEN json_valid(e.metadata)
+                            THEN coalesce(CAST(json_extract(e.metadata, '$.associative_tag') AS TEXT), '')
+                            ELSE ''
+                        END
+                    ) LIKE ? ESCAPE '\\'
+                    OR (lower(s.node_type)='tag' AND lower(s.label) LIKE ? ESCAPE '\\')
+                    OR (lower(t.node_type)='tag' AND lower(t.label) LIKE ? ESCAPE '\\')
+                )
+                """
+            )
+            params.extend([tag_pattern, tag_pattern, tag_pattern])
+        if node_type:
+            clauses.append("(lower(s.node_type)=? OR lower(t.node_type)=?)")
+            params.extend([node_type, node_type])
+        if cleaned_memory_ids:
+            placeholders = ",".join("?" for _ in cleaned_memory_ids)
+            clauses.append(f"e.source_memory_id IN ({placeholders})")
+            params.extend(cleaned_memory_ids)
+
+        try:
+            bounded_limit = max(1, min(200, int(limit)))
+        except (TypeError, ValueError):
+            bounded_limit = 80
+
+        # Prefer paths that are likely to survive the service-layer visibility
+        # check. This keeps a dense, unrelated user's graph from consuming the
+        # bounded scan budget before current-session evidence is considered.
+        priority_cases: list[str] = []
+        priority_params: list[Any] = []
+        if session_id:
+            priority_cases.append("WHEN e.session_id=? THEN 0")
+            priority_params.append(session_id)
+        if user_id:
+            priority_cases.append("WHEN (m.subject_id=? OR m.object_id=?) THEN 1")
+            priority_params.extend([user_id, user_id])
+        if group_id:
+            priority_cases.append("WHEN e.group_id=? THEN 2")
+            priority_params.append(group_id)
+        if scope:
+            priority_cases.append("WHEN lower(e.scope)=? THEN 3")
+            priority_params.append(scope)
+        priority_order = (
+            "CASE " + " ".join(priority_cases) + " ELSE 4 END, "
+            if priority_cases
+            else ""
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT
+                    e.id AS edge_id,
+                    e.source_memory_id,
+                    e.source_node_id,
+                    s.node_type AS source_type,
+                    s.node_key AS source_key,
+                    s.label AS source_label,
+                    s.metadata AS source_metadata,
+                    e.target_node_id,
+                    t.node_type AS target_type,
+                    t.node_key AS target_key,
+                    t.label AS target_label,
+                    t.metadata AS target_metadata,
+                    e.relation_type,
+                    e.evidence,
+                    e.confidence,
+                    e.review_status,
+                    e.scope,
+                    e.session_id,
+                    e.group_id,
+                    e.metadata AS edge_metadata,
+                    e.created_at,
+                    e.updated_at
+                FROM knowledge_edges e
+                JOIN knowledge_nodes s ON s.id=e.source_node_id
+                JOIN knowledge_nodes t ON t.id=e.target_node_id
+                LEFT JOIN memories m ON m.id=e.source_memory_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY {priority_order}e.confidence DESC, e.updated_at DESC, e.id ASC
+                LIMIT ?
+                """,
+                params + priority_params + [bounded_limit],
+            ).fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            for key in ("source_metadata", "target_metadata", "edge_metadata"):
+                parsed = json_loads(item.get(key), {})
+                item[key] = parsed if isinstance(parsed, dict) else {}
+            results.append(item)
+        return results
+
     async def related_knowledge_terms(
         self,
         terms: list[str],

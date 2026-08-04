@@ -776,6 +776,43 @@
         "hint": "开启后模型可创建、读取和删除当前 Bot 自己可见的 companion_note，用于日程、状态、创作草稿和陪伴线索整理。",
         "type": "bool",
         "default": true
+      },
+      "enable_reconstruction_tool": {
+        "description": "启用记忆导航工具",
+        "hint": "开启后，模型可在普通召回证据不足时调用 memory_companion_navigate，按当前证据逐步补查；每一步仍会重新检查窗口、平台、Bot、权限和群发言者边界。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "memory_reconstruction": {
+    "description": "主动记忆重建",
+    "hint": "为明确回忆、时间、个性化和多跳问题提供有界的逐步证据导航。普通聊天仍使用原有快速检索。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用主动重建",
+        "hint": "开启后，复杂记忆问题可在首轮证据不足时继续导航；是否继续和何时停止由提示词约束。",
+        "type": "bool",
+        "default": true
+      },
+      "max_steps": {
+        "description": "单轮最多导航步数",
+        "hint": "同一条消息最多允许多少次不同的导航调用。默认 3；这是资源上限，不要求模型用满。",
+        "type": "int",
+        "default": 3
+      },
+      "per_step_limit": {
+        "description": "每步证据条数",
+        "hint": "每次导航最多返回多少条当前可见候选。默认 6，较小值可减少提示词体量。",
+        "type": "int",
+        "default": 6
+      },
+      "candidate_scan_limit": {
+        "description": "每步图候选扫描数",
+        "hint": "每步最多扫描多少条关联路径，再按当前权限过滤并截取可见证据。默认 96。",
+        "type": "int",
+        "default": 96
       }
     }
   },

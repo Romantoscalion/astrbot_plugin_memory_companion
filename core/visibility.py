@@ -50,6 +50,17 @@ class VisibilityPolicy:
         if memory.visibility == "shareable":
             return True, "shareable"
         if memory.visibility == "private_pair":
+            owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
+            if not owner_ok:
+                return False, owner_reason
+            memory_platform = _clean_id(memory.platform).lower()
+            current_platform = _clean_id(ctx.platform).lower()
+            if memory_platform == "unknown":
+                memory_platform = ""
+            if current_platform == "unknown":
+                current_platform = ""
+            if memory_platform and current_platform and memory_platform != current_platform:
+                return False, "other_platform"
             if memory.session_id and memory.session_id == ctx.session_id:
                 return True, "same_private_session"
             if ctx.scope != "private":
