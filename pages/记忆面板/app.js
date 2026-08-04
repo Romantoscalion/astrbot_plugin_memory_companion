@@ -3,7 +3,7 @@ const PAGE_ENDPOINT_PREFIX = "page";
 const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 
 const VIEWS = {
-  objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和拟人维度概览。" },
+  objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和互动协同概览。" },
   film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。" },
   microscope: { title: "记忆显微镜", hint: "对比全库管理检索与指定会话中的实际召回和过滤。" },
   relations: { title: "用户记忆", hint: "聚焦用户画像、偏好、称呼和关系声明。" },
@@ -36,7 +36,7 @@ const SECONDARY_NAV = {
     { id: "relations", label: "图谱边", sublabel: "人物、话题、事实与记忆关联", badge: "图谱" },
     { id: "threads", label: "跨窗口线程", sublabel: "不同私聊/群聊之间的待办线索", badge: "线程" },
     { id: "timeline", label: "时间线", sublabel: "最近记录的事件节点", badge: "时间" },
-    { id: "persona", label: "拟人维度", sublabel: "关系阶段 · 情绪连续性 · 称呼演进", badge: "拟人" },
+    { id: "persona", label: "互动协同", sublabel: "表达权威 · 记忆触动 · 情绪连续性", badge: "协同" },
   ],
   microscope: [
     { id: "query", label: "召回测试", sublabel: "输入一句话模拟检索", badge: "测试" },
@@ -4494,7 +4494,7 @@ function renderMemoryStructuredMetadata(memory) {
           <div class="memory-diagnostics-grid">
             ${policy ? `<span><em>策略</em><strong>${escapeHtml(mentionPolicyLabel(policy))}</strong></span>` : ""}
             ${mentionability !== undefined && mentionability !== null ? `<span><em>可提及性</em><strong>${escapeHtml(percentLabel(mentionability))}</strong></span>` : ""}
-            ${phase ? `<span><em>关系阶段</em><strong>${escapeHtml(phase)}</strong></span>` : ""}
+            ${phase ? `<span><em>当时关系情境</em><strong>${escapeHtml(phase)}</strong></span>` : ""}
             ${decayMode ? `<span><em>衰减</em><strong>${escapeHtml(decayModeLabel(decayMode))}</strong></span>` : ""}
             ${feedback.last_reaction ? `<span><em>上次反馈</em><strong>${escapeHtml(reactionLabel(feedback.last_reaction))}</strong></span>` : ""}
           </div>
@@ -6017,7 +6017,7 @@ function renderHistoricalChatStatus(result) {
           <span>重要事件 ${number(memoryCounts.important_event)}</span>
           <span>日摘要 ${number(memoryCounts.daily_digest)}</span>
           <span>稳定事实 ${number(memoryCounts.stable_fact)}</span>
-          <span>阶段摘要 ${number(memoryCounts.relationship_phase_summary)}</span>
+          <span>相处经历摘要 ${number(memoryCounts.relationship_phase_summary)}</span>
         </div>
       ` : ""}
       ${batch.stats?.embedding?.enabled ? `<small class="chat-import-embedding-note">向量索引 ${number(batch.stats.embedding.indexed)}/${number(batch.stats.embedding.eligible)} · ${escapeHtml(batch.stats.embedding.status || "处理中")}</small>` : ""}
@@ -6491,7 +6491,7 @@ function bindActions() {
 async function loadPersonaState() {
   const panel = $("#personaStatePanel");
   if (!panel) return;
-  panel.innerHTML = `<div class="persona-loading">正在读取拟人维度数据...</div>`;
+  panel.innerHTML = `<div class="persona-loading">正在读取互动协同数据...</div>`;
   let data;
   try {
     data = await apiGet("/persona-state");
@@ -6503,17 +6503,13 @@ async function loadPersonaState() {
 }
 
 function renderPersonaState(d) {
-  const phases = d.phases || [];
-  const events = d.pending_emotional_events || [];
+  const coordination = d.expression_coordination || {};
+  const trends = d.memory_touch_trends || [];
+  const events = d.memory_touch_events || [];
   const crossState = d.cross_window_emotional_state || {};
   const timeOfDay = d.time_of_day || "";
-  const phaseLabels = d.phase_labels || {};
-  const addressLabels = d.address_phase_labels || {};
+  const legacyLabels = d.legacy_context_labels || {};
   const timeLabels = d.time_of_day_labels || {};
-  const botAddress = d.bot_address_suggestions || {};
-  const phaseDefs = d.phase_definitions || {};
-  const allPhases = phaseDefs.phases || ["acquaintance", "familiar", "close", "intimate", "deeply_bonded"];
-  const thresholds = phaseDefs.thresholds || [0.0, 0.20, 0.45, 0.65, 0.85];
 
   const timeLabel = timeLabels[timeOfDay] || timeOfDay || "未知";
   const crossTotal = crossState.total || 0;
@@ -6523,7 +6519,26 @@ function renderPersonaState(d) {
 
   let html = '<div class="persona-grid">';
 
-  // 1. Time-of-day and cross-window summary card
+  html += `
+    <div class="persona-card persona-card-wide">
+      <div class="persona-card-head">
+        <b>陪伴表达协同状态</b>
+        <span class="persona-badge">只读</span>
+      </div>
+      <div class="persona-card-body">
+        <div class="persona-cross-window">
+          <span class="persona-cw-label">最终语气、称呼、互动档位由陪伴插件统一决定</span>
+          <div class="persona-cw-stats">
+            <span class="persona-cw-stat is-active">${escapeHtml(coordination.contract || "未检测到合同")}</span>
+            <span class="persona-cw-stat">请求级消费</span>
+            <span class="persona-cw-stat">不持久化表达状态</span>
+          </div>
+          <small class="persona-cw-empty">记忆插件只负责事实、可见性、召回和记忆提及上限，不会建立第二套好感度、互动状态或称呼系统。</small>
+        </div>
+      </div>
+    </div>
+  `;
+
   html += `
     <div class="persona-card persona-card-wide">
       <div class="persona-card-head">
@@ -6545,38 +6560,37 @@ function renderPersonaState(d) {
     </div>
   `;
 
-  // 2. Relationship phases
-  if (phases.length === 0) {
+  if (trends.length === 0) {
     html += `
       <div class="persona-card persona-card-wide">
-        <div class="persona-card-head"><b>关系阶段</b></div>
+        <div class="persona-card-head"><b>记忆触动趋势</b></div>
         <div class="persona-card-body">
-          <p class="persona-empty">还没有足够的关系互动数据。随着对话积累，关系阶段会自然演进。</p>
+          <p class="persona-empty">暂无历史记忆触动记录。该区域只反映记忆被触动的趋势，不代表当前好感度或互动状态。</p>
         </div>
       </div>
     `;
   } else {
     html += `
       <div class="persona-card persona-card-wide">
-        <div class="persona-card-head"><b>关系阶段演进</b><span class="persona-badge">${phases.length} 个会话</span></div>
+        <div class="persona-card-head"><b>记忆触动趋势</b><span class="persona-badge">${trends.length} 个会话</span></div>
         <div class="persona-card-body">
           <div class="persona-phase-list">
-            ${phases.map(p => renderPersonaPhaseItem(p, allPhases, thresholds, phaseLabels, addressLabels, botAddress)).join('')}
+            ${trends.map(item => renderMemoryTouchTrend(item, legacyLabels)).join('')}
           </div>
         </div>
       </div>
     `;
   }
 
-  // 3. Pending emotional events
   if (events.length > 0) {
     html += `
       <div class="persona-card persona-card-wide">
-        <div class="persona-card-head"><b>情绪事件队列</b><span class="persona-badge">${events.length} 条待处理</span></div>
+        <div class="persona-card-head"><b>记忆触动事件</b><span class="persona-badge">${events.length} 条待处理</span></div>
         <div class="persona-card-body">
           <div class="persona-event-list">
             ${events.map(e => renderPersonaEventItem(e)).join('')}
           </div>
+          <small class="persona-cw-empty">这些事件只作为陪伴插件 Bot 心情与精力的输入，最终表达仍由陪伴插件裁决。</small>
         </div>
       </div>
     `;
@@ -6586,80 +6600,38 @@ function renderPersonaState(d) {
   return html;
 }
 
-function renderPersonaPhaseItem(p, allPhases, thresholds, phaseLabels, addressLabels, botAddress) {
-  const phase = p.phase || 'acquaintance';
-  const momentum = p.momentum || 0;
-  const phaseLabel = phaseLabels[phase] || phase;
+function renderMemoryTouchTrend(p, legacyLabels) {
+  const trend = p.trend_band || 'steady';
+  const trendLabels = { rising: '升温触动', steady: '平稳触动', cooling: '降温触动' };
+  const trendLabel = trendLabels[trend] || trend;
+  const trendPercent = trend === 'rising' ? 82 : trend === 'cooling' ? 24 : 52;
+  const trendClass = trend === 'rising' ? 'is-high' : trend === 'cooling' ? 'is-low' : 'is-mid';
   const touchCount = p.touch_count || 0;
-  const addressPhase = p.current_address_phase || '';
-  const addressLabel = addressLabels[addressPhase] || '';
+  const legacyContext = p.legacy_context || '';
+  const legacyLabel = legacyLabels[legacyContext] || legacyContext;
   const updatedAt = p.updated_at || '';
   const sessionKey = p.session_label || p.session_key || '';
   const shortSession = sessionKey.length > 40 ? sessionKey.slice(0, 37) + '...' : sessionKey;
-
-  // Find current phase index for progress bar
-  const phaseIdx = allPhases.indexOf(phase);
-  const phasePercent = phaseIdx >= 0 ? ((phaseIdx + 1) / allPhases.length) * 100 : 20;
-
-  // Momentum bar: map [-0.3, 1.0] to [0%, 100%]
-  const momentumPercent = Math.max(0, Math.min(100, ((momentum + 0.3) / 1.3) * 100));
-  const momentumClass = momentum >= 0.45 ? 'is-high' : momentum >= 0.15 ? 'is-mid' : momentum < 0 ? 'is-low' : '';
-
-  // Bot address suggestion
-  const botSuggestion = botAddress[phase] || {};
-  const botTone = botSuggestion.tone || '';
-  const botHint = botSuggestion.hint || '';
-
-  // Address log
-  const addressLog = p.address_log || [];
-  const hasAddressLog = addressLog.length > 0;
 
   return `
     <div class="persona-phase-item">
       <div class="persona-phase-header">
         <div class="persona-phase-info">
-          <span class="persona-phase-name">${escapeHtml(phaseLabel)}</span>
+          <span class="persona-phase-name">${escapeHtml(trendLabel)}</span>
           <small class="persona-phase-session">${escapeHtml(shortSession)}</small>
         </div>
         <div class="persona-phase-meta">
           <span class="persona-phase-touch">${touchCount} 次触动</span>
-          ${addressLabel ? `<span class="persona-phase-address">称呼：${escapeHtml(addressLabel)}</span>` : ''}
-        </div>
-      </div>
-      <div class="persona-phase-progress">
-        <div class="persona-phase-bar">
-          <div class="persona-phase-bar-fill" style="width:${phasePercent}%"></div>
-        </div>
-        <div class="persona-phase-steps">
-          ${allPhases.map((ph, i) => `<span class="persona-phase-step ${i <= phaseIdx ? 'is-active' : ''}">${escapeHtml(phaseLabels[ph] || ph)}</span>`).join('')}
+          ${legacyLabel ? `<span class="persona-phase-address">历史情境：${escapeHtml(legacyLabel)}</span>` : ''}
         </div>
       </div>
       <div class="persona-momentum">
-        <span class="persona-momentum-label">动量</span>
+        <span class="persona-momentum-label">触动趋势</span>
         <div class="persona-momentum-bar">
-          <div class="persona-momentum-fill ${momentumClass}" style="width:${momentumPercent}%"></div>
+          <div class="persona-momentum-fill ${trendClass}" style="width:${trendPercent}%"></div>
         </div>
-        <span class="persona-momentum-value">${momentum.toFixed(3)}</span>
+        <span class="persona-momentum-value">${escapeHtml(trendLabel)}</span>
       </div>
-      ${botTone ? `
-        <div class="persona-bot-address">
-          <span class="persona-bot-tone">${escapeHtml(botTone)}</span>
-          ${botHint ? `<small class="persona-bot-hint">${escapeHtml(botHint)}</small>` : ''}
-        </div>
-      ` : ''}
-      ${hasAddressLog ? `
-        <details class="persona-address-log">
-          <summary>称呼演变记录 (${addressLog.length})</summary>
-          <div class="persona-address-timeline">
-            ${addressLog.map(log => `
-              <div class="persona-address-entry">
-                <span class="persona-address-time">${escapeHtml((log.ts || '').slice(0, 16))}</span>
-                <span class="persona-address-change">${escapeHtml(addressLabels[log.previous] || log.previous || '—')} → ${escapeHtml(addressLabels[log.phase] || log.phase || '')}</span>
-              </div>
-            `).join('')}
-          </div>
-        </details>
-      ` : ''}
       ${updatedAt ? `<small class="persona-phase-updated">更新于 ${escapeHtml(updatedAt.slice(0, 16))}</small>` : ''}
     </div>
   `;

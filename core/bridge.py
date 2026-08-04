@@ -24,6 +24,98 @@ _COMPANION_RELATIONSHIP_PHASES = {
     "intimate",
     "deeply_bonded",
 }
+_COMPANION_INTERACTION_BANDS = {
+    "avoidant",
+    "hurt",
+    "relaxed",
+    "lively",
+    "warm",
+    "close",
+    "affectionate",
+}
+_COMPANION_EXPRESSION_CONTRACT = "companion_interaction_expression.v1"
+_COMPANION_EXPRESSION_BEHAVIORS = {
+    "acknowledge",
+    "brief_reply",
+    "give_space",
+    "reply",
+    "clarify",
+    "light_humor",
+    "followup",
+    "support",
+    "shared_ritual",
+    "affectionate_expression",
+}
+_COMPANION_EXPRESSION_SAFETY_MODES = {
+    "normal",
+    "contact_boundary_passive",
+    "contact_boundary",
+    "p4_blocked",
+}
+_COMPANION_EXPRESSION_BLOCKERS = {"contact_boundary", "p4_safety"}
+_COMPANION_EXPRESSION_REASON_CODES = {
+    "relationship_baseline_retained",
+    "interaction_band_applied",
+    "administrator_override_applied",
+    "owner_role_required",
+    "contact_boundary_passive_reengagement",
+    "p4_warmth_cap_applied",
+    "relationship_tone_applied",
+    "relationship_address_applied",
+    "relationship_followup_cap",
+    "intent_followup_suppressed",
+    "low_energy_expression_cap",
+    "down_mood_expression_cap",
+    "up_mood_expression_lift",
+    "relationship_proactive_cap",
+    "interaction_proactive_suppressed",
+    "schedule_proactive_suppressed",
+    "p4_blocked",
+    "contact_boundary",
+}
+
+
+def sanitize_companion_expression_decision(value: Any) -> dict[str, Any]:
+    """Accept only the bounded, request-scoped Companion expression contract."""
+
+    fallback = {"status": "invalid", "read_only": True, "decision": {}}
+    if type(value) is not dict or value.get("contract") != _COMPANION_EXPRESSION_CONTRACT:
+        return fallback
+    expression_band = value.get("expression_band")
+    if type(expression_band) is not str or expression_band not in _COMPANION_INTERACTION_BANDS:
+        return fallback
+    allowed_behaviors = value.get("allowed_behaviors")
+    if type(allowed_behaviors) not in {list, tuple} or len(allowed_behaviors) > 12:
+        return fallback
+    if any(type(item) is not str or item not in _COMPANION_EXPRESSION_BEHAVIORS for item in allowed_behaviors):
+        return fallback
+    if len(set(allowed_behaviors)) != len(allowed_behaviors):
+        return fallback
+    safety_mode = value.get("safety_mode")
+    if type(safety_mode) is not str or safety_mode not in _COMPANION_EXPRESSION_SAFETY_MODES:
+        return fallback
+    blocker = value.get("blocker")
+    if blocker is not None and (type(blocker) is not str or blocker not in _COMPANION_EXPRESSION_BLOCKERS):
+        return fallback
+    reason_codes = value.get("reason_codes")
+    if type(reason_codes) not in {list, tuple} or len(reason_codes) > 24:
+        return fallback
+    if any(type(item) is not str or item not in _COMPANION_EXPRESSION_REASON_CODES for item in reason_codes):
+        return fallback
+    if type(value.get("followup")) is not bool:
+        return fallback
+    return {
+        "status": "accepted",
+        "read_only": True,
+        "decision": {
+            "contract": _COMPANION_EXPRESSION_CONTRACT,
+            "expression_band": expression_band,
+            "allowed_behaviors": list(allowed_behaviors),
+            "safety_mode": safety_mode,
+            "blocker": blocker,
+            "reason_codes": list(reason_codes),
+        },
+    }
 
 
 def sanitize_companion_relationship_projection(value: Any) -> dict[str, Any]:
@@ -67,6 +159,20 @@ def sanitize_companion_relationship_projection(value: Any) -> dict[str, Any]:
             )
         },
     }
+    relationship_mode = value.get("relationship_mode")
+    if relationship_mode in {"normal", "owner_exclusive"}:
+        projection["relationship_mode"] = relationship_mode
+    current_interaction = value.get("current_interaction")
+    if type(current_interaction) is dict:
+        expression_band = current_interaction.get("expression_band")
+        if type(expression_band) is str and expression_band in _COMPANION_INTERACTION_BANDS:
+            projection["current_interaction"] = {
+                "expression_band": expression_band,
+                "label": clean_text(current_interaction.get("label"), 40),
+                "source": clean_text(current_interaction.get("source"), 40),
+                "reason": clean_text(current_interaction.get("reason"), 120),
+                "manual_override": current_interaction.get("manual_override") is True,
+            }
     return {"status": "accepted", "read_only": True, "projection": projection}
 
 

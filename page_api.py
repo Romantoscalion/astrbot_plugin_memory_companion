@@ -377,10 +377,10 @@ class PluginPageApi:
             return self._err(f"历史对话导入回滚失败: {exc}", 500)
 
     async def persona_state(self):
-        """Return persona state: relationship phases, emotional events, address evolution, cross-window state."""
+        """Return read-only expression coordination and memory-touch diagnostics."""
         try:
             service = self.plugin.service
-            phases: list[dict[str, Any]] = []
+            touch_trends: list[dict[str, Any]] = []
             phase_state = getattr(service, "_relationship_phase_state", None)
             if isinstance(phase_state, dict):
                 for key, state in phase_state.items():
@@ -396,19 +396,19 @@ class PluginPageApi:
                     member_id = clean_text(identity.get("member_id"), 120)
                     if member_id:
                         identity_parts.append(f"member={member_id}")
-                    phases.append({
+                    raw_momentum = state.get("momentum", 0.0)
+                    momentum = float(raw_momentum) if type(raw_momentum) in {int, float} else 0.0
+                    trend_band = "rising" if momentum >= 0.08 else "cooling" if momentum <= -0.08 else "steady"
+                    touch_trends.append({
                         "session_key": key,
                         "session_label": " / ".join(part for part in identity_parts if part) or key,
-                        "phase": state.get("phase", "acquaintance"),
-                        "momentum": round(state.get("momentum", 0.0), 3),
+                        "trend_band": trend_band,
                         "touch_count": state.get("touch_count", 0),
-                        "last_transition_at": state.get("last_transition_at", ""),
+                        "legacy_context": clean_text(state.get("phase"), 40),
                         "updated_at": state.get("updated_at", ""),
-                        "current_address_phase": state.get("current_address_phase", ""),
-                        "address_log": (state.get("address_log") or [])[-5:],
                     })
-            phases.sort(key=lambda p: p.get("updated_at", ""), reverse=True)
-            pending_emotional_events: list[dict[str, Any]] = []
+            touch_trends.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+            memory_touch_events: list[dict[str, Any]] = []
             event_queue = getattr(service, "_emotional_event_queue", None)
             if isinstance(event_queue, dict):
                 for session_id, queue in event_queue.items():
@@ -417,7 +417,7 @@ class PluginPageApi:
                     for event in queue[-3:]:
                         if not isinstance(event, dict):
                             continue
-                        pending_emotional_events.append({
+                        memory_touch_events.append({
                             "session_id": session_id,
                             "event_type": event.get("event_type"),
                             "energy_delta": event.get("energy_delta"),
@@ -431,24 +431,18 @@ class PluginPageApi:
             cross_window_state: dict[str, Any] = {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
             if hasattr(service, "_get_cross_window_emotional_state"):
                 cross_window_state = service._get_cross_window_emotional_state()
-            phases_list = getattr(service, "_PHASES", ["acquaintance", "familiar", "close", "intimate", "deeply_bonded"])
-            thresholds = getattr(service, "_PHASE_THRESHOLDS", [0.0, 0.20, 0.45, 0.65, 0.85])
-            bot_suggestions = getattr(service, "_BOT_ADDRESS_SUGGESTIONS", {})
             return self._ok({
-                "phases": phases[:20],
-                "pending_emotional_events": pending_emotional_events[:15],
+                "expression_coordination": {
+                    "contract": "companion_interaction_expression.v1",
+                    "mode": "request_scoped_read_only",
+                    "expression_authority": "private_companion",
+                    "memory_role": "recall_visibility_and_mention_cap",
+                    "persistent": False,
+                },
+                "memory_touch_trends": touch_trends[:20],
+                "memory_touch_events": memory_touch_events[:15],
                 "time_of_day": time_of_day,
-                "phase_definitions": {
-                    "phases": phases_list,
-                    "thresholds": thresholds,
-                },
                 "cross_window_emotional_state": cross_window_state,
-                "address_phase_labels": {
-                    "formal": "正式",
-                    "casual": "随意",
-                    "intimate": "亲密",
-                    "playful": "玩笑",
-                },
                 "time_of_day_labels": {
                     "late_night": "深夜",
                     "dawn": "凌晨",
@@ -457,8 +451,7 @@ class PluginPageApi:
                     "evening": "傍晚",
                     "night": "夜间",
                 },
-                "bot_address_suggestions": bot_suggestions,
-                "phase_labels": {
+                "legacy_context_labels": {
                     "acquaintance": "初识",
                     "familiar": "熟悉",
                     "close": "亲近",
@@ -467,7 +460,7 @@ class PluginPageApi:
                 },
             })
         except Exception as exc:
-            return self._err(f"拟人维度数据读取失败: {exc}", 500)
+            return self._err(f"互动协同数据读取失败: {exc}", 500)
 
     async def acl_matrix(self):
         """Return all windows, ACL rules and policies in one shot for topology visualization."""

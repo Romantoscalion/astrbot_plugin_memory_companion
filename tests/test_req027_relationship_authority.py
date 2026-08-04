@@ -26,6 +26,14 @@ def valid_projection() -> dict:
         "tone": "温暖、自然",
         "address_level": "使用已确认昵称",
         "proactive_care_limit": 2,
+        "relationship_mode": "owner_exclusive",
+        "current_interaction": {
+            "expression_band": "affectionate",
+            "label": "爱意",
+            "source": "manual",
+            "reason": "administrator_manual_override",
+            "manual_override": True,
+        },
         "soft_behaviors": {
             "allow_playful_jokes": True,
             "allow_followup": True,
@@ -45,6 +53,9 @@ class Req027RelationshipAuthorityTests(unittest.TestCase):
         self.assertEqual("private_companion.relationship_score", accepted["authority"])
         self.assertTrue(accepted["read_only"])
         self.assertEqual("close", accepted["phase_key"])
+        self.assertEqual("owner_exclusive", accepted["relationship_mode"])
+        self.assertEqual("affectionate", accepted["current_interaction"]["expression_band"])
+        self.assertTrue(accepted["current_interaction"]["manual_override"])
         for forbidden in ("owner", "cross_user_query", "p4_bypass"):
             self.assertNotIn(forbidden, accepted)
 
@@ -80,7 +91,7 @@ class Req027RelationshipAuthorityTests(unittest.TestCase):
         self.assertEqual("", group.relationship_authority_source)
         self.assertEqual("", group.companion_relationship_phase_key)
 
-    def test_companion_authority_stops_memory_phase_transition_but_keeps_momentum(self) -> None:
+    def test_companion_authority_stops_memory_phase_state_writes(self) -> None:
         service = MemoryCompanionService.__new__(MemoryCompanionService)
         state = {
             "phase": "acquaintance",
@@ -108,11 +119,10 @@ class Req027RelationshipAuthorityTests(unittest.TestCase):
             companion_relationship_phase_key="close",
             companion_relationship_phase_label="亲近",
         )
-        self.assertTrue(service._update_relationship_phase_momentum(authoritative, touch_type="warm"))
-        self.assertGreater(state["momentum"], 0)
+        self.assertFalse(service._update_relationship_phase_momentum(authoritative, touch_type="warm"))
+        self.assertEqual(0.0, state["momentum"])
         self.assertEqual(0, calls["transition"])
-        self.assertEqual("private_companion.relationship_score", state["phase_authority"])
-        self.assertEqual("close", state["companion_phase_key"])
+        self.assertEqual(0, calls["save"])
 
         fallback = SessionContext(
             session_id="telegram:FriendMessage:u2",
@@ -122,7 +132,7 @@ class Req027RelationshipAuthorityTests(unittest.TestCase):
         )
         self.assertTrue(service._update_relationship_phase_momentum(fallback, touch_type="warm"))
         self.assertEqual(1, calls["transition"])
-        self.assertEqual(2, calls["save"])
+        self.assertEqual(1, calls["save"])
 
     def test_address_hint_uses_companion_phase_and_memory_declares_trend_only(self) -> None:
         service = MemoryCompanionService.__new__(MemoryCompanionService)

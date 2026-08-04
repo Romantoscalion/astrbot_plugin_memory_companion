@@ -84,6 +84,12 @@ class SessionContext:
     companion_relationship_phase_label: str = ""
     companion_relationship_tone: str = ""
     companion_relationship_address_level: str = ""
+    companion_expression_contract: str = ""
+    companion_expression_band: str = ""
+    companion_expression_allowed_behaviors: tuple[str, ...] = ()
+    companion_expression_safety_mode: str = ""
+    companion_expression_blocker: str = ""
+    companion_expression_reason_codes: tuple[str, ...] = ()
 
     @property
     def current_target_id(self) -> str:

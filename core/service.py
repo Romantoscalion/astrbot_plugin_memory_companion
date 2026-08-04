@@ -24,7 +24,11 @@ from .astrbot_compat import (
     remove_temp_text,
     sanitize_request_history,
 )
-from .bridge import sanitize_companion_relationship_projection, serialize_memory
+from .bridge import (
+    sanitize_companion_expression_decision,
+    sanitize_companion_relationship_projection,
+    serialize_memory,
+)
 from .bot_personal_dto import (
     BotPersonalArchiveDTO,
     BotPersonalValidationError,
@@ -470,6 +474,7 @@ class MemoryCompanionService:
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
+        self._apply_companion_expression_decision(ctx, event=event, req=req)
         self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
@@ -821,6 +826,36 @@ class MemoryCompanionService:
         ctx.companion_relationship_phase_label = clean_text(projection.get("phase_label"), 40)
         ctx.companion_relationship_tone = clean_text(projection.get("tone"), 160)
         ctx.companion_relationship_address_level = clean_text(projection.get("address_level"), 120)
+
+    @staticmethod
+    def _apply_companion_expression_decision(
+        ctx: SessionContext,
+        *,
+        event: Any = None,
+        req: Any = None,
+    ) -> None:
+        """Consume a bounded, request-scoped Companion expression decision."""
+
+        if ctx.scope != "private":
+            return
+        raw_decision: Any = None
+        for target in (req, event):
+            if target is None:
+                continue
+            candidate = getattr(target, "_private_companion_expression_decision", None)
+            if candidate is not None:
+                raw_decision = candidate
+                break
+        consumed = sanitize_companion_expression_decision(raw_decision)
+        decision = consumed.get("decision") if isinstance(consumed, dict) else None
+        if not isinstance(decision, dict):
+            return
+        ctx.companion_expression_contract = clean_text(decision.get("contract"), 80)
+        ctx.companion_expression_band = clean_text(decision.get("expression_band"), 40)
+        ctx.companion_expression_allowed_behaviors = tuple(decision.get("allowed_behaviors") or ())
+        ctx.companion_expression_safety_mode = clean_text(decision.get("safety_mode"), 60)
+        ctx.companion_expression_blocker = clean_text(decision.get("blocker"), 60)
+        ctx.companion_expression_reason_codes = tuple(decision.get("reason_codes") or ())
 
     def _sanitize_visible_timeline_text(self, text: Any) -> str:
         cleaned = clean_text(text, 1200)
@@ -8034,6 +8069,9 @@ class MemoryCompanionService:
             return "uncertain", "low_confidence"
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
+        companion_cap_reason = self._companion_memory_mention_cap(ctx, explicit_memory=explicit_memory)
+        if companion_cap_reason:
+            return "tone", companion_cap_reason
         acl_authorized_for_sender = self._acl_authorized_private_group_result(
             ctx,
             memory,
@@ -8115,6 +8153,23 @@ class MemoryCompanionService:
         if memory.sayability == "indirect" and not explicit_memory and not acl_authorized_for_sender:
             return "tone", "indirect_memory"
         return "mention", "direct_relevance"
+
+    @staticmethod
+    def _companion_memory_mention_cap(ctx: SessionContext, *, explicit_memory: bool) -> str:
+        """Return a reason when Companion limits unsolicited memory expression."""
+
+        if explicit_memory or ctx.scope != "private" or not ctx.companion_expression_contract:
+            return ""
+        if ctx.companion_expression_blocker:
+            return "companion_expression:blocker"
+        if ctx.companion_expression_safety_mode != "normal":
+            return f"companion_expression:safety_{ctx.companion_expression_safety_mode}"
+        if ctx.companion_expression_band in {"avoidant", "hurt"}:
+            return f"companion_expression:band_{ctx.companion_expression_band}"
+        mention_capable = {"support", "followup", "shared_ritual"}
+        if not mention_capable.intersection(ctx.companion_expression_allowed_behaviors):
+            return "companion_expression:behavior_cap"
+        return ""
 
     def _memory_age_days(self, memory: MemoryRecord) -> float | None:
         timestamp = clean_text(memory.occurred_at or memory.updated_at or memory.created_at, 80)
@@ -8890,6 +8945,11 @@ class MemoryCompanionService:
         message_id = clean_text(message_id or ctx.message_id, 160)
         if not message_id:
             return False
+        if (
+            ctx.relationship_authority_source == "private_companion.relationship_score"
+            or ctx.companion_expression_contract
+        ):
+            return False
         state = self._get_relationship_phase(ctx)
         recent_ids = state.get("recent_touch_message_ids")
         if not isinstance(recent_ids, list):
@@ -8914,12 +8974,7 @@ class MemoryCompanionService:
         recent_ids.append(message_id)
         state["recent_touch_message_ids"] = recent_ids[-self._RELATIONSHIP_TOUCH_HISTORY_LIMIT :]
         state["updated_at"] = utc_now()
-        if ctx.relationship_authority_source == "private_companion.relationship_score":
-            state["companion_phase_key"] = clean_text(ctx.companion_relationship_phase_key, 40)
-            state["companion_phase_label"] = clean_text(ctx.companion_relationship_phase_label, 40)
-            state["phase_authority"] = "private_companion.relationship_score"
-        else:
-            self._maybe_transition_phase(ctx, state)
+        self._maybe_transition_phase(ctx, state)
         self._save_relationship_phase_state()
         return True
 
@@ -8994,6 +9049,11 @@ class MemoryCompanionService:
 
     def _update_address_evolution(self, ctx: SessionContext, text: str) -> None:
         """Track address evolution in the relationship phase state."""
+        if (
+            ctx.relationship_authority_source == "private_companion.relationship_score"
+            or ctx.companion_expression_contract
+        ):
+            return
         phase = self._detect_address_phase(text)
         if not phase:
             return
@@ -9028,6 +9088,8 @@ class MemoryCompanionService:
                 "不必每句都带称呼；关系阶段建议、历史称呼、显示名和旧记忆只作识别资料，"
                 "不能另造或追加亲昵称呼。若对方本轮明确要求改称呼，以本轮最新要求为准。"
             )
+        if ctx.companion_expression_contract:
+            return ""
         if ctx.relationship_authority_source == "private_companion.relationship_score":
             label = clean_text(ctx.companion_relationship_phase_label, 40) or clean_text(
                 ctx.companion_relationship_phase_key,
