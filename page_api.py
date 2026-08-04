@@ -79,6 +79,8 @@ class PluginPageApi:
             ("/config/module/update", self.config_module_update, ["POST"], "MemoryCompanion Page config module update"),
             ("/retrieval/config/update", self.retrieval_config_update, ["POST"], "MemoryCompanion Page retrieval config update"),
             ("/operations/diagnostics", self.operations_diagnostics, ["GET"], "MemoryCompanion operations diagnostics"),
+            ("/emotion/trace", self.emotion_trace, ["GET"], "MemoryCompanion redacted emotion trace"),
+            ("/emotion/traces", self.emotion_traces, ["GET"], "MemoryCompanion redacted emotion trace list"),
             ("/coordination/status", self.coordination_status, ["GET"], "MemoryCompanion safe coordination status"),
             ("/operations/preset", self.operations_preset, ["GET", "POST"], "MemoryCompanion operations preset"),
             ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
@@ -196,6 +198,39 @@ class PluginPageApi:
             return self._ok({"diagnostics": await self.plugin.service.operational_report()})
         except Exception as exc:
             return self._err(f"运维诊断失败: {exc}", 500)
+
+    async def emotion_trace(self):
+        trace_id = clean_text(request.args.get("trace_id", ""), 96)
+        if not trace_id:
+            return self._err("缺少 trace_id", 400)
+        context = {
+            "is_admin": True,
+            "bot_id": clean_text(request.args.get("bot_id", ""), 160),
+            "scope": clean_text(request.args.get("scope", ""), 24),
+            "session_id": clean_text(request.args.get("session_id", ""), 220),
+        }
+        bridge = getattr(self.plugin, "memory_companion", None)
+        getter = getattr(bridge, "get_emotion_trace_diagnostic", None)
+        if not callable(getter):
+            return self._ok({"result": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
+        return self._ok({"result": await getter(trace_id, context, limit=100)})
+
+    async def emotion_traces(self):
+        context = {
+            "is_admin": True,
+            "bot_id": clean_text(request.args.get("bot_id", ""), 160),
+            "scope": clean_text(request.args.get("scope", ""), 24),
+            "session_id": clean_text(request.args.get("session_id", ""), 220),
+        }
+        bridge = getattr(self.plugin, "memory_companion", None)
+        getter = getattr(bridge, "get_emotion_trace_summary", None)
+        if not callable(getter):
+            return self._ok({"result": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
+        return self._ok({"result": await getter(
+            context,
+            cursor=clean_text(request.args.get("cursor", ""), 20),
+            limit=max(1, min(100, self._int(request.args.get("limit", "20"), 20))),
+        )})
 
     async def coordination_status(self):
         """Expose a fixed, read-only coordination projection."""

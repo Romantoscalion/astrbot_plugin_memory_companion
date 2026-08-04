@@ -6536,11 +6536,32 @@ async function loadPersonaState() {
   let data;
   try {
     data = await apiGet("/persona-state");
+    try {
+      const traces = await apiGet("/emotion/traces?scope=private&limit=20");
+      data.emotion_trace_diagnostics = traces?.result || traces || {};
+    } catch (_) {
+      data.emotion_trace_diagnostics = { state: "degraded", items: [], error_code: "trace_summary_unavailable" };
+    }
   } catch (err) {
     panel.innerHTML = `<div class="persona-error">读取失败：${escapeHtml(err?.message || "未知错误")}</div>`;
     return;
   }
   panel.innerHTML = renderPersonaState(data || {});
+  panel.querySelectorAll("[data-memory-emotion-trace]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const traceId = String(button.dataset.memoryEmotionTrace || "");
+      const target = panel.querySelector("[data-memory-emotion-trace-detail]");
+      if (!traceId || !target) return;
+      target.textContent = "正在读取脱敏链路...";
+      try {
+        const response = await apiGet(`/emotion/trace?trace_id=${encodeURIComponent(traceId)}&scope=private`);
+        const result = response?.result || response || {};
+        target.textContent = JSON.stringify(result, null, 2);
+      } catch (error) {
+        target.textContent = `degraded: ${error?.message || "trace unavailable"}`;
+      }
+    });
+  });
 }
 
 function renderPersonaState(d) {
@@ -6551,6 +6572,8 @@ function renderPersonaState(d) {
   const timeOfDay = d.time_of_day || "";
   const legacyLabels = d.legacy_context_labels || {};
   const timeLabels = d.time_of_day_labels || {};
+  const traceDiagnostics = d.emotion_trace_diagnostics || {};
+  const traceItems = Array.isArray(traceDiagnostics.items) ? traceDiagnostics.items.slice(0, 20) : [];
 
   const timeLabel = timeLabels[timeOfDay] || timeOfDay || "未知";
   const crossTotal = crossState.total || 0;
@@ -6559,6 +6582,18 @@ function renderPersonaState(d) {
   const crossVuln = crossState.vulnerable_count || 0;
 
   let html = '<div class="persona-grid">';
+
+  html += `
+    <div class="persona-card persona-card-wide">
+      <div class="persona-card-head"><b>情绪链路诊断</b><span class="persona-badge">${escapeHtml(traceDiagnostics.state || "degraded")}</span></div>
+      <div class="persona-card-body">
+        <div class="persona-event-list">
+          ${traceItems.map((item) => `<button type="button" class="persona-event-item" data-memory-emotion-trace="${escapeHtml(item.trace_id || "")}"><b>${escapeHtml(item.event_type || "neutral")} · r${escapeHtml(item.revision || 1)}</b><small>${escapeHtml(item.status || "observed")} · ${escapeHtml(item.occurred_at || "")}</small></button>`).join("") || '<p class="persona-empty">暂无可展示的脱敏 trace。</p>'}
+        </div>
+        <pre class="json-box" data-memory-emotion-trace-detail>选择一条 trace 查看事件 revision 与投递确认状态。</pre>
+      </div>
+    </div>
+  `;
 
   html += `
     <div class="persona-card persona-card-wide">

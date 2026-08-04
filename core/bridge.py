@@ -1178,6 +1178,44 @@ class MemoryCompanionBridge:
     async def get_emotion_trace(self, trace_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         return await self._plugin.store.get_emotion_trace(trace_id, limit=limit)
 
+    async def get_emotion_trace_diagnostic(
+        self,
+        trace_id: str,
+        requester_context: dict[str, Any],
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        context = requester_context if type(requester_context) is dict else {}
+        if context.get("is_admin") is not True:
+            return {"state": "forbidden", "read_only": True, "items": [], "error_code": "admin_required"}
+        items = await self._plugin.store.get_emotion_trace_diagnostic(
+            trace_id,
+            bot_id=clean_text(context.get("bot_id"), 160),
+            scope=clean_text(context.get("scope"), 24),
+            session_id=clean_text(context.get("session_id"), 220),
+            limit=max(1, min(100, int(limit or 100))),
+        )
+        return {"state": "ready", "read_only": True, "items": items}
+
+    async def get_emotion_trace_summary(
+        self,
+        requester_context: dict[str, Any],
+        *,
+        cursor: str = "",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        context = requester_context if type(requester_context) is dict else {}
+        if context.get("is_admin") is not True:
+            return {"state": "forbidden", "read_only": True, "items": [], "next_cursor": "", "error_code": "admin_required"}
+        result = await self._plugin.store.get_emotion_trace_summary(
+            bot_id=clean_text(context.get("bot_id"), 160),
+            scope=clean_text(context.get("scope"), 24),
+            session_id=clean_text(context.get("session_id"), 220),
+            cursor=clean_text(cursor, 20),
+            limit=max(1, min(100, int(limit or 20))),
+        )
+        return {"state": "ready", "read_only": True, **result}
+
     async def search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
         return await self._plugin.bridge_search_open_loops(session_id=session_id, limit=limit)

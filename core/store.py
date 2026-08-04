@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from contextlib import closing, contextmanager
 from copy import deepcopy
 import re
@@ -6380,6 +6381,166 @@ class MemoryStore:
                 (trace, max(1, min(500, int(limit or 100)))),
             ).fetchall()
         return [self._emotion_event_row(row) for row in rows]
+
+    async def get_emotion_trace_diagnostic(
+        self,
+        trace_id: str,
+        *,
+        bot_id: str = "",
+        scope: str = "",
+        session_id: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return await self._run_recoverable_database_operation(
+            self._get_emotion_trace_diagnostic_sync, trace_id, bot_id, scope, session_id, limit
+        )
+
+    def _get_emotion_trace_diagnostic_sync(
+        self,
+        trace_id: str,
+        bot_id: str,
+        scope: str,
+        session_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        trace = clean_text(trace_id, 96)
+        if not trace:
+            return []
+        clauses = ["e.trace_id=?"]
+        params: list[Any] = [trace]
+        for column, value, size in (("bot_id", bot_id, 160), ("scope", scope, 24), ("session_id", session_id, 220)):
+            cleaned = clean_text(value, size)
+            if cleaned:
+                clauses.append(f"e.{column}=?")
+                params.append(cleaned)
+        params.append(max(1, min(100, int(limit or 100))))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT e.* FROM emotion_events e WHERE {' AND '.join(clauses)} ORDER BY e.revision ASC LIMIT ?",
+                params,
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                event = self._emotion_event_row(row)
+                deliveries = self._conn.execute(
+                    """
+                    SELECT consumer_id, attempts, first_delivered_at, last_delivered_at, acked_at
+                    FROM emotion_event_deliveries
+                    WHERE event_id=? AND revision=?
+                    ORDER BY consumer_id ASC LIMIT 20
+                    """,
+                    (event["event_id"], event["revision"]),
+                ).fetchall()
+                result.append(self._emotion_diagnostic_projection(event, deliveries))
+        return result
+
+    async def get_emotion_trace_summary(
+        self,
+        *,
+        bot_id: str = "",
+        scope: str = "",
+        session_id: str = "",
+        cursor: str = "",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._get_emotion_trace_summary_sync, bot_id, scope, session_id, cursor, limit
+        )
+
+    def _get_emotion_trace_summary_sync(
+        self,
+        bot_id: str,
+        scope: str,
+        session_id: str,
+        cursor: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        for column, value, size in (("bot_id", bot_id, 160), ("scope", scope, 24), ("session_id", session_id, 220)):
+            cleaned = clean_text(value, size)
+            if cleaned:
+                clauses.append(f"e.{column}=?")
+                params.append(cleaned)
+        try:
+            offset = max(0, min(100000, int(cursor or 0)))
+        except (TypeError, ValueError):
+            offset = 0
+        bounded = max(1, min(100, int(limit or 20)))
+        params.extend((bounded + 1, offset))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT e.* FROM emotion_events e
+                JOIN (SELECT event_id, MAX(revision) revision FROM emotion_events GROUP BY event_id) latest
+                  ON latest.event_id=e.event_id AND latest.revision=e.revision
+                WHERE {' AND '.join(clauses)}
+                ORDER BY e.occurred_at DESC, e.event_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+        page = [self._emotion_event_row(row) for row in rows[:bounded]]
+        return {
+            "items": [{
+                "trace_id": clean_text(item.get("trace_id"), 96),
+                "event_id": clean_text(item.get("event_id"), 96),
+                "revision": int(item.get("revision") or 1),
+                "event_type": clean_text(item.get("event_type"), 48),
+                "status": clean_text(item.get("status"), 24),
+                "occurred_at": clean_text(item.get("occurred_at"), 48),
+                "session_hash": self._diagnostic_hash(item.get("session_id")),
+            } for item in page],
+            "next_cursor": str(offset + bounded) if len(rows) > bounded else "",
+            "has_more": len(rows) > bounded,
+        }
+
+    @classmethod
+    def _emotion_diagnostic_projection(cls, event: dict[str, Any], deliveries: list[sqlite3.Row]) -> dict[str, Any]:
+        return {
+            "schema_version": "emotion_trace_diagnostic.v1",
+            "event_id": clean_text(event.get("event_id"), 96),
+            "trace_id": clean_text(event.get("trace_id"), 96),
+            "revision": int(event.get("revision") or 1),
+            "producer_plugin": clean_text(event.get("producer_plugin"), 80),
+            "origin_kind": clean_text(event.get("origin_kind"), 40),
+            "event_type": clean_text(event.get("event_type"), 48),
+            "intensity": float(event.get("intensity") or 0.0),
+            "confidence": float(event.get("confidence") or 0.0),
+            "status": clean_text(event.get("status"), 24),
+            "source_rule": clean_text(event.get("source_rule"), 80),
+            "occurred_at": clean_text(event.get("occurred_at"), 48),
+            "applied_interaction": clean_text(event.get("applied_interaction"), 32),
+            "applied_energy_delta": float(event.get("applied_energy_delta") or 0.0),
+            "correction_of": clean_text(event.get("correction_of"), 96),
+            "actor": cls._diagnostic_ref(event.get("actor_ref")),
+            "target": cls._diagnostic_ref(event.get("target_ref")),
+            "quoted_target": cls._diagnostic_ref(event.get("quoted_target_ref")),
+            "scope": clean_text(event.get("scope"), 24),
+            "session_hash": cls._diagnostic_hash(event.get("session_id")),
+            "deliveries": [{
+                "consumer_id": clean_text(row["consumer_id"], 80),
+                "attempts": max(0, int(row["attempts"] or 0)),
+                "first_delivered_at": clean_text(row["first_delivered_at"], 48),
+                "last_delivered_at": clean_text(row["last_delivered_at"], 48),
+                "acked": bool(row["acked_at"]),
+                "acked_at": clean_text(row["acked_at"], 48),
+            } for row in deliveries],
+        }
+
+    @classmethod
+    def _diagnostic_ref(cls, value: Any) -> dict[str, str]:
+        source = value if isinstance(value, dict) else {}
+        return {
+            "kind": clean_text(source.get("kind"), 24),
+            "role": clean_text(source.get("role"), 40),
+            "id_hash": cls._diagnostic_hash(source.get("id")),
+        }
+
+    @staticmethod
+    def _diagnostic_hash(value: Any) -> str:
+        cleaned = clean_text(value, 220)
+        return hashlib.sha256(cleaned.encode("utf-8", errors="ignore")).hexdigest()[:12] if cleaned else ""
 
     async def list_emotion_events(
         self,
