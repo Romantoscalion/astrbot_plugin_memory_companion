@@ -1281,6 +1281,7 @@ class MemoryCompanionService:
         admin_read_all: bool = False,
         time_intent: TimeIntent | None = None,
         slot_limits: dict[str, int] | None = None,
+        capped_slots: set[str] | None = None,
     ) -> str:
         try:
             revision = await self.store.memory_revision()
@@ -1342,6 +1343,7 @@ class MemoryCompanionService:
             },
             "time": time_payload,
             "slots": slot_limits or {},
+            "capped_slots": sorted(clean_text(slot, 60) for slot in (capped_slots or set()) if clean_text(slot, 60)),
             "config": config_payload,
             "revision": revision,
         }
@@ -1483,7 +1485,13 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
     ):
         ctx = self._normalized_session_context(ctx)
-        slot_limits = self._slot_limits(top_k, query=query, time_intent=time_intent)
+        slot_query = clean_text(query, 1000) or clean_text(ctx.message_text, 1000)
+        slot_limits = self._slot_limits(top_k, query=slot_query, time_intent=time_intent)
+        capped_slots = self._slot_capped_slots(
+            slot_query,
+            time_intent=time_intent,
+            bot_id=ctx.bot_id,
+        )
         cache_key = await self._retrieval_cache_key(
             "slots",
             query,
@@ -1492,6 +1500,7 @@ class MemoryCompanionService:
             admin_read_all=admin_read_all,
             time_intent=time_intent,
             slot_limits=slot_limits,
+            capped_slots=capped_slots,
         )
         cached = self._get_retrieval_cache(cache_key)
         if isinstance(cached, dict):
@@ -1543,6 +1552,7 @@ class MemoryCompanionService:
             slot_limits=slot_limits,
             total_limit=top_k,
             time_intent=time_intent,
+            capped_slots=capped_slots,
         )
         self._last_retrieval_path_info = dict(engine.last_path_info or {})
         self._last_retrieval_path_info["cache"] = "miss"
@@ -6603,6 +6613,70 @@ class MemoryCompanionService:
         return any(re.search(pattern, compact) for pattern in patterns)
 
     @staticmethod
+    def _message_targets_bot_personal_schedule(
+        text: str,
+        *,
+        bot_id: str = "",
+        allow_implicit_temporal: bool = False,
+    ) -> bool:
+        compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
+        if not compact or len(compact) > 80:
+            return False
+
+        bot_tokens = ["你", "您", "bot"]
+        normalized_bot_id = clean_text(bot_id, 120).lower()
+        if normalized_bot_id and normalized_bot_id not in {"self", "bot"}:
+            bot_tokens.append(normalized_bot_id)
+        bot_pattern = "(?:" + "|".join(
+            re.escape(token) for token in sorted(set(bot_tokens), key=len, reverse=True) if token
+        ) + ")"
+        temporal = (
+            r"(?:今天|今日|昨天|昨日|前天|明天|后天|今晚|明早|明晚|现在|当前|目前|"
+            r"最近|本周|这周|这一周|下周|周末|这周末|本月|下个月)"
+        )
+        specific_noun = r"(?:日程|行程|待办|提醒事项|时间表)"
+        schedule_noun = r"(?:日程|行程|安排|计划|待办|提醒事项|时间表)"
+        personal_action = r"(?:上班|上学|上课|出门|休息|起床|睡觉|睡|工作)"
+        personal_status = (
+            r"(?:有事|有安排|有计划|忙|(?:要|会|得|准备)?(?:上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|工作)|有空|有时间)"
+        )
+        status_suffix = r"(?:吗|呢|呀|嘛|不|了没|没有)?[?？]?$"
+
+        direct_patterns = (
+            rf"{bot_pattern}的(?:{temporal}(?:的)?)?{schedule_noun}",
+            rf"{bot_pattern}{temporal}(?:的)?{schedule_noun}",
+            rf"{bot_pattern}(?:的)?{specific_noun}",
+            rf"{bot_pattern}(?:{temporal})?(?:都)?(?:有|有没有|有什么|有哪些)(?:什么)?{schedule_noun}",
+            rf"{temporal}{bot_pattern}(?:的)?{schedule_noun}",
+            rf"{temporal}{bot_pattern}(?:都)?(?:有|有没有|有什么|有哪些)(?:什么)?{schedule_noun}",
+            rf"{bot_pattern}(?:{temporal})?(?:几点|什么时候|何时)(?:要|会|得|准备)?{personal_action}",
+            rf"{temporal}{bot_pattern}(?:几点|什么时候|何时)?(?:要|会|得|准备)?{personal_action}",
+            rf"{bot_pattern}(?:{temporal})?{personal_status}{status_suffix}",
+            rf"{temporal}{bot_pattern}{personal_status}{status_suffix}",
+            rf"{bot_pattern}{temporal}(?:做了什么|做什么|要做什么|准备做什么|去了哪(?:里|儿)?)",
+            rf"{temporal}{bot_pattern}(?:做了什么|做什么|要做什么|准备做什么|去了哪(?:里|儿)?)",
+        )
+        if any(re.search(pattern, compact) for pattern in direct_patterns):
+            return True
+
+        english_owner = r"(?:your|bot(?:'s)?"
+        if normalized_bot_id and normalized_bot_id not in {"self", "bot"}:
+            english_owner += rf"|{re.escape(normalized_bot_id)}(?:'s)?"
+        english_owner += r")"
+        if re.search(rf"{english_owner}(?:schedule|calendar|itinerary|todo)", compact):
+            return True
+
+        if not allow_implicit_temporal:
+            return False
+        personal_state = (
+            r"(?:有事|有安排|有计划|忙|上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|"
+            r"有空|有时间|要做什么|准备做什么)"
+        )
+        prefix = r"(?:请问|想问(?:一下|下)?|问(?:一下|下)?)?"
+        suffix = r"(?:吗|呢|呀|嘛|不|了没|没有)?[?？]?"
+        return bool(re.fullmatch(rf"{prefix}{temporal}{personal_state}{suffix}", compact))
+
+    @staticmethod
     def _message_is_future_arrangement_question(text: str, *, bot_id: str = "") -> bool:
         compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
         if not compact or len(compact) > 48:
@@ -6623,68 +6697,17 @@ class MemoryCompanionService:
             "周末",
             "下个月",
         )
-        personal_arrangement_markers = (
-            "有事",
-            "有安排",
-            "忙",
-            "上班",
-            "上学",
-            "上课",
-            "出门",
-            "休息",
-            "睡",
-            "起床",
-            "赖床",
-            "有空",
-            "空吗",
-            "时间",
-        )
         question_markers = ("？", "?", "吗", "呢", "呀", "嘛", "是不是", "有没有", "会不会", "能不能", "有空不")
         if not (
             any(marker in compact for marker in future_markers)
             and any(marker in compact for marker in question_markers)
         ):
             return False
-
-        # Project and release questions often contain the same time and plan words,
-        # but should retain normal retrieval rather than be treated as the Bot's life.
-        technical_markers = (
-            "项目",
-            "插件",
-            "版本",
-            "更新",
-            "发布",
-            "代码",
-            "bug",
-            "功能",
-            "任务",
-            "排期",
-            "需求",
-            "工单",
-            "开发",
-            "文档",
-            "仓库",
-            "模型",
+        return MemoryCompanionService._message_targets_bot_personal_schedule(
+            compact,
+            bot_id=bot_id,
+            allow_implicit_temporal=True,
         )
-        if any(marker in compact for marker in technical_markers):
-            return False
-
-        bot_tokens = ["你", "您", "bot"]
-        normalized_bot_id = clean_text(bot_id, 120).lower()
-        if normalized_bot_id and normalized_bot_id not in {"self", "bot"}:
-            bot_tokens.append(normalized_bot_id)
-        explicit_bot_target = any(token and token in compact for token in bot_tokens)
-        implicit_personal_question = bool(
-            re.search(
-                r"(?:明天|后天|明早|明晚|今晚|过会|一会儿|待会|下周|周末|下个月).{0,12}(?:有事|有安排|忙|上班|上学|上课|出门|休息|睡|起床|赖床|有空|有时间|空吗)",
-                compact,
-            )
-        )
-        if "我" in compact and not explicit_bot_target:
-            return False
-        has_personal_arrangement = any(marker in compact for marker in personal_arrangement_markers)
-        has_direct_plan = explicit_bot_target and any(marker in compact for marker in ("安排", "计划"))
-        return (explicit_bot_target and (has_personal_arrangement or has_direct_plan)) or implicit_personal_question
 
     def _filter_current_state_memory_slots(
         self,
@@ -7718,6 +7741,35 @@ class MemoryCompanionService:
             "conversation_summary": min(total, conversation_limit),
             "stable_memory": min(total, self.config.int("context_orchestration.stable_memory_limit", 3)),
         }
+
+    def _slot_capped_slots(
+        self,
+        query: str,
+        *,
+        time_intent: TimeIntent | None = None,
+        bot_id: str = "",
+    ) -> set[str]:
+        if self._query_focuses_self_timeline(query, time_intent=time_intent, bot_id=bot_id):
+            return set()
+        return {"self_timeline"}
+
+    def _query_focuses_self_timeline(
+        self,
+        query: str,
+        *,
+        time_intent: TimeIntent | None = None,
+        bot_id: str = "",
+    ) -> bool:
+        compact = re.sub(r"\s+", "", clean_text(query, 1000)).lower()
+        if not compact:
+            return False
+        if self._message_is_future_arrangement_question(compact, bot_id=bot_id):
+            return True
+        return self._message_targets_bot_personal_schedule(
+            compact,
+            bot_id=bot_id,
+            allow_implicit_temporal=bool(time_intent is not None and time_intent.active),
+        )
 
     def _short_reply_chain_anchor(self, ctx: SessionContext, event: Any) -> str:
         if ctx.scope != "group" or event is None:

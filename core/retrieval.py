@@ -237,10 +237,12 @@ class RetrievalEngine:
         slot_limits: dict[str, int],
         total_limit: int = 6,
         time_intent: TimeIntent | None = None,
+        capped_slots: set[str] | None = None,
     ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, list[SearchResult]]]:
         ranked, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         total = max(1, int(total_limit or 1))
         ranked = await self._maybe_rerank_results(query, ranked, total)
+        enforced_caps = {clean_text(slot, 60) for slot in (capped_slots or set()) if clean_text(slot, 60)}
         slot_order = [
             "open_loop",
             "self_timeline",
@@ -252,6 +254,31 @@ class RetrievalEngine:
         selected: list[SearchResult] = []
         selected_ids: set[str] = set()
         slot_map: dict[str, list[SearchResult]] = {slot: [] for slot in slot_order}
+
+        # Give every available slot one chance before any slot spends the rest
+        # of its normal budget. This keeps later summary and stable-memory
+        # slots visible when several earlier slots also have candidates.
+        for slot in slot_order:
+            limit = max(0, int(slot_limits.get(slot, 0) or 0))
+            if len(selected) >= total:
+                break
+            if limit <= 0:
+                continue
+            item = next(
+                (
+                    candidate
+                    for candidate in ranked
+                    if candidate.memory.id not in selected_ids
+                    and self._slot_for_memory(candidate.memory, ctx) == slot
+                ),
+                None,
+            )
+            if item is None:
+                continue
+            item.reason = self._with_slot_reason(item.reason, slot)
+            slot_map[slot].append(item)
+            selected.append(item)
+            selected_ids.add(item.memory.id)
 
         for slot in slot_order:
             limit = max(0, int(slot_limits.get(slot, 0) or 0))
@@ -269,6 +296,9 @@ class RetrievalEngine:
                 selected.append(item)
                 selected_ids.add(item.memory.id)
 
+        # Slot limits are diversity budgets rather than global hard limits.
+        # Only explicitly capped slots stay inside their budget during ranked
+        # fallback; other highly relevant memory types may still fill top_k.
         if len(selected) < total:
             for item in ranked:
                 if len(selected) >= total:
@@ -276,6 +306,11 @@ class RetrievalEngine:
                 if item.memory.id in selected_ids:
                     continue
                 slot = self._slot_for_memory(item.memory, ctx)
+                slot_limit = max(0, int(slot_limits.get(slot, 0) or 0))
+                if slot_limit <= 0:
+                    continue
+                if slot in enforced_caps and len(slot_map.get(slot, [])) >= slot_limit:
+                    continue
                 item.reason = self._with_slot_reason(item.reason, slot)
                 slot_map.setdefault(slot, []).append(item)
                 selected.append(item)
@@ -1721,6 +1756,11 @@ class RetrievalEngine:
         memory_type = (memory.memory_type or "").lower()
         reality = (memory.reality_level or "").lower()
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        # The producer already gives schedule entries a structured type. Keep
+        # that ownership signal ahead of generic promise/open-loop weights,
+        # which are often raised by ordinary schedule words such as "tomorrow".
+        if memory_type == "schedule_fragment":
+            return "self_timeline"
         if self._memory_is_open_loop(memory, metadata):
             return "open_loop"
         if (
@@ -1736,7 +1776,6 @@ class RetrievalEngine:
                 "image_action",
                 "qzone_action",
                 "reading_memory",
-                "schedule_fragment",
                 "companion_note",
             }
         ):

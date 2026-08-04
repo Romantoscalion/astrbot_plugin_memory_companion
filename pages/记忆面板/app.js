@@ -3658,6 +3658,37 @@ async function runSearch() {
     const results = data.results || [];
     const blocked = data.blocked || [];
     const returnedContext = data.search_context || {};
+    const retrieval = data.retrieval || {};
+    const slotCounts = retrieval.slot_counts || {};
+    const slotLimits = retrieval.slot_limits || {};
+    const cappedSlots = new Set(retrieval.capped_slots || []);
+    const slotLabels = {
+      open_loop: "未完成事项",
+      self_timeline: "日程 / 行动",
+      user_profile: "用户事实",
+      current_window: "当前窗口",
+      conversation_summary: "对话总结",
+      stable_memory: "稳定记忆",
+    };
+    const slotOrder = [
+      "open_loop",
+      "self_timeline",
+      "user_profile",
+      "current_window",
+      "conversation_summary",
+      "stable_memory",
+    ];
+    const slotParts = retrieval.orchestration_enabled
+      ? slotOrder
+        .filter((slot) => Object.prototype.hasOwnProperty.call(slotLimits, slot))
+        .map((slot) => ({
+          slot,
+          label: slotLabels[slot] || slot,
+          count: Number(slotCounts[slot] || 0),
+          limit: Number(slotLimits[slot] || 0),
+          capped: cappedSlots.has(slot),
+        }))
+      : [];
     const contextLabel = returnedContext.mode === "all" ? "全部可检索记忆" : requestedLabel;
     const contextKind = returnedContext.mode === "all" ? "管理检索" : "会话模拟";
     resultHost.innerHTML = `
@@ -3665,6 +3696,22 @@ async function runSearch() {
         <span><b>${escapeHtml(contextLabel)}</b><small>${escapeHtml(contextKind)}</small></span>
         <em>${escapeHtml(results.length)} 命中 · ${escapeHtml(blocked.length)} 过滤</em>
       </div>
+      ${slotParts.length ? `
+        <div class="microscope-slot-summary" aria-label="召回分槽">
+          ${slotParts.map((item) => {
+            const flexible = !item.capped && item.limit > 0;
+            const budgetText = `${item.count}/${item.limit}${flexible ? "+" : ""}`;
+            const detail = item.capped
+              ? `${item.label}：${item.count} 条，当前按 ${item.limit} 条封顶`
+              : `${item.label}：${item.count} 条，基础预算 ${item.limit} 条，可按相关性补位`;
+            return `
+            <span class="${item.count ? "is-hit" : ""} ${flexible ? "is-flexible" : "is-capped"}" title="${escapeHtml(detail)}" aria-label="${escapeHtml(detail)}">
+              <b>${escapeHtml(item.label)}</b>
+              <em>${escapeHtml(budgetText)}</em>
+            </span>
+          `}).join("")}
+        </div>
+      ` : ""}
       <section class="result-section film-panel" data-result-section="hits">
         <div class="personal-zone-head">
           <h4>命中记忆</h4>

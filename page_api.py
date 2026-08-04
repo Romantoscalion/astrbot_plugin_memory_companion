@@ -690,9 +690,10 @@ class PluginPageApi:
             message_text=query,
         )
         top_k = max(1, min(50, self._int(payload.get("top_k"), 8)))
+        slot_map: dict[str, list[Any]] = {}
         search_context_slots = getattr(self.plugin.service, "search_context_slots", None)
         if callable(search_context_slots):
-            results, blocked, _slot_map = await search_context_slots(
+            results, blocked, slot_map = await search_context_slots(
                 query,
                 ctx,
                 top_k,
@@ -705,6 +706,22 @@ class PluginPageApi:
                 top_k,
                 admin_read_all=admin_read_all,
             )
+            slot_map = {"stable_memory": results} if results else {}
+        slot_limits: dict[str, int] = {}
+        slot_limit_builder = getattr(self.plugin.service, "_slot_limits", None)
+        if callable(slot_limit_builder):
+            slot_limits = slot_limit_builder(top_k, query=query)
+        capped_slots: set[str] = set()
+        cap_builder = getattr(self.plugin.service, "_slot_capped_slots", None)
+        if callable(cap_builder):
+            capped_slots = set(cap_builder(query, bot_id=requested_bot_id) or set())
+        orchestration_enabled = callable(search_context_slots)
+        config = getattr(self.plugin.service, "config", None)
+        config_bool = getattr(config, "bool", None)
+        if callable(config_bool):
+            orchestration_enabled = orchestration_enabled and bool(
+                config_bool("context_orchestration.enabled", True)
+            )
         return self._ok(
             {
                 "results": [
@@ -712,6 +729,17 @@ class PluginPageApi:
                     for item in results
                 ],
                 "blocked": blocked[:30],
+                "retrieval": {
+                    "top_k": top_k,
+                    "orchestration_enabled": orchestration_enabled,
+                    "slot_counts": {
+                        clean_text(slot, 60): len(items)
+                        for slot, items in slot_map.items()
+                        if isinstance(items, list) and items
+                    },
+                    "slot_limits": slot_limits if orchestration_enabled else {},
+                    "capped_slots": sorted(capped_slots) if orchestration_enabled else [],
+                },
                 "search_context": {
                     "mode": "all" if admin_read_all else "session",
                     "scope": normalized["scope"],

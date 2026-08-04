@@ -12,8 +12,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
+from astrbot_plugin_remember_you.core.importance import ImportanceEvaluator
 from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SessionContext
 from astrbot_plugin_remember_you.core.service import MemoryCompanionService
+from astrbot_plugin_remember_you.core.time_intent import parse_time_intent
 
 
 class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
@@ -383,7 +385,331 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("user_preference", memory_types)
         self.assertIn("conversation_summary", memory_types)
-        self.assertLess(memory_types.count("schedule_fragment"), len(memory_types))
+        self.assertLessEqual(memory_types.count("schedule_fragment"), 2)
+
+    async def test_slot_fallback_does_not_overfill_schedule_results(self) -> None:
+        service = self.make_service()
+        evaluator = ImportanceEvaluator()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            user_name="小王",
+            bot_id="b1",
+            message_text="泛化召回锚点",
+        )
+        for index in range(8):
+            record = evaluator.calibrate(
+                MemoryRecord(
+                    id=f"only-schedule-{index}",
+                    memory_type="schedule_fragment",
+                    subject=EntityRef.bot_self("b1"),
+                    object=EntityRef(kind="user", id="u1", name="小王"),
+                    scope="private",
+                    session_id=ctx.session_id,
+                    platform="qq",
+                    visibility="bot_self",
+                    reality_level="persona_life",
+                    lifecycle="stable_memory",
+                    content=f"泛化召回锚点：明天提醒处理日程记录 {index}",
+                    confidence=1.0,
+                    importance=1.0,
+                    metadata={"owner_bot_id": "b1"},
+                ),
+                source="schedule_test",
+            )
+            self.assertGreaterEqual(float(record.metadata.get("promise_weight") or 0.0), 0.35)
+            await service.store.insert_memory(
+                record
+            )
+        results, _blocked, slot_map = await service.search_context_slots(
+            "泛化召回锚点",
+            ctx,
+            top_k=8,
+            admin_read_all=True,
+        )
+
+        self.assertEqual(2, len(results))
+        self.assertEqual({"schedule_fragment"}, {item.memory.memory_type for item in results})
+        self.assertEqual(2, len(slot_map.get("self_timeline", [])))
+        self.assertEqual([], slot_map.get("open_loop", []))
+
+    async def test_non_schedule_slot_can_fill_remaining_results(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            user_name="小王",
+            bot_id="b1",
+            message_text="偏好扩展锚点",
+        )
+        for index in range(8):
+            await service.store.insert_memory(
+                MemoryRecord(
+                    id=f"profile-only-{index}",
+                    memory_type="user_preference",
+                    subject=EntityRef(kind="user", id="u1", name="小王"),
+                    object=EntityRef.bot_self("b1"),
+                    scope="private",
+                    session_id=ctx.session_id,
+                    platform="qq",
+                    visibility="private_pair",
+                    lifecycle="stable_memory",
+                    content=f"偏好扩展锚点记录 {index}",
+                    confidence=1.0,
+                    importance=1.0,
+                    metadata={"owner_bot_id": "b1"},
+                )
+            )
+
+        results, _blocked, slot_map = await service.search_context_slots(
+            "偏好扩展锚点",
+            ctx,
+            top_k=8,
+            admin_read_all=True,
+        )
+
+        self.assertEqual(8, len(results))
+        self.assertEqual(8, len(slot_map.get("user_profile", [])))
+
+    async def test_slot_selection_gives_each_available_slot_a_first_chance(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            user_name="小王",
+            bot_id="b1",
+            message_text="全槽召回锚点",
+        )
+        records = (
+            MemoryRecord(
+                id="all-slots-open-loop",
+                memory_type="timeline_event",
+                subject=EntityRef(kind="user", id="u1", name="小王"),
+                object=EntityRef.bot_self("b1"),
+                scope="private",
+                session_id=ctx.session_id,
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="全槽召回锚点未完成事项",
+                importance=1.0,
+                metadata={"owner_bot_id": "b1", "open_loop_weight": 0.9},
+            ),
+            MemoryRecord(
+                id="all-slots-self-timeline",
+                memory_type="schedule_fragment",
+                subject=EntityRef.bot_self("b1"),
+                object=EntityRef(kind="user", id="u1", name="小王"),
+                scope="private",
+                session_id=ctx.session_id,
+                platform="qq",
+                visibility="bot_self",
+                reality_level="persona_life",
+                lifecycle="stable_memory",
+                content="全槽召回锚点日程",
+                importance=1.0,
+                metadata={"owner_bot_id": "b1"},
+            ),
+            MemoryRecord(
+                id="all-slots-user-profile",
+                memory_type="user_preference",
+                subject=EntityRef(kind="user", id="u1", name="小王"),
+                object=EntityRef.bot_self("b1"),
+                scope="private",
+                session_id=ctx.session_id,
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="全槽召回锚点用户偏好",
+                importance=1.0,
+                metadata={"owner_bot_id": "b1"},
+            ),
+            MemoryRecord(
+                id="all-slots-current-window",
+                memory_type="timeline_event",
+                subject=EntityRef(kind="user", id="u1", name="小王"),
+                object=EntityRef.bot_self("b1"),
+                scope="private",
+                session_id=ctx.session_id,
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="全槽召回锚点当前窗口",
+                importance=1.0,
+                metadata={"owner_bot_id": "b1"},
+            ),
+            MemoryRecord(
+                id="all-slots-summary",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1", name="小王"),
+                object=EntityRef.bot_self("b1"),
+                scope="private",
+                session_id=ctx.session_id,
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="全槽召回锚点对话总结",
+                importance=1.0,
+                metadata={"owner_bot_id": "b1"},
+            ),
+            MemoryRecord(
+                id="all-slots-stable",
+                memory_type="timeline_event",
+                subject=EntityRef(kind="user", id="u1", name="小王"),
+                object=EntityRef(kind="group", id="g1", name="测试群"),
+                scope="group",
+                session_id="qq:GroupMessage:g1",
+                platform="qq",
+                group_id="g1",
+                visibility="group_public",
+                lifecycle="stable_memory",
+                content="全槽召回锚点稳定记忆",
+                importance=1.0,
+                metadata={"owner_bot_id": "b1"},
+            ),
+        )
+        for record in records:
+            await service.store.insert_memory(record)
+
+        results, _blocked, slot_map = await service.search_context_slots(
+            "全槽召回锚点",
+            ctx,
+            top_k=6,
+            admin_read_all=True,
+        )
+
+        self.assertEqual(6, len(results))
+        self.assertEqual(
+            {
+                "open_loop",
+                "self_timeline",
+                "user_profile",
+                "current_window",
+                "conversation_summary",
+                "stable_memory",
+            },
+            set(slot_map),
+        )
+
+    def test_self_timeline_overflow_intent_boundaries(self) -> None:
+        service = self.make_service()
+        cases = {
+            "项目计划是什么？": False,
+            "你的项目计划有哪些？": False,
+            "下周版本发布安排是什么？": False,
+            "我的日程有哪些？": False,
+            "我今天的安排是什么？": False,
+            "你能查一下我的日程吗？": False,
+            "你记得我今天的安排吗？": False,
+            "小王的日程有哪些？": False,
+            "会议日程有哪些？": False,
+            "请规划一份日程": False,
+            "行程规划算法": False,
+            "my schedule": False,
+            "project schedule": False,
+            "你知道今天几点了吗？": False,
+            "你的日程有哪些？": True,
+            "你今天的安排是什么？": True,
+            "今晚你有空吗？": True,
+            "明天有空吗？": True,
+            "你什么时候上班？": True,
+            "b1 的日程": True,
+            "your schedule": True,
+        }
+        for query, expected in cases.items():
+            with self.subTest(query=query):
+                intent = parse_time_intent(query)
+                self.assertEqual(
+                    expected,
+                    service._query_focuses_self_timeline(
+                        query,
+                        time_intent=intent if intent.active else None,
+                        bot_id="b1",
+                    ),
+                )
+
+    async def test_explicit_schedule_query_can_fill_self_timeline_slot(self) -> None:
+        service = self.make_service()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            user_name="小王",
+            bot_id="b1",
+            message_text="你的日程锚点有哪些？",
+        )
+        for index in range(8):
+            await service.store.insert_memory(
+                MemoryRecord(
+                    id=f"focused-schedule-{index}",
+                    memory_type="schedule_fragment",
+                    subject=EntityRef.bot_self("b1"),
+                    object=EntityRef(kind="user", id="u1", name="小王"),
+                    scope="private",
+                    session_id=ctx.session_id,
+                    platform="qq",
+                    visibility="bot_self",
+                    reality_level="persona_life",
+                    lifecycle="stable_memory",
+                    content=f"日程锚点安排 {index}",
+                    confidence=1.0,
+                    importance=1.0,
+                    metadata={"owner_bot_id": "b1"},
+                )
+            )
+        await service.store.insert_memory(
+            MemoryRecord(
+                id="focused-profile",
+                memory_type="user_preference",
+                subject=EntityRef(kind="user", id="u1", name="小王"),
+                object=EntityRef.bot_self("b1"),
+                scope="private",
+                session_id=ctx.session_id,
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="日程锚点相关的用户时间偏好。",
+                confidence=0.8,
+                importance=0.7,
+                metadata={"owner_bot_id": "b1"},
+            )
+        )
+        await service.store.insert_memory(
+            MemoryRecord(
+                id="focused-summary",
+                memory_type="conversation_summary",
+                subject=EntityRef(kind="user", id="u1", name="小王"),
+                object=EntityRef.bot_self("b1"),
+                scope="private",
+                session_id=ctx.session_id,
+                platform="qq",
+                visibility="private_pair",
+                lifecycle="stable_memory",
+                content="日程锚点相关的一次安排对话。",
+                confidence=0.8,
+                importance=0.7,
+                metadata={"owner_bot_id": "b1"},
+            )
+        )
+
+        results, _blocked, slot_map = await service.search_context_slots(
+            "你的日程锚点有哪些？",
+            ctx,
+            top_k=8,
+            admin_read_all=True,
+        )
+
+        self.assertEqual(8, len(results))
+        self.assertEqual(6, len(slot_map.get("self_timeline", [])))
+        self.assertEqual(1, len(slot_map.get("user_profile", [])))
+        self.assertEqual(1, len(slot_map.get("conversation_summary", [])))
 
     async def test_old_explicit_meal_memory_is_not_mistaken_for_current_state(self) -> None:
         service = self.make_service()

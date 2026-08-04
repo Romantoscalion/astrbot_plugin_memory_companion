@@ -140,7 +140,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=1.7.0", page)
+        self.assertIn("app.css?v=1.7.1", page)
 
     def test_microscope_has_explicit_context_and_non_overlapping_results(self) -> None:
         page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
@@ -174,6 +174,9 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertNotIn('$("#runSearchBtn").addEventListener("click", (event) => withButton', script)
         self.assertIn("if (searchToken !== state.microscopeSearchToken) return;", script)
         self.assertIn("data.search_context || {}", script)
+        self.assertIn("data.retrieval || {}", script)
+        self.assertIn("retrieval.capped_slots || []", script)
+        self.assertIn('class="microscope-slot-summary"', script)
         self.assertIsNotNone(layout)
         self.assertIn("grid-template-rows:auto auto minmax(0,1fr)", layout.group(1))
         self.assertIn("#view-microscope.is-active>.section-head{grid-row:1}", styles)
@@ -181,6 +184,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("#view-microscope.is-active>#searchResult{grid-row:3}", styles)
         self.assertIn(".microscope-context-bar", styles)
         self.assertIn(".microscope-result-context", styles)
+        self.assertIn(".microscope-slot-summary", styles)
         self.assertRegex(
             styles,
             r'#searchResult\[data-microscope-section="hits"\] \[data-result-section="hits"\],\s*'
@@ -260,7 +264,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .projection-stage', styles)
         self.assertIn(".film-app.is-workspace .overview-layout-switch", styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=1.7.0", page)
+        self.assertIn("app.js?v=1.7.1", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")

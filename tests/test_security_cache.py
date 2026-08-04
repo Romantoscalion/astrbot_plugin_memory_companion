@@ -27,7 +27,7 @@ if "quart" not in sys.modules:
     sys.modules["quart"] = quart_stub
 
 import astrbot_plugin_remember_you.page_api as page_api_module
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SessionContext
+from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
 from astrbot_plugin_remember_you.core.service import MemoryCompanionService
 from astrbot_plugin_remember_you.page_api import PluginPageApi
 
@@ -48,6 +48,7 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
     async def page_search(self, payload: dict):
         service = SimpleNamespace(
             search_with_diagnostics=AsyncMock(return_value=([], [])),
+            config=SimpleNamespace(bool=lambda *_args: True),
         )
         api = PluginPageApi(SimpleNamespace(service=service))
         fake_request = SimpleNamespace(get_json=AsyncMock(return_value=payload))
@@ -63,9 +64,16 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         return response, service.search_with_diagnostics
 
     async def test_page_search_uses_slot_orchestration_when_service_supports_it(self) -> None:
+        item = SearchResult(memory=self.group_memory("共同召回锚点"), score=1.0, reason="slot=conversation_summary")
         service = SimpleNamespace(
-            search_context_slots=AsyncMock(return_value=([], [], {})),
+            search_context_slots=AsyncMock(return_value=([item], [], {"conversation_summary": [item]})),
             search_with_diagnostics=AsyncMock(return_value=([], [])),
+            _slot_limits=lambda *_args, **_kwargs: {
+                "self_timeline": 2,
+                "conversation_summary": 2,
+            },
+            _slot_capped_slots=lambda *_args, **_kwargs: {"self_timeline"},
+            config=SimpleNamespace(bool=lambda *_args: True),
         )
         api = PluginPageApi(SimpleNamespace(service=service))
         fake_request = SimpleNamespace(
@@ -81,7 +89,11 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         ):
             response = await api.search()
 
-        self.assertEqual([], response["results"])
+        self.assertEqual(["共同召回锚点"], [item["content"] for item in response["results"]])
+        self.assertEqual({"conversation_summary": 1}, response["retrieval"]["slot_counts"])
+        self.assertEqual(2, response["retrieval"]["slot_limits"]["self_timeline"])
+        self.assertEqual(["self_timeline"], response["retrieval"]["capped_slots"])
+        self.assertTrue(response["retrieval"]["orchestration_enabled"])
         service.search_context_slots.assert_awaited_once()
         service.search_with_diagnostics.assert_not_awaited()
 
@@ -202,6 +214,7 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("unknown", context.scope)
         self.assertEqual("", context.session_id)
         self.assertEqual("all", response["search_context"]["mode"])
+        self.assertFalse(response["retrieval"]["orchestration_enabled"])
 
         response, search = await self.page_search(
             {
