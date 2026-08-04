@@ -5,7 +5,9 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
+from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
+from .person_projection import consume_person_projection
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -310,6 +312,38 @@ class MemoryCompanionBridge:
         result.setdefault("degraded", False)
         return result
 
+    def consume_person_projection(
+        self,
+        projection: Any,
+        expected_identity_key: str = "",
+        expected_person_id: str = "",
+        *,
+        companion_available: bool = True,
+    ) -> dict[str, Any]:
+        """Validate a companion-owned person projection without writing memory state."""
+        return consume_person_projection(
+            projection,
+            expected_identity_key=expected_identity_key,
+            expected_person_id=expected_person_id,
+            companion_available=companion_available,
+        )
+
+    def consume_context_projection(
+        self,
+        context: Any,
+        expected_person_id: str = "",
+        expected_scope: str = "",
+        *,
+        companion_available: bool = True,
+    ) -> dict[str, Any]:
+        """Validate a P3 projection without creating people or storing raw text."""
+        return consume_context_projection(
+            context,
+            expected_person_id=expected_person_id,
+            expected_scope=expected_scope,
+            companion_available=companion_available,
+        )
+
     def probe_bot_personal_memory_capabilities(self) -> dict[str, Any]:
         """Return a database-free capability snapshot for the bot-personal contract.
 
@@ -385,6 +419,8 @@ class MemoryCompanionBridge:
                 "compose_context",
                 "remember",
                 "recall",
+                "consume_person_projection",
+                "consume_context_projection",
                 "probe_bot_personal_memory_capabilities",
             ],
         )
