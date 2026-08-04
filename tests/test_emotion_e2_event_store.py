@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 
 
@@ -47,20 +48,75 @@ class EmotionE2EventStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
         self.assertEqual(2, store._conn.execute("SELECT COUNT(*) FROM emotion_events").fetchone()[0])
 
-    async def test_bridge_records_and_reads_redacted_trace(self) -> None:
+    def make_attested_bridge(self, store: MemoryStore) -> tuple[MemoryCompanionBridge, object]:
+        companion = object()
+        context = SimpleNamespace(
+            get_all_stars=lambda: [
+                SimpleNamespace(
+                    star_cls=companion,
+                    root_dir_name="astrbot_plugin_private_companion",
+                    name="PrivateCompanion",
+                    activated=True,
+                )
+            ]
+        )
+        service = SimpleNamespace(store=store, context=context)
+        bridge = MemoryCompanionBridge(service)
+        capability = bridge.register_emotion_producer(companion)
+        self.assertIsNotNone(capability)
+        producer_context = bridge.create_emotion_producer_context(
+            capability,
+            bot_id="bot-1",
+            scope="private",
+            platform="qq",
+            user_id="user-1",
+            session_id="qq:FriendMessage:user-1",
+        )
+        self.assertIsNotNone(producer_context)
+        return bridge, producer_context
+
+    async def test_bridge_requires_attested_producer_and_redacts_trace(self) -> None:
         store = self.make_store()
-        plugin = type("Plugin", (), {"store": store})()
-        bridge = MemoryCompanionBridge(plugin)
+        bridge, producer_context = self.make_attested_bridge(store)
+        denied = await bridge.record_emotion_event({"event_type": "comfort"})
+        self.assertEqual("forbidden", denied["state"])
+
         event = await bridge.record_emotion_event({
+            "producer_plugin": "untrusted_plugin",
+            "origin_kind": "memory_recall",
+            "bot_id": "other-bot",
+            "scope": "group",
+            "platform": "other-platform",
+            "actor_ref": {"kind": "user", "id": "other-user", "role": "speaker"},
+            "target_ref": {"kind": "bot", "id": "other-bot", "role": "bot_self"},
             "event_type": "comfort",
-            "session_id": "qq:FriendMessage:u1",
+            "session_id": "qq:FriendMessage:other-user",
             "dedupe_key": "m2",
             "trace_id": "trace-2",
             "raw_text": "PRIVATE",
-        })
-        trace = await bridge.get_emotion_trace("trace-2")
-        self.assertEqual(event["event_id"], trace[0]["event_id"])
-        self.assertNotIn("PRIVATE", repr(trace))
+        }, producer_context=producer_context)
+        self.assertEqual("private_companion", event["producer_plugin"])
+        self.assertEqual("interaction", event["origin_kind"])
+        self.assertEqual("bot-1", event["bot_id"])
+        self.assertEqual("user-1", event["actor_ref"]["id"])
+
+        raw_trace = await bridge.get_emotion_trace("trace-2")
+        self.assertEqual("forbidden", raw_trace["state"])
+
+        page = SimpleNamespace(plugin=bridge._plugin)
+        page_capability = bridge.bind_emotion_page_api(page)
+        admin_context = bridge.create_emotion_admin_context(
+            page_capability,
+            bot_id="bot-1",
+            scope="private",
+            session_id="qq:FriendMessage:user-1",
+        )
+        trace = await bridge.get_emotion_trace("trace-2", requester_context=admin_context)
+        self.assertEqual("ready", trace["state"])
+        self.assertEqual(event["event_id"], trace["items"][0]["event_id"])
+        rendered = repr(trace)
+        for secret in ("PRIVATE", "user-1", "qq:FriendMessage:user-1"):
+            self.assertNotIn(secret, rendered)
         self.assertTrue(EMOTION_EVENT_CONTRACT_FINGERPRINT)
 
 

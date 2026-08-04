@@ -14,6 +14,78 @@ from .person_projection import consume_person_projection
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
+_PRIVATE_COMPANION_ROOT = "astrbot_plugin_private_companion"
+_PRIVATE_COMPANION_NAMES = {"PrivateCompanion", "private_companion"}
+_EMOTION_INGRESS_ORIGINS = {"interaction", "system_condition"}
+
+
+class _EmotionProducerCapability:
+    """Non-serializable capability bound to one live Companion plugin instance."""
+
+    __slots__ = ("_bridge", "_producer", "_token")
+
+    def __init__(self, bridge: Any, producer: Any, token: object) -> None:
+        self._bridge = bridge
+        self._producer = producer
+        self._token = token
+
+
+class _EmotionPageAdminCapability:
+    """Non-serializable capability bound to this bridge's Page API instance."""
+
+    __slots__ = ("_bridge", "_page_api", "_token")
+
+    def __init__(self, bridge: Any, page_api: Any, token: object) -> None:
+        self._bridge = bridge
+        self._page_api = page_api
+        self._token = token
+
+
+class _EmotionProducerContext:
+    """Opaque, scoped authorization context for Companion emotion ingress."""
+
+    __slots__ = ("_bridge", "_capability", "bot_id", "platform", "scope", "session_id", "user_id")
+
+    def __init__(
+        self,
+        bridge: Any,
+        capability: _EmotionProducerCapability,
+        *,
+        bot_id: str,
+        platform: str,
+        scope: str,
+        session_id: str,
+        user_id: str,
+    ) -> None:
+        self._bridge = bridge
+        self._capability = capability
+        self.bot_id = bot_id
+        self.platform = platform
+        self.scope = scope
+        self.session_id = session_id
+        self.user_id = user_id
+
+
+class _EmotionAdminContext:
+    """Opaque, scoped authorization context for redacted admin diagnostics."""
+
+    __slots__ = ("_bridge", "_capability", "bot_id", "scope", "session_id")
+
+    def __init__(
+        self,
+        bridge: Any,
+        capability: _EmotionPageAdminCapability,
+        *,
+        bot_id: str,
+        scope: str,
+        session_id: str,
+    ) -> None:
+        self._bridge = bridge
+        self._capability = capability
+        self.bot_id = bot_id
+        self.scope = scope
+        self.session_id = session_id
+
 _COMPANION_RELATIONSHIP_PHASES = {
     "deeply_distant",
     "strongly_distant",
@@ -240,6 +312,158 @@ class MemoryCompanionBridge:
     def __init__(self, plugin: Any):
         self._plugin = plugin
         self._capability_cache = CapabilityCache()
+        self._emotion_producer_token = object()
+        self._emotion_page_admin_token = object()
+
+    def register_emotion_producer(self, producer: Any) -> Any | None:
+        """Issue a private Companion capability only to a live registered plugin."""
+
+        if not self._is_registered_private_companion(producer):
+            return None
+        return _EmotionProducerCapability(self, producer, self._emotion_producer_token)
+
+    def create_emotion_producer_context(
+        self,
+        capability: Any,
+        *,
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+    ) -> Any | None:
+        """Bind a Companion capability to one private user/Bot delivery domain."""
+
+        if not self._is_valid_emotion_producer_capability(capability):
+            return None
+        normalized = self._normalize_emotion_domain(
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if normalized is None:
+            return None
+        return _EmotionProducerContext(self, capability, **normalized)
+
+    def bind_emotion_page_api(self, page_api: Any) -> Any | None:
+        """Issue a private diagnostic capability to this Memory plugin's Page API."""
+
+        page_plugin = getattr(page_api, "plugin", None)
+        if page_plugin is not self._plugin and getattr(page_plugin, "service", None) is not self._plugin:
+            return None
+        return _EmotionPageAdminCapability(self, page_api, self._emotion_page_admin_token)
+
+    def create_emotion_admin_context(
+        self,
+        capability: Any,
+        *,
+        bot_id: str,
+        scope: str,
+        session_id: str,
+    ) -> Any | None:
+        """Create a scoped redacted-diagnostic context after page auth succeeds."""
+
+        if not self._is_valid_emotion_page_admin_capability(capability):
+            return None
+        normalized_bot_id = clean_text(bot_id, 160)
+        normalized_scope = clean_text(scope, 24).lower()
+        normalized_session_id = clean_text(session_id, 220)
+        if not normalized_bot_id or normalized_scope not in {"private", "group"} or not normalized_session_id:
+            return None
+        return _EmotionAdminContext(
+            self,
+            capability,
+            bot_id=normalized_bot_id,
+            scope=normalized_scope,
+            session_id=normalized_session_id,
+        )
+
+    def _is_registered_private_companion(self, producer: Any) -> bool:
+        context = getattr(self._plugin, "context", None)
+        getter = getattr(context, "get_all_stars", None)
+        if not callable(getter):
+            return False
+        try:
+            stars = getter()
+        except Exception:
+            return False
+        if not isinstance(stars, (list, tuple)):
+            return False
+        for metadata in stars:
+            if getattr(metadata, "star_cls", None) is not producer:
+                continue
+            if getattr(metadata, "activated", True) is not True:
+                continue
+            root = clean_text(getattr(metadata, "root_dir_name", ""), 120)
+            name = clean_text(getattr(metadata, "name", ""), 120)
+            if root == _PRIVATE_COMPANION_ROOT or name in _PRIVATE_COMPANION_NAMES:
+                return True
+        return False
+
+    def _is_valid_emotion_producer_capability(self, capability: Any) -> bool:
+        return (
+            type(capability) is _EmotionProducerCapability
+            and capability._bridge is self
+            and capability._token is self._emotion_producer_token
+            and self._is_registered_private_companion(capability._producer)
+        )
+
+    def _is_valid_emotion_page_admin_capability(self, capability: Any) -> bool:
+        return (
+            type(capability) is _EmotionPageAdminCapability
+            and capability._bridge is self
+            and capability._token is self._emotion_page_admin_token
+            and (
+                getattr(capability._page_api, "plugin", None) is self._plugin
+                or getattr(getattr(capability._page_api, "plugin", None), "service", None) is self._plugin
+            )
+        )
+
+    @staticmethod
+    def _normalize_emotion_domain(
+        *,
+        bot_id: Any,
+        scope: Any,
+        platform: Any,
+        user_id: Any,
+        session_id: Any,
+    ) -> dict[str, str] | None:
+        normalized = {
+            "bot_id": clean_text(bot_id, 160),
+            "scope": clean_text(scope, 24).lower(),
+            "platform": clean_text(platform, 80),
+            "user_id": clean_text(user_id, 160),
+            "session_id": clean_text(session_id, 220),
+        }
+        if not all(normalized.values()) or normalized["scope"] != "private":
+            return None
+        return normalized
+
+    def _is_valid_emotion_producer_context(self, context: Any) -> bool:
+        return (
+            type(context) is _EmotionProducerContext
+            and context._bridge is self
+            and self._is_valid_emotion_producer_capability(context._capability)
+            and self._normalize_emotion_domain(
+                bot_id=context.bot_id,
+                scope=context.scope,
+                platform=context.platform,
+                user_id=context.user_id,
+                session_id=context.session_id,
+            ) is not None
+        )
+
+    def _is_valid_emotion_admin_context(self, context: Any) -> bool:
+        return (
+            type(context) is _EmotionAdminContext
+            and context._bridge is self
+            and self._is_valid_emotion_page_admin_capability(context._capability)
+            and bool(clean_text(context.bot_id, 160))
+            and clean_text(context.scope, 24).lower() in {"private", "group"}
+            and bool(clean_text(context.session_id, 220))
+        )
 
     def consume_relationship_projection(self, projection: Any) -> dict[str, Any]:
         """Validate a read-only Companion relationship projection without persisting it."""
@@ -1131,8 +1355,9 @@ class MemoryCompanionBridge:
         return await self._plugin.store.update_memory_visibility(memory_id, visibility)
 
     def get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
-        """Legacy read-and-remove compatibility path; new consumers use list/ack."""
-        return self._plugin.bridge_get_emotional_events(session_id=session_id, limit=limit)
+        """Deprecated unscoped API; callers must migrate to a capability context."""
+        _ = (session_id, limit)
+        return []
 
     async def list_emotion_events(
         self,
@@ -1164,54 +1389,117 @@ class MemoryCompanionBridge:
             event_refs=event_refs,
         )
 
-    async def record_emotion_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        """Persist one redacted event revision outside normal memory retrieval."""
-        return await self._plugin.store.upsert_emotion_event(event)
+    async def record_emotion_event(
+        self,
+        event: dict[str, Any],
+        *,
+        producer_context: Any = None,
+    ) -> dict[str, Any]:
+        """Persist a Companion event only inside an attested private user/Bot domain."""
 
-    async def revise_emotion_event(self, event: dict[str, Any]) -> dict[str, Any]:
-        """Persist a later revision of an existing event."""
-        return await self._plugin.store.upsert_emotion_event(event)
+        if not self._is_valid_emotion_producer_context(producer_context):
+            return self._emotion_forbidden_result("producer_context_required")
+        return await self._plugin.store.upsert_emotion_event(
+            self._attested_emotion_event(event, producer_context)
+        )
 
-    async def get_emotion_trace(self, trace_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        return await self._plugin.store.get_emotion_trace(trace_id, limit=limit)
+    async def revise_emotion_event(
+        self,
+        event: dict[str, Any],
+        *,
+        producer_context: Any = None,
+    ) -> dict[str, Any]:
+        """Persist a later Companion revision only inside its attested domain."""
+
+        if not self._is_valid_emotion_producer_context(producer_context):
+            return self._emotion_forbidden_result("producer_context_required")
+        return await self._plugin.store.upsert_emotion_event(
+            self._attested_emotion_event(event, producer_context)
+        )
+
+    async def get_emotion_trace(
+        self,
+        trace_id: str,
+        *,
+        requester_context: Any = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return only the scoped, redacted diagnostic projection for a trusted admin."""
+
+        return await self.get_emotion_trace_diagnostic(
+            trace_id,
+            requester_context,
+            limit=limit,
+        )
 
     async def get_emotion_trace_diagnostic(
         self,
         trace_id: str,
-        requester_context: dict[str, Any],
+        requester_context: Any,
         *,
         limit: int = 100,
     ) -> dict[str, Any]:
-        context = requester_context if type(requester_context) is dict else {}
-        if context.get("is_admin") is not True:
+        context = requester_context
+        if not self._is_valid_emotion_admin_context(context):
             return {"state": "forbidden", "read_only": True, "items": [], "error_code": "admin_required"}
         items = await self._plugin.store.get_emotion_trace_diagnostic(
             trace_id,
-            bot_id=clean_text(context.get("bot_id"), 160),
-            scope=clean_text(context.get("scope"), 24),
-            session_id=clean_text(context.get("session_id"), 220),
+            bot_id=context.bot_id,
+            scope=context.scope,
+            session_id=context.session_id,
             limit=max(1, min(100, int(limit or 100))),
         )
         return {"state": "ready", "read_only": True, "items": items}
 
     async def get_emotion_trace_summary(
         self,
-        requester_context: dict[str, Any],
+        requester_context: Any,
         *,
         cursor: str = "",
         limit: int = 20,
     ) -> dict[str, Any]:
-        context = requester_context if type(requester_context) is dict else {}
-        if context.get("is_admin") is not True:
+        context = requester_context
+        if not self._is_valid_emotion_admin_context(context):
             return {"state": "forbidden", "read_only": True, "items": [], "next_cursor": "", "error_code": "admin_required"}
         result = await self._plugin.store.get_emotion_trace_summary(
-            bot_id=clean_text(context.get("bot_id"), 160),
-            scope=clean_text(context.get("scope"), 24),
-            session_id=clean_text(context.get("session_id"), 220),
+            bot_id=context.bot_id,
+            scope=context.scope,
+            session_id=context.session_id,
             cursor=clean_text(cursor, 20),
             limit=max(1, min(100, int(limit or 20))),
         )
         return {"state": "ready", "read_only": True, **result}
+
+    @staticmethod
+    def _emotion_forbidden_result(error_code: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "state": "forbidden",
+            "read_only": False,
+            "event_id": "",
+            "error_code": error_code,
+        }
+
+    @staticmethod
+    def _attested_emotion_event(event: Any, context: _EmotionProducerContext) -> dict[str, Any]:
+        source = dict(event) if isinstance(event, dict) else {}
+        origin = clean_text(source.get("origin_kind"), 40).lower()
+        if origin not in _EMOTION_INGRESS_ORIGINS:
+            origin = "interaction"
+        source.update(
+            {
+                "producer_plugin": "private_companion",
+                "origin_kind": origin,
+                "bot_id": context.bot_id,
+                "scope": context.scope,
+                "platform": context.platform,
+                "session_id": context.session_id,
+                "actor_ref": {"kind": "user", "id": context.user_id, "role": "speaker"},
+                "target_ref": {"kind": "bot", "id": context.bot_id, "role": "bot_self"},
+                "quoted_target_ref": {},
+            }
+        )
+        return source
 
     async def search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""

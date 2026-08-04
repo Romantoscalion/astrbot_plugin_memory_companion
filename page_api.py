@@ -17,6 +17,11 @@ from zoneinfo import ZoneInfo
 
 from quart import jsonify, request, send_file
 
+try:
+    from astrbot.api.web import request as astrbot_web_request
+except Exception:  # pragma: no cover - optional in isolated page tests.
+    astrbot_web_request = None
+
 from .core.bridge import serialize_memory
 from .core.coordination_status import build_coordination_status, project_p6_status
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
@@ -51,6 +56,14 @@ DEFAULT_THEME_KEY = THEME_NAME_TO_KEY[DEFAULT_THEME_NAME]
 class PluginPageApi:
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
+        self._emotion_page_admin_capability = None
+        bridge = getattr(plugin, "memory_companion", None)
+        binder = getattr(bridge, "bind_emotion_page_api", None)
+        if callable(binder):
+            try:
+                self._emotion_page_admin_capability = binder(self)
+            except Exception:
+                self._emotion_page_admin_capability = None
 
     def register_routes(self) -> None:
         register = self.plugin.context.register_web_api
@@ -200,15 +213,12 @@ class PluginPageApi:
             return self._err(f"运维诊断失败: {exc}", 500)
 
     async def emotion_trace(self):
+        context = self._trusted_emotion_admin_context()
+        if context is None:
+            return self._err("admin_required", 403)
         trace_id = clean_text(request.args.get("trace_id", ""), 96)
         if not trace_id:
             return self._err("缺少 trace_id", 400)
-        context = {
-            "is_admin": True,
-            "bot_id": clean_text(request.args.get("bot_id", ""), 160),
-            "scope": clean_text(request.args.get("scope", ""), 24),
-            "session_id": clean_text(request.args.get("session_id", ""), 220),
-        }
         bridge = getattr(self.plugin, "memory_companion", None)
         getter = getattr(bridge, "get_emotion_trace_diagnostic", None)
         if not callable(getter):
@@ -216,12 +226,9 @@ class PluginPageApi:
         return self._ok({"result": await getter(trace_id, context, limit=100)})
 
     async def emotion_traces(self):
-        context = {
-            "is_admin": True,
-            "bot_id": clean_text(request.args.get("bot_id", ""), 160),
-            "scope": clean_text(request.args.get("scope", ""), 24),
-            "session_id": clean_text(request.args.get("session_id", ""), 220),
-        }
+        context = self._trusted_emotion_admin_context()
+        if context is None:
+            return self._err("admin_required", 403)
         bridge = getattr(self.plugin, "memory_companion", None)
         getter = getattr(bridge, "get_emotion_trace_summary", None)
         if not callable(getter):
@@ -231,6 +238,50 @@ class PluginPageApi:
             cursor=clean_text(request.args.get("cursor", ""), 20),
             limit=max(1, min(100, self._int(request.args.get("limit", "20"), 20))),
         )})
+
+    def _trusted_emotion_admin_context(self) -> Any | None:
+        """Construct diagnostic authority only from AstrBot's bound dashboard user."""
+
+        if not self._is_bound_dashboard_admin():
+            return None
+        bridge = getattr(self.plugin, "memory_companion", None)
+        creator = getattr(bridge, "create_emotion_admin_context", None)
+        if not callable(creator) or self._emotion_page_admin_capability is None:
+            return None
+        try:
+            return creator(
+                self._emotion_page_admin_capability,
+                bot_id=clean_text(request.args.get("bot_id", ""), 160),
+                scope=clean_text(request.args.get("scope", ""), 24),
+                session_id=clean_text(request.args.get("session_id", ""), 220),
+            )
+        except Exception:
+            return None
+
+    def _is_bound_dashboard_admin(self) -> bool:
+        """Accept only the framework-injected dashboard user, never request claims."""
+
+        bound_request = astrbot_web_request
+        if bound_request is None:
+            return False
+        try:
+            username = clean_text(bound_request.username, 160)
+        except Exception:
+            return False
+        context = getattr(self.plugin, "context", None)
+        config_getter = getattr(context, "get_config", None)
+        if not callable(config_getter):
+            return False
+        try:
+            config = config_getter()
+        except Exception:
+            return False
+        dashboard = config.get("dashboard") if isinstance(config, dict) else None
+        expected_username = clean_text(
+            dashboard.get("username") if isinstance(dashboard, dict) else "",
+            160,
+        )
+        return bool(username and expected_username and username == expected_username)
 
     async def coordination_status(self):
         """Expose a fixed, read-only coordination projection."""

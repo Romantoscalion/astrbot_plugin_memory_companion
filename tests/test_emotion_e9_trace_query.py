@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,20 @@ class EmotionE9TraceQueryTests(unittest.IsolatedAsyncioTestCase):
             "raw_text": "PRIVATE CHAT /tmp/secret token=abc",
         }, producer_plugin="memory_companion"))
 
+    @staticmethod
+    def admin_context(bridge: MemoryCompanionBridge, *, bot_id: str, scope: str, session_id: str):
+        page = SimpleNamespace(plugin=bridge._plugin)
+        capability = bridge.bind_emotion_page_api(page)
+        assert capability is not None
+        context = bridge.create_emotion_admin_context(
+            capability,
+            bot_id=bot_id,
+            scope=scope,
+            session_id=session_id,
+        )
+        assert context is not None
+        return context
+
     async def test_admin_scope_filter_redaction_and_delivery_status(self) -> None:
         store = self.make_store()
         await self.add_event(store, event_id="e1", trace_id="trace-shared", bot_id="b1", session_id="s1")
@@ -46,11 +61,11 @@ class EmotionE9TraceQueryTests(unittest.IsolatedAsyncioTestCase):
         await store.list_emotion_event_deliveries(consumer_id="companion", session_id="s1", limit=5)
         bridge = MemoryCompanionBridge(type("Plugin", (), {"store": store})())
 
-        denied = await bridge.get_emotion_trace_diagnostic("trace-shared", {"is_admin": False})
+        denied = await bridge.get_emotion_trace_diagnostic("trace-shared", {"is_admin": True})
         self.assertEqual("forbidden", denied["state"])
         result = await bridge.get_emotion_trace_diagnostic(
             "trace-shared",
-            {"is_admin": True, "bot_id": "b1", "scope": "private", "session_id": "s1"},
+            self.admin_context(bridge, bot_id="b1", scope="private", session_id="s1"),
         )
         self.assertEqual(1, len(result["items"]))
         item = result["items"][0]
@@ -67,13 +82,13 @@ class EmotionE9TraceQueryTests(unittest.IsolatedAsyncioTestCase):
             await self.add_event(store, event_id=f"e{index}", trace_id=f"t{index}", bot_id="b1", session_id="s1")
         bridge = MemoryCompanionBridge(type("Plugin", (), {"store": store})())
         first = await bridge.get_emotion_trace_summary(
-            {"is_admin": True, "bot_id": "b1", "scope": "private", "session_id": "s1"},
+            self.admin_context(bridge, bot_id="b1", scope="private", session_id="s1"),
             limit=1000,
         )
         self.assertEqual(100, len(first["items"]))
         self.assertTrue(first["has_more"])
         second = await bridge.get_emotion_trace_summary(
-            {"is_admin": True, "bot_id": "b1", "scope": "private", "session_id": "s1"},
+            self.admin_context(bridge, bot_id="b1", scope="private", session_id="s1"),
             cursor=first["next_cursor"],
             limit=100,
         )
