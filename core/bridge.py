@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
 from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
+from .capability_probe import CapabilityCache, PROFILE_NAMES as C4_PROFILE_NAMES, build_capability_snapshot
 from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 from .person_projection import consume_person_projection
@@ -37,6 +38,7 @@ class MemoryCompanionBridge:
 
     def __init__(self, plugin: Any):
         self._plugin = plugin
+        self._capability_cache = CapabilityCache()
 
     async def record_event(
         self,
@@ -315,6 +317,74 @@ class MemoryCompanionBridge:
     async def search_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
         return await self.read_bot_personal_profile(query=query, limit=limit)
 
+    async def read_bot_profile(
+        self,
+        profile: str,
+        query: str = "",
+        *,
+        limit: int = 10,
+        current_date: str = "",
+        current_window: str = "",
+        authorized: bool = False,
+    ) -> dict[str, Any]:
+        """Read a C4 Bot Profile through a privacy-limited bridge boundary."""
+
+        base = {
+            "ok": False,
+            "read_only": True,
+            "state": "degraded",
+            "degraded": True,
+            "pending": True,
+            "profile": clean_text(profile, 80),
+            "items": [],
+            "warnings": [],
+        }
+        try:
+            getter = getattr(self._plugin, "read_bot_profile", None)
+        except Exception:
+            getter = None
+        if not callable(getter):
+            return {**base, "error_code": "bridge_method_unavailable"}
+        try:
+            result = await getter(
+                profile,
+                query=query,
+                limit=limit,
+                current_date=current_date,
+                current_window=current_window,
+                authorized=authorized,
+            )
+        except Exception:
+            return {**base, "error_code": "bridge_exception"}
+        if not isinstance(result, dict):
+            return {**base, "error_code": "invalid_bridge_response"}
+        safe_item_keys = {
+            "record_id", "memory_domain", "memory_type", "subject", "date", "window",
+            "occurred_at", "source_kind", "source_refs", "evidence_level", "status",
+            "version", "summary", "reference",
+        }
+        safe_items: list[dict[str, Any]] = []
+        items = result.get("items", [])
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict):
+                safe_items.append({key: item[key] for key in safe_item_keys if key in item})
+        return {
+            "ok": bool(result.get("ok", True)),
+            "read_only": True,
+            "state": clean_text(result.get("state"), 40) or "ready",
+            "degraded": bool(result.get("degraded", False)),
+            "pending": bool(result.get("pending", False)),
+            "profile": clean_text(result.get("profile") or profile, 80),
+            "items": safe_items,
+            "warnings": [clean_text(item, 160) for item in result.get("warnings", []) if clean_text(item, 160)][:8]
+            if isinstance(result.get("warnings"), list) else [],
+        }
+
+    async def read_profile(self, profile: str, query: str = "", **kwargs: Any) -> dict[str, Any]:
+        """Short alias for callers that use the generic Profile API name."""
+
+        return await self.read_bot_profile(profile, query=query, **kwargs)
+
     async def search(
         self,
         query: str,
@@ -430,13 +500,15 @@ class MemoryCompanionBridge:
             companion_available=companion_available,
         )
 
-    def probe_bot_personal_memory_capabilities(self) -> dict[str, Any]:
-        """Return a database-free capability snapshot for the bot-personal contract.
+    def probe_capability_snapshot(self) -> dict[str, Any]:
+        """Return the C4 capability snapshot without touching plugin state or storage.
 
         The probe is intentionally based only on the shared contract module. It
         must remain safe to call from ordinary chat paths even when the contract
         is stale or the local module is otherwise malformed.
         """
+        if self._capability_cache.snapshot().get("state") == "negative":
+            return self.capability_status()
         try:
             descriptor = bot_personal_contract.capability_descriptor(
                 available=True,
@@ -482,11 +554,57 @@ class MemoryCompanionBridge:
             )
 
         result["available"] = True
-        result["state"] = "ready"
+        result["state"] = "available"
         result["degraded"] = False
         self._add_personal_capability_contract_aliases(result)
+        c4_snapshot = build_capability_snapshot(
+            available=True,
+            state="available",
+            contract_module=bot_personal_contract,
+            methods=result.get("methods", []),
+            profiles=C4_PROFILE_NAMES,
+            warnings=result.get("warnings", []),
+        )
+        result.update(c4_snapshot)
+        result["memory_domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN
+        result["domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN
+        result["contract_revision"] = bot_personal_contract.CONTRACT_REVISION
+        result["capability_schema_version"] = bot_personal_contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION
+        result["payload_schema_version"] = bot_personal_contract.BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION
+        result["capability_state"] = "available"
+        self._capability_cache.mark_available(c4_snapshot)
         result.setdefault("warnings", [])
         return result
+
+    def probe_bot_personal_memory_capabilities(self) -> dict[str, Any]:
+        """Backward-compatible C1 probe; C4 state is exposed as capability_state."""
+
+        result = dict(self.probe_capability_snapshot())
+        if result.get("capability_state") == "available":
+            result["state"] = "ready"
+        result["legacy_state"] = result.get("state", "degraded")
+        return result
+
+    def capability_status(self) -> dict[str, Any]:
+        """Return the bounded C4 cache state without probing storage."""
+
+        snapshot = self._capability_cache.snapshot()
+        snapshot["read_only"] = False
+        snapshot["contract_name"] = bot_personal_contract.CONTRACT_NAME
+        snapshot["max_payload_bytes"] = bot_personal_contract.BOT_PERSONAL_MAX_PAYLOAD_BYTES
+        snapshot["memory_domain"] = bot_personal_contract.BOT_PERSONAL_MEMORY_DOMAIN
+        snapshot["domain"] = snapshot["memory_domain"]
+        snapshot["contract_revision"] = bot_personal_contract.CONTRACT_REVISION
+        snapshot["capability_schema_version"] = bot_personal_contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION
+        snapshot["payload_schema_version"] = bot_personal_contract.BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION
+        snapshot["capability_state"] = snapshot.get("state", "unprobed")
+        return snapshot
+
+    def mark_capability_negative(self, reason: str) -> dict[str, Any]:
+        """Temporarily suppress repeated capability failures at the bridge edge."""
+
+        self._capability_cache.mark_negative(clean_text(reason, 120) or "capability_negative")
+        return self.capability_status()
 
     @staticmethod
     def _add_personal_capability_contract_aliases(result: dict[str, Any]) -> dict[str, Any]:
@@ -494,12 +612,17 @@ class MemoryCompanionBridge:
 
         result.setdefault("domain", result.get("memory_domain", ""))
         result.setdefault("domains", [result.get("memory_domain", "")])
-        result.setdefault("profiles", ["bot_personal_archive"])
+        result.setdefault("profiles", list(C4_PROFILE_NAMES))
+        result.setdefault("legacy_profiles", ["bot_personal_archive"])
         result.setdefault(
             "methods",
             [
                 "record_event",
                 "record_visible_turn",
+                "record_bot_personal_archive",
+                "record_bot_personal_memory",
+                "read_bot_personal_profile",
+                "search_bot_personal_profile",
                 "search",
                 "compose_injection",
                 "compose_context",
@@ -507,6 +630,9 @@ class MemoryCompanionBridge:
                 "recall",
                 "consume_person_projection",
                 "consume_context_projection",
+                "read_bot_profile",
+                "read_profile",
+                "probe_capability_snapshot",
                 "probe_bot_personal_memory_capabilities",
             ],
         )
@@ -548,7 +674,28 @@ class MemoryCompanionBridge:
                 "warnings": list(warnings or [reason]),
             }
         )
-        return MemoryCompanionBridge._add_personal_capability_contract_aliases(result)
+        MemoryCompanionBridge._add_personal_capability_contract_aliases(result)
+        c4_snapshot = build_capability_snapshot(
+            available=False,
+            state="degraded",
+            contract_module=bot_personal_contract,
+            methods=result.get("methods", []),
+            profiles=C4_PROFILE_NAMES,
+            warnings=result.get("warnings", []),
+            error_code=reason,
+        )
+        result.update(c4_snapshot)
+        result["memory_domain"] = getattr(bot_personal_contract, "BOT_PERSONAL_MEMORY_DOMAIN", "")
+        result["domain"] = result["memory_domain"]
+        result["contract_revision"] = getattr(bot_personal_contract, "CONTRACT_REVISION", 0)
+        result["capability_schema_version"] = getattr(
+            bot_personal_contract, "BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION", ""
+        )
+        result["payload_schema_version"] = getattr(
+            bot_personal_contract, "BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION", ""
+        )
+        result["capability_state"] = "degraded"
+        return result
 
     def get_token_usage_summary(self) -> dict[str, Any]:
         getter = getattr(self._plugin, "token_usage_summary", None)

@@ -94,6 +94,8 @@ class PluginPageApi:
             ("/conversation-import/resume", self.conversation_import_resume, ["POST"], "MemoryCompanion historical chat resume"),
             ("/conversation-import/rebind", self.conversation_import_rebind, ["POST"], "MemoryCompanion historical chat rebind"),
             ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
+            ("/profiles", self.profiles, ["GET"], "MemoryCompanion Bot Profiles"),
+            ("/capabilities/bot-personal", self.bot_personal_capabilities, ["GET"], "MemoryCompanion Bot Personal capability"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
             ("/companion/personal-photo-data", self.companion_personal_photo_data, ["GET"], "MemoryCompanion Page companion personal photo data"),
@@ -115,6 +117,35 @@ class PluginPageApi:
         stats = await self.plugin.service.store.stats()
         stats.pop("pending_review", None)
         return self._ok({"stats": stats})
+
+    async def profiles(self):
+        profile = clean_text(request.args.get("profile", ""), 80)
+        query = clean_text(request.args.get("query", ""), 240)
+        current_date = clean_text(request.args.get("date", ""), 20)
+        current_window = clean_text(request.args.get("window", ""), 40)
+        try:
+            limit = max(1, min(100, int(request.args.get("limit", "10"))))
+        except (TypeError, ValueError):
+            limit = 10
+        result = await self.plugin.service.read_bot_profile(
+            profile,
+            query=query,
+            limit=limit,
+            current_date=current_date,
+            current_window=current_window,
+            authorized=False,
+        )
+        return self._ok({"result": result})
+
+    async def bot_personal_capabilities(self):
+        getter = getattr(self.plugin, "bot_personal_capability_status", None)
+        result = getter() if callable(getter) else {
+            "available": False,
+            "state": "degraded",
+            "degraded": True,
+            "warnings": ["capability_status_unavailable"],
+        }
+        return self._ok({"result": result if isinstance(result, dict) else {}})
 
     async def operations_diagnostics(self):
         try:

@@ -1,0 +1,242 @@
+"""Database-free capability state and negative-cache helpers for C4.
+
+This module deliberately knows only about the shared bot-personal contract.  It
+does not inspect plugin modules, touch storage, or perform capability probing
+itself; callers can use the cache to decide when a probe is worth attempting.
+"""
+
+from __future__ import annotations
+
+import copy
+import time
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+
+CAPABILITY_STATES = ("unprobed", "available", "degraded", "negative")
+
+# Stable C4 capability profiles.  Keep this tuple closed: callers may report
+# only profiles understood by both companion plugins.
+PROFILE_NAMES = (
+    "bot_schedule_current",
+    "bot_schedule_history",
+    "bot_creative",
+    "bot_subjective",
+    "locked_frame_personal",
+)
+
+_SNAPSHOT_KEYS = (
+    "available",
+    "state",
+    "degraded",
+    "pending",
+    "contract_fingerprint",
+    "contract_version",
+    "schema_version",
+    "windows",
+    "memory_types",
+    "domains",
+    "profiles",
+    "methods",
+    "warnings",
+    "error_code",
+)
+_MAX_ITEMS = 64
+_MAX_TEXT = 256
+
+
+def _text(value: object, *, limit: int = _MAX_TEXT) -> str:
+    try:
+        return str(value or "")[:limit]
+    except Exception:
+        return ""
+
+
+def _unique_texts(values: object, *, allowed: set[str] | None = None) -> list[str]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        return []
+    result: list[str] = []
+    try:
+        for value in values:
+            item = _text(value)
+            if not item or (allowed is not None and item not in allowed) or item in result:
+                continue
+            result.append(item)
+            if len(result) >= _MAX_ITEMS:
+                break
+    except Exception:
+        return result
+    return result
+
+
+def _contract_value(module: object, name: str, default: object) -> object:
+    try:
+        return getattr(module, name)
+    except Exception:
+        return default
+
+
+def _safe_contract_data(contract_module: object | None) -> dict[str, object]:
+    if contract_module is None:
+        try:
+            from . import bot_personal_contract as contract_module
+        except Exception:
+            contract_module = None
+
+    windows = _unique_texts(_contract_value(contract_module, "WINDOW_SLUGS", ()))
+    memory_types = _unique_texts(_contract_value(contract_module, "BOT_PERSONAL_MEMORY_TYPES", ()))
+    domain = _text(_contract_value(contract_module, "BOT_PERSONAL_MEMORY_DOMAIN", ""))
+    domains = [domain] if domain else []
+    return {
+        "contract_fingerprint": _text(_contract_value(contract_module, "CONTRACT_FINGERPRINT", "")),
+        "contract_version": _text(_contract_value(contract_module, "CONTRACT_REVISION", "")),
+        "schema_version": _text(
+            _contract_value(contract_module, "BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION", "")
+        ),
+        "windows": windows,
+        "memory_types": memory_types,
+        "domains": domains,
+    }
+
+
+def _state(value: object) -> str:
+    candidate = _text(value).lower()
+    return candidate if candidate in CAPABILITY_STATES else "unprobed"
+
+
+def build_capability_snapshot(
+    *,
+    available: bool = False,
+    state: str = "unprobed",
+    contract_module: object | None = None,
+    methods: Iterable[object] = (),
+    domains: Iterable[object] = (),
+    profiles: Iterable[object] = PROFILE_NAMES,
+    warnings: Iterable[object] = (),
+    error_code: object = "",
+) -> dict[str, object]:
+    """Build a bounded, JSON-safe capability snapshot."""
+
+    contract = _safe_contract_data(contract_module)
+    resolved_state = _state(state)
+    if available:
+        resolved_state = "available"
+    elif resolved_state == "available":
+        resolved_state = "degraded"
+
+    supplied_domains = _unique_texts(domains)
+    if not supplied_domains:
+        supplied_domains = list(contract["domains"])
+
+    result: dict[str, object] = {
+        "available": resolved_state == "available",
+        "state": resolved_state,
+        "degraded": resolved_state in {"degraded", "negative"},
+        "pending": resolved_state == "unprobed",
+        "contract_fingerprint": contract["contract_fingerprint"],
+        "contract_version": contract["contract_version"],
+        "schema_version": contract["schema_version"],
+        "windows": list(contract["windows"]),
+        "memory_types": list(contract["memory_types"]),
+        "domains": supplied_domains,
+        "profiles": _unique_texts(profiles, allowed=set(PROFILE_NAMES)),
+        "methods": _unique_texts(methods),
+        "warnings": _unique_texts(warnings),
+        "error_code": _text(error_code),
+    }
+    return {key: result[key] for key in _SNAPSHOT_KEYS}
+
+
+class CapabilityCache:
+    """In-memory capability state with a TTL-limited negative result."""
+
+    def __init__(self, negative_ttl: float = 60.0, clock: object | None = None) -> None:
+        try:
+            self._negative_ttl = max(0.0, float(negative_ttl))
+        except (TypeError, ValueError):
+            self._negative_ttl = 60.0
+        self._clock = clock if callable(clock) else time.monotonic
+        self._snapshot = build_capability_snapshot()
+        self._negative_at: float | None = None
+
+    def _now(self) -> float:
+        try:
+            return float(self._clock())
+        except Exception:
+            return time.monotonic()
+
+    def snapshot(self) -> dict[str, object]:
+        if self._snapshot["state"] == "negative" and self._negative_at is not None:
+            if self._now() - self._negative_at >= self._negative_ttl:
+                self._snapshot = build_capability_snapshot()
+                self._negative_at = None
+        return copy.deepcopy(self._snapshot)
+
+    def mark_available(self, snapshot: Mapping[str, object]) -> dict[str, object]:
+        values = dict(snapshot) if isinstance(snapshot, Mapping) else {}
+        self._snapshot = build_capability_snapshot(
+            available=True,
+            state="available",
+            methods=values.get("methods", ()),
+            domains=values.get("domains", ()),
+            profiles=values.get("profiles", PROFILE_NAMES),
+            warnings=values.get("warnings", ()),
+            error_code=values.get("error_code", ""),
+            contract_module=_MappingContract(values),
+        )
+        self._negative_at = None
+        return self.snapshot()
+
+    def mark_degraded(self, reason: object) -> dict[str, object]:
+        current = self.snapshot()
+        self._snapshot = build_capability_snapshot(
+            state="degraded",
+            methods=current["methods"],
+            domains=current["domains"],
+            profiles=current["profiles"],
+            warnings=[*current["warnings"], _text(reason)] if _text(reason) else current["warnings"],
+            error_code=_text(reason),
+            contract_module=_MappingContract(current),
+        )
+        self._negative_at = None
+        return self.snapshot()
+
+    def mark_negative(self, reason: object) -> dict[str, object]:
+        current = self.snapshot()
+        self._snapshot = build_capability_snapshot(
+            state="negative",
+            methods=current["methods"],
+            domains=current["domains"],
+            profiles=current["profiles"],
+            warnings=[*current["warnings"], _text(reason)] if _text(reason) else current["warnings"],
+            error_code=_text(reason),
+            contract_module=_MappingContract(current),
+        )
+        self._negative_at = self._now()
+        return self.snapshot()
+
+    def clear(self) -> dict[str, object]:
+        self._snapshot = build_capability_snapshot()
+        self._negative_at = None
+        return self.snapshot()
+
+
+class _MappingContract:
+    """Attribute adapter used to preserve contract metadata across cache updates."""
+
+    def __init__(self, values: Mapping[str, object]) -> None:
+        self.CONTRACT_FINGERPRINT = values.get("contract_fingerprint", "")
+        self.CONTRACT_REVISION = values.get("contract_version", "")
+        self.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION = values.get("schema_version", "")
+        self.WINDOW_SLUGS = values.get("windows", ())
+        self.BOT_PERSONAL_MEMORY_TYPES = values.get("memory_types", ())
+        domains = values.get("domains", ())
+        self.BOT_PERSONAL_MEMORY_DOMAIN = domains[0] if isinstance(domains, list) and domains else ""
+
+
+__all__ = [
+    "CAPABILITY_STATES",
+    "PROFILE_NAMES",
+    "CapabilityCache",
+    "build_capability_snapshot",
+]

@@ -54,7 +54,7 @@ class MemoryCompanionPlugin(Star):
             data_dir=data_dir,
         )
         self.memory_companion = MemoryCompanionBridge(self.service)
-        self.bot_personal_capabilities = self.memory_companion.probe_bot_personal_memory_capabilities()
+        self.bot_personal_capabilities = self.memory_companion.probe_capability_snapshot()
         if not self.bot_personal_capabilities.get("available", False):
             logger.warning(
                 "[MemoryCompanion] Bot Personal capability probe degraded: %s",

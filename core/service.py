@@ -32,6 +32,7 @@ from .bot_personal_dto import (
     build_bot_personal_archive,
     sanitize_bot_personal_value,
 )
+from .profile_api import build_profile_result
 from .chat_import import HistoricalChatImporter
 from .classifier import MemoryClassifier
 from .config import ConfigView
@@ -936,6 +937,82 @@ class MemoryCompanionService:
                 "summary": f"Bot Personal archive reference [{record.memory_type}]",
             })
         return {"ok": True, "read_only": True, "state": "ready", "degraded": False, "pending": False, "items": items[:max(1, min(100, int(limit or 10)))]}
+
+    async def read_bot_profile(
+        self,
+        profile: str,
+        query: str = "",
+        *,
+        limit: int = 10,
+        current_date: str = "",
+        current_window: str = "",
+        authorized: bool = False,
+    ) -> dict[str, Any]:
+        """Read a C4 Bot Profile after hard domain and storage filtering."""
+
+        store = getattr(self, "store", None)
+        lister = getattr(store, "list_memories", None)
+        if not callable(lister):
+            return {
+                "ok": False,
+                "read_only": True,
+                "state": "degraded",
+                "degraded": True,
+                "pending": True,
+                "profile": clean_text(profile, 80),
+                "items": [],
+                "warnings": ["store_unavailable"],
+            }
+        try:
+            safe_limit = max(1, min(100, int(limit or 10)))
+        except (TypeError, ValueError):
+            safe_limit = 10
+        try:
+            records = await lister(
+                # The profile filter is applied again in profile_api; this
+                # bounded overscan leaves room for malformed or other-domain
+                # rows without scanning the whole database.
+                limit=min(300, max(24, safe_limit * 3)),
+                include_pending=False,
+                query="",
+                scope="private",
+                visibility="bot_self",
+                session_id="bot_personal",
+            )
+        except Exception:
+            return {
+                "ok": False,
+                "read_only": True,
+                "state": "degraded",
+                "degraded": True,
+                "pending": True,
+                "profile": clean_text(profile, 80),
+                "items": [],
+                "warnings": ["store_unavailable"],
+            }
+        if not clean_text(current_date, 20) or not clean_text(current_window, 40):
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            current_date = current_date or now.strftime("%Y-%m-%d")
+            current_window = current_window or self._bot_personal_window_for_datetime(now)
+        return build_profile_result(
+            records,
+            profile,
+            query=query,
+            limit=safe_limit,
+            current_date=current_date,
+            current_window=current_window,
+            authorized=authorized,
+        )
+
+    @staticmethod
+    def _bot_personal_window_for_datetime(value: datetime) -> str:
+        minutes = value.hour * 60 + value.minute
+        try:
+            from .bot_personal_contract import window_for_minutes
+
+            return window_for_minutes(minutes)
+        except Exception:
+            return ""
 
     async def bridge_search(
         self,
