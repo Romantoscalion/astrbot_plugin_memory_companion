@@ -42,6 +42,7 @@ from .classifier import MemoryClassifier
 from .config import ConfigView
 from .context_orchestrator import RetrievalIntent, RetrievalIntentBuilder
 from .emotion_event_contract import normalize_emotion_event
+from .emotion_targeting import memory_emotion_refs
 from .identity import IdentityResolver, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
 from .importance import ImportanceEvaluator
 from .injection import (
@@ -1829,6 +1830,9 @@ class MemoryCompanionService:
                 mood_hint = "柔软"
             if not event_type:
                 continue
+            refs = memory_emotion_refs(memory, ctx)
+            if refs is None:
+                continue
             # Mood resonance check: if Bot is already in a contrasting mood, dampen the drift
             if companion_bot_mood:
                 mood_lower = companion_bot_mood.strip().lower()
@@ -1849,12 +1853,7 @@ class MemoryCompanionService:
                 "bot_id": ctx.bot_id,
                 "scope": ctx.scope,
                 "session_id": ctx.session_id,
-                "actor_ref": {
-                    "kind": memory.subject.kind,
-                    "id": memory.subject.id,
-                    "role": memory.subject.role,
-                },
-                "target_ref": {"kind": "bot", "id": ctx.bot_id or "self", "role": "bot_self"},
+                **refs,
                 "event_type": event_type,
                 "intensity": max(scar_w, emotional_w, vulnerability_w) * 100.0,
                 "confidence": max(0.5, min(1.0, getattr(item, "score", 0.5))),

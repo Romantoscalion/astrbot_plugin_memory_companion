@@ -13,9 +13,9 @@ from tests.emotion_eval_cases import build_emotion_eval_cases, emotion_eval_fing
 
 
 class EmotionE3ReplayTests(unittest.TestCase):
-    def test_sixty_case_matrix_normalizes_identically(self) -> None:
+    def test_120_case_matrix_normalizes_identically(self) -> None:
         cases = build_emotion_eval_cases()
-        self.assertEqual(60, len(cases))
+        self.assertEqual(120, len(cases))
         self.assertEqual(emotion_eval_fingerprint(), emotion_eval_fingerprint())
         ids: set[str] = set()
         for case in cases:
