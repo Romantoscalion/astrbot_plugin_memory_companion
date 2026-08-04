@@ -391,8 +391,16 @@ class MemoryCompanionBridge:
         *,
         session_context: SessionContext | dict[str, Any] | None = None,
         top_k: int | None = None,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
     ) -> list[dict[str, Any]]:
-        return await self._plugin.bridge_search(query, session_context=session_context, top_k=top_k)
+        return await self._plugin.bridge_search(
+            query,
+            session_context=session_context,
+            top_k=top_k,
+            p5_attestation=p5_attestation,
+            p5_attestation_consumer=p5_attestation_consumer,
+        )
 
     async def compose_injection(
         self,
@@ -403,6 +411,8 @@ class MemoryCompanionBridge:
         max_chars: int | None = None,
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
     ) -> str:
         return await self._plugin.bridge_compose_injection(
             query,
@@ -411,6 +421,8 @@ class MemoryCompanionBridge:
             max_chars=max_chars,
             companion_bot_mood=companion_bot_mood,
             companion_bot_energy=companion_bot_energy,
+            p5_attestation=p5_attestation,
+            p5_attestation_consumer=p5_attestation_consumer,
         )
 
     async def compose_context(
@@ -423,6 +435,8 @@ class MemoryCompanionBridge:
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
         retrieval_profile: str = "",
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
     ) -> str:
         return await self._plugin.bridge_compose_context(
             query=query,
@@ -432,13 +446,74 @@ class MemoryCompanionBridge:
             companion_bot_mood=companion_bot_mood,
             companion_bot_energy=companion_bot_energy,
             retrieval_profile=retrieval_profile,
+            p5_attestation=p5_attestation,
+            p5_attestation_consumer=p5_attestation_consumer,
         )
 
     async def remember(self, *, event: Any, content: str, note_type: str = "memory") -> dict[str, Any]:
         return await self._plugin.tool_remember(event, content, note_type=note_type)
 
-    async def recall(self, *, event: Any, query: str, top_k: int = 5) -> dict[str, Any]:
-        return await self._plugin.tool_recall(event, query, top_k=top_k)
+    async def recall(
+        self,
+        *,
+        event: Any,
+        query: str,
+        top_k: int = 5,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
+    ) -> dict[str, Any]:
+        return await self._plugin.tool_recall(
+            event,
+            query,
+            top_k=top_k,
+            p5_attestation=p5_attestation,
+            p5_attestation_consumer=p5_attestation_consumer,
+        )
+
+    def p5_capability_status(self) -> dict[str, Any]:
+        getter = getattr(self._plugin, "p5_capability_status", None)
+        if not callable(getter):
+            return {"state": "degraded", "error_code": "p5_status_unavailable"}
+        try:
+            result = getter()
+        except Exception:
+            return {"state": "degraded", "error_code": "p5_status_exception"}
+        return dict(result) if isinstance(result, dict) else {"state": "degraded", "error_code": "p5_status_invalid"}
+
+    def provenance_snapshot(self) -> dict[str, Any]:
+        getter = getattr(self._plugin, "provenance_snapshot", None)
+        if not callable(getter):
+            return {"records": {}, "operation_count": 0, "state": "degraded"}
+        result = getter()
+        return dict(result) if isinstance(result, dict) else {"records": {}, "operation_count": 0, "state": "degraded"}
+
+    def provenance_preview(self, candidates: list[dict[str, Any]], *, operation_ref_hash: str) -> dict[str, Any]:
+        getter = getattr(self._plugin, "provenance_preview", None)
+        if not callable(getter):
+            return {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["unavailable"]}
+        result = getter(candidates, operation_ref_hash=operation_ref_hash)
+        return dict(result) if isinstance(result, dict) else {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["invalid_result"]}
+
+    async def provenance_apply(self, operation: dict[str, Any]) -> dict[str, Any]:
+        getter = getattr(self._plugin, "provenance_apply", None)
+        if not callable(getter):
+            return {"ok": False, "state": "degraded", "error_code": "unavailable"}
+        result = await getter(operation)
+        return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
+
+    async def provenance_backup(self) -> dict[str, Any]:
+        getter = getattr(self._plugin, "provenance_backup", None)
+        if not callable(getter):
+            return {"ok": False, "state": "degraded", "error_code": "unavailable"}
+        result = await getter()
+        return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
+
+    async def provenance_rollback(self, operation: dict[str, Any]) -> dict[str, Any]:
+        getter = getattr(self._plugin, "provenance_rollback", None)
+        if not callable(getter):
+            return {"ok": False, "state": "degraded", "error_code": "unavailable"}
+        result = await getter(operation)
+        return dict(result) if isinstance(result, dict) else {"ok": False, "state": "degraded", "error_code": "invalid_result"}
 
     async def create_note(self, *, event: Any, title: str, content: str = "") -> dict[str, Any]:
         return await self._plugin.tool_note_create(event, title, content)
@@ -572,6 +647,12 @@ class MemoryCompanionBridge:
         result["capability_schema_version"] = bot_personal_contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION
         result["payload_schema_version"] = bot_personal_contract.BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION
         result["capability_state"] = "available"
+        p5_status = getattr(self._plugin, "p5_capability_status", None)
+        if callable(p5_status):
+            try:
+                result["p5"] = dict(p5_status() or {})
+            except Exception:
+                result["p5"] = {"state": "degraded", "error_code": "p5_status_exception"}
         self._capability_cache.mark_available(c4_snapshot)
         result.setdefault("warnings", [])
         return result
@@ -632,6 +713,12 @@ class MemoryCompanionBridge:
                 "consume_context_projection",
                 "read_bot_profile",
                 "read_profile",
+                "p5_capability_status",
+                "provenance_snapshot",
+                "provenance_preview",
+                "provenance_apply",
+                "provenance_backup",
+                "provenance_rollback",
                 "probe_capability_snapshot",
                 "probe_bot_personal_memory_capabilities",
             ],
@@ -695,6 +782,7 @@ class MemoryCompanionBridge:
             bot_personal_contract, "BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION", ""
         )
         result["capability_state"] = "degraded"
+        result["p5"] = {"state": "degraded", "error_code": reason}
         return result
 
     def get_token_usage_summary(self) -> dict[str, Any]:

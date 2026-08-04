@@ -685,6 +685,18 @@
         "type": "bool",
         "default": true
       },
+      "enable_p5_b1_recall_gate": {
+        "description": "启用 P5-B1 召回闸门",
+        "hint": "默认关闭。开启后普通记忆注入和主动 recall 需要陪伴侧当前请求的一次性 attestation；无效时返回明确 degraded。",
+        "type": "bool",
+        "default": false
+      },
+      "enable_p5_b1_bridge_gate": {
+        "description": "启用 P5-B1 Bridge 闸门",
+        "hint": "默认关闭。开启后 Bridge 搜索、上下文和序列化入口需要一次性 attestation；不会删除原版娱乐写入。",
+        "type": "bool",
+        "default": false
+      },
       "dedupe_prompt_context": {
         "description": "协同去重陪伴注入",
         "hint": "开启后会和陪伴插件协调，让重复的自我时间线、私聊上下文等段落只由一侧注入。",

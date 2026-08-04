@@ -12,7 +12,7 @@ import inspect
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from .astrbot_compat import (
@@ -65,6 +65,8 @@ from .operations import (
     detect_preset,
     persist_runtime_config,
 )
+from .provenance import observed_from_companion_snapshot
+from .provenance_store import ProvenanceLedger
 from .qq_history import QQHistoryReader
 from .reply_chain import ReplyChainResolver
 from .retrieval import RetrievalEngine
@@ -234,6 +236,148 @@ class MemoryCompanionService:
         self._relationship_phase_state: dict[str, dict[str, Any]] = {}
         self._RELATIONSHIP_PHASE_FILE = self.data_dir / "memory_companion_relationship_phase.json"
         self._load_relationship_phase_state()
+        self.provenance_ledger = ProvenanceLedger(self.data_dir / "provenance_ledger.json")
+        self._last_p5_gate_status: dict[str, Any] = {"state": "disabled", "enabled": False}
+
+    def _p5_gate_enabled(self, sink: str) -> bool:
+        key = (
+            "private_companion_bridge.enable_p5_b1_recall_gate"
+            if sink == "memory_recall"
+            else "private_companion_bridge.enable_p5_b1_bridge_gate"
+        )
+        return self.config.bool(key, False)
+
+    async def _p5_gate(
+        self,
+        *,
+        event: Any = None,
+        sink: str,
+        attestation: Any = None,
+        consumer: Any = None,
+    ) -> dict[str, Any]:
+        """Consume an opaque Companion attestation when a P5 gate is enabled."""
+
+        if not self._p5_gate_enabled(sink):
+            if attestation is not None and callable(consumer):
+                try:
+                    consumed = consumer(attestation, sink)
+                    if inspect.isawaitable(consumed):
+                        await consumed
+                except Exception:
+                    pass
+            result = {"ok": True, "state": "legacy", "legacy": True, "enabled": False}
+            self._last_p5_gate_status = result
+            return result
+        if attestation is None and event is not None:
+            issuer = getattr(event, "private_companion_p5_issue_attestation", None)
+            if callable(issuer):
+                try:
+                    issued = issuer(sink)
+                except Exception:
+                    issued = None
+                if isinstance(issued, tuple) and len(issued) == 2:
+                    attestation, consumer = issued
+        if attestation is None or not callable(consumer):
+            result = {
+                "ok": False,
+                "state": "degraded",
+                "enabled": True,
+                "error_code": "p5_attestation_required",
+                "warnings": ["legacy_call_not_attested"],
+            }
+            self._last_p5_gate_status = result
+            return result
+        try:
+            snapshot = consumer(attestation, sink)
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+        except Exception:
+            snapshot = None
+        snapshot_record = observed_from_companion_snapshot("p5_gate", snapshot)
+        snapshot_sink = getattr(snapshot, "sink", None)
+        if snapshot_sink is None and isinstance(snapshot, Mapping):
+            snapshot_sink = snapshot.get("sink")
+        if snapshot_record.get("provenance_state") != "observed" or snapshot_sink != sink:
+            result = {
+                "ok": False,
+                "state": "denied",
+                "enabled": True,
+                "error_code": "p5_attestation_invalid",
+                "warnings": ["invalid_or_replayed_attestation"],
+            }
+            self._last_p5_gate_status = result
+            return result
+        disposition = str(getattr(snapshot, "disposition", "") or "")
+        trust = str(getattr(snapshot, "source_trust", "") or "")
+        if isinstance(snapshot, Mapping):
+            disposition = str(snapshot.get("disposition") or disposition)
+            trust = str(snapshot.get("source_trust") or snapshot.get("trust") or trust)
+        if disposition == "deny_high_risk":
+            state, error_code, allowed = "denied", "p5_high_risk_denied", False
+        elif disposition != "allow" or trust in {"T3", "T4"}:
+            state, error_code, allowed = "shadow", "p5_source_shadowed", False
+        else:
+            state, error_code, allowed = "allowed", "", True
+        result = {
+            "ok": allowed,
+            "state": state,
+            "enabled": True,
+            "snapshot": snapshot,
+            "error_code": error_code or None,
+            "warnings": [] if allowed else [error_code],
+        }
+        self._last_p5_gate_status = {key: value for key, value in result.items() if key != "snapshot"}
+        return result
+
+    def p5_capability_status(self) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        snapshot = ledger.snapshot() if isinstance(ledger, ProvenanceLedger) else {
+            "records": {}, "operation_count": 0, "observation_count": 0, "path_present": False,
+        }
+        return {
+            "schema_version": "ops.p5.provenance.v1",
+            "recall_gate": self._p5_gate_enabled("memory_recall"),
+            "bridge_gate": self._p5_gate_enabled("bridge_serialization"),
+            "last_gate_state": str(getattr(self, "_last_p5_gate_status", {}).get("state") or "disabled"),
+            "provenance_records": len(snapshot.get("records", {})),
+            "provenance_operations": int(snapshot.get("operation_count", 0) or 0),
+            "provenance_observations": int(snapshot.get("observation_count", 0) or 0),
+            "provenance_file_present": bool(snapshot.get("path_present", False)),
+        }
+
+    async def _p5_record_observed(self, memory_ids: list[str], snapshot: Any) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "provenance_ledger_unavailable"}
+        return await asyncio.to_thread(ledger.record_observed, memory_ids, snapshot)
+
+    def provenance_snapshot(self) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        return ledger.snapshot() if isinstance(ledger, ProvenanceLedger) else {"records": {}, "operation_count": 0}
+
+    def provenance_preview(self, candidates: list[Mapping[str, Any]], *, operation_ref_hash: str) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["ledger_unavailable"]}
+        return ledger.preview_legacy(candidates, operation_ref_hash=operation_ref_hash)
+
+    async def provenance_backup(self) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "ledger_unavailable"}
+        return await asyncio.to_thread(ledger.backup)
+
+    async def provenance_apply(self, operation: Mapping[str, Any]) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "ledger_unavailable"}
+        return await asyncio.to_thread(ledger.apply, operation)
+
+    async def provenance_rollback(self, operation: Mapping[str, Any]) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "ledger_unavailable"}
+        return await asyncio.to_thread(ledger.rollback, operation)
 
     def preview_historical_chat_upload(
         self,
@@ -1020,10 +1164,23 @@ class MemoryCompanionService:
         *,
         session_context: SessionContext | dict[str, Any] | None = None,
         top_k: int | None = None,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
     ) -> list[dict[str, Any]]:
+        gate = await self._p5_gate(
+            sink="bridge_serialization",
+            attestation=p5_attestation,
+            consumer=p5_attestation_consumer,
+        )
+        if not gate.get("ok"):
+            return []
         ctx = self.session_context_from_bridge(session_context)
         results = await self.search(query, ctx, top_k or self.config.int("memory_injection.top_k", 6))
-        return [serialize_memory(item.memory, item.score, item.reason) for item in results]
+        serialized = [serialize_memory(item.memory, item.score, item.reason) for item in results]
+        snapshot = gate.get("snapshot")
+        if snapshot is not None:
+            await self._p5_record_observed([item.memory.id for item in results], snapshot)
+        return serialized
 
     async def bridge_compose_injection(
         self,
@@ -1034,7 +1191,18 @@ class MemoryCompanionService:
         max_chars: int | None = None,
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
+        _p5_gate_passed: bool = False,
     ) -> str:
+        if not _p5_gate_passed:
+            gate = await self._p5_gate(
+                sink="bridge_serialization",
+                attestation=p5_attestation,
+                consumer=p5_attestation_consumer,
+            )
+            if not gate.get("ok"):
+                return ""
         ctx = self.session_context_from_bridge(session_context)
         query_text = clean_text(query or ctx.message_text, 1400)
         if not query_text:
@@ -1060,7 +1228,16 @@ class MemoryCompanionService:
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
         retrieval_profile: str = "",
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
     ) -> str:
+        gate = await self._p5_gate(
+            sink="bridge_serialization",
+            attestation=p5_attestation,
+            consumer=p5_attestation_consumer,
+        )
+        if not gate.get("ok"):
+            return ""
         profile = clean_text(retrieval_profile, 40).lower()
         fast_profile_enabled = {
             "schedule_fast": self.config.bool(
@@ -1089,6 +1266,7 @@ class MemoryCompanionService:
             max_chars=max_chars,
             companion_bot_mood=companion_bot_mood,
             companion_bot_energy=companion_bot_energy,
+            _p5_gate_passed=True,
         )
 
     async def _bridge_compose_schedule_fast_context(
@@ -3694,11 +3872,32 @@ class MemoryCompanionService:
             )
             return {"ok": False, "error": "memory write failed"}
 
-    async def tool_recall(self, event: Any, query: str, top_k: int = 5) -> dict[str, Any]:
+    async def tool_recall(
+        self,
+        event: Any,
+        query: str,
+        top_k: int = 5,
+        *,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
+    ) -> dict[str, Any]:
         ctx = await self.identity.resolve_event_context(event)
         query = clean_text(query, 1000)
         if not query:
             return {"ok": False, "error": "empty query", "memories": []}
+        p5_gate = await self._p5_gate(
+            event=event,
+            sink="memory_recall",
+            attestation=p5_attestation,
+            consumer=p5_attestation_consumer,
+        )
+        if not p5_gate.get("ok"):
+            return {
+                "ok": False,
+                "state": p5_gate.get("state", "degraded"),
+                "error": p5_gate.get("error_code", "p5_attestation_required"),
+                "memories": [],
+            }
         limit = max(1, min(10, int(top_k or 5)))
         results, _blocked, slot_map = await self.search_context_slots(
             query,
@@ -3716,8 +3915,12 @@ class MemoryCompanionService:
             "acl_allowed:private:" in clean_text(getattr(item, "reason", ""), 1200)
             for item in results
         )
+        snapshot = p5_gate.get("snapshot")
+        if snapshot is not None:
+            await self._p5_record_observed([item.memory.id for item in results], snapshot)
         return {
             "ok": True,
+            "state": p5_gate.get("state", "legacy"),
             "usage": (
                 "群聊中的 acl_allowed 私聊结果只是条件候选：仅当当前发言者的核心意图确实需要其本人相关事实时使用；"
                 "普通陈述、转述、反问或意图不清时忽略，不主动公开或扩展私聊内容。"
@@ -5376,6 +5579,22 @@ class MemoryCompanionService:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map={})
             if self.config.bool("memory_injection.debug_log_injection_enabled", False):
                 logger.info("[MemoryCompanion] 记忆注入已关闭: session=%s", ctx.session_id)
+            return
+        p5_gate = await self._p5_gate(event=event, sink="memory_recall")
+        if not p5_gate.get("ok"):
+            self._mark_memory_companion_injection_state(
+                event,
+                req,
+                injected=False,
+                conversation_memory=False,
+                slot_map={},
+            )
+            logger.info(
+                "[MemoryCompanion] P5 召回闸门未放行本轮记忆注入: session=%s state=%s error=%s",
+                ctx.session_id,
+                p5_gate.get("state"),
+                p5_gate.get("error_code"),
+            )
             return
         self._sanitize_request_history_for_companion(ctx, req)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
