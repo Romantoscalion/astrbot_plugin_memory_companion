@@ -36,6 +36,7 @@ from .chat_import import HistoricalChatImporter
 from .classifier import MemoryClassifier
 from .config import ConfigView
 from .context_orchestrator import RetrievalIntent, RetrievalIntentBuilder
+from .emotion_event_contract import normalize_emotion_event
 from .identity import IdentityResolver, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
 from .importance import ImportanceEvaluator
 from .injection import (
@@ -1314,7 +1315,7 @@ class MemoryCompanionService:
                 break
         return open_loops
 
-    def _detect_and_queue_emotional_events(
+    async def _detect_and_queue_emotional_events(
         self,
         ctx: SessionContext,
         results: list[Any],
@@ -1368,23 +1369,54 @@ class MemoryCompanionService:
             event_id = hashlib.sha1(
                 f"{ctx.session_id}|{event_key}|{memory.id}|{event_type}".encode("utf-8", errors="ignore")
             ).hexdigest()[:20]
-            events.append({
-                "id": f"emo_{event_id}",
-                "ts": now,
+            event = normalize_emotion_event({
+                "event_id": f"emo_{event_id}",
+                "trace_id": f"etr_{event_id}",
+                "producer_plugin": "memory_companion",
+                "origin_kind": "memory_recall",
+                "platform": ctx.platform,
+                "bot_id": ctx.bot_id,
+                "scope": ctx.scope,
                 "session_id": ctx.session_id,
+                "actor_ref": {
+                    "kind": memory.subject.kind,
+                    "id": memory.subject.id,
+                    "role": memory.subject.role,
+                },
+                "target_ref": {"kind": "bot", "id": ctx.bot_id or "self", "role": "bot_self"},
                 "event_type": event_type,
+                "intensity": max(scar_w, emotional_w, vulnerability_w) * 100.0,
+                "confidence": max(0.5, min(1.0, getattr(item, "score", 0.5))),
+                "valence_hint": 0.35 if event_type == "warm_memory" else -0.45 if event_type == "scar_touched" else -0.1,
+                "arousal_hint": min(1.0, max(scar_w, emotional_w)),
+                "vulnerability_hint": max(vulnerability_w, 0.6 if event_type == "vulnerable_resonance" else 0.0),
+                "source_rule": event_type,
+                "occurred_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="seconds"),
+                "dedupe_key": f"{ctx.session_id}|{event_key}|{memory.id}|{event_type}",
+                "payload_hash": hashlib.sha256(memory.id.encode("utf-8", errors="ignore")).hexdigest(),
+                "privacy_level": "redacted",
+                "applied_energy_delta": round(energy_delta, 2),
+                "status": "observed",
+                "reason_codes": [event_type, "memory_recall_resonance"],
+            }, producer_plugin="memory_companion")
+            event.update({
+                "id": event["event_id"],
+                "ts": now,
                 "memory_id": memory.id,
                 "energy_delta": round(energy_delta, 2),
                 "mood_hint": mood_hint,
                 "scar_weight": round(scar_w, 3),
                 "emotional_weight": round(emotional_w, 3),
-                "content_preview": clean_text(memory.content, 120),
             })
+            events.append(event)
         if not events:
             return
         queue = self._emotional_event_queue.setdefault(ctx.session_id, [])
         existing_ids = {clean_text(item.get("id"), 80) for item in queue if isinstance(item, dict)}
-        queue.extend(event for event in events if clean_text(event.get("id"), 80) not in existing_ids)
+        fresh_events = [event for event in events if clean_text(event.get("id"), 80) not in existing_ids]
+        queue.extend(fresh_events)
+        for event in fresh_events:
+            await self.store.upsert_emotion_event(event)
         # Trim old events
         queue[:] = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
         if len(queue) > self._EMOTIONAL_EVENT_MAX_PER_SESSION:
@@ -5229,7 +5261,7 @@ class MemoryCompanionService:
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
         )
-        self._detect_and_queue_emotional_events(
+        await self._detect_and_queue_emotional_events(
             ctx, results,
             companion_bot_mood=merged_bot_mood,
             companion_bot_energy=merged_bot_energy,
@@ -5515,7 +5547,7 @@ class MemoryCompanionService:
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
         )
-        self._detect_and_queue_emotional_events(
+        await self._detect_and_queue_emotional_events(
             ctx, results,
             companion_bot_mood=_bot_mood,
             companion_bot_energy=_bot_energy,

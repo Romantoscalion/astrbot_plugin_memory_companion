@@ -485,6 +485,40 @@ class MemoryStore:
                     updated_at TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(memory_id, provider_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS emotion_events (
+                    event_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    trace_id TEXT NOT NULL DEFAULT '',
+                    producer_plugin TEXT NOT NULL DEFAULT '',
+                    origin_kind TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL DEFAULT '',
+                    bot_id TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    actor_ref TEXT NOT NULL DEFAULT '{}',
+                    target_ref TEXT NOT NULL DEFAULT '{}',
+                    quoted_target_ref TEXT NOT NULL DEFAULT '{}',
+                    event_type TEXT NOT NULL DEFAULT 'neutral',
+                    intensity REAL NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    valence_hint REAL NOT NULL DEFAULT 0,
+                    arousal_hint REAL NOT NULL DEFAULT 0,
+                    vulnerability_hint REAL NOT NULL DEFAULT 0,
+                    source_rule TEXT NOT NULL DEFAULT '',
+                    occurred_at TEXT NOT NULL DEFAULT '',
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    dedupe_key TEXT NOT NULL DEFAULT '',
+                    payload_hash TEXT NOT NULL DEFAULT '',
+                    privacy_level TEXT NOT NULL DEFAULT 'redacted',
+                    applied_interaction TEXT NOT NULL DEFAULT '',
+                    applied_energy_delta REAL NOT NULL DEFAULT 0,
+                    correction_of TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'observed',
+                    reason_codes TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(event_id, revision)
+                );
                 """
             )
             self._ensure_memory_columns_sync()
@@ -536,6 +570,15 @@ class MemoryStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_provider ON memory_embeddings(provider_id, updated_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_trace ON emotion_events(trace_id, revision)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_session ON emotion_events(bot_id, scope, session_id, occurred_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_dedupe ON emotion_events(dedupe_key, event_type)"
             )
             self._conn.commit()
 
@@ -6146,3 +6189,90 @@ class MemoryStore:
             )
             self._conn.commit()
         return row_id
+
+    async def upsert_emotion_event(self, value: Any) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(self._upsert_emotion_event_sync, value)
+
+    def _upsert_emotion_event_sync(self, value: Any) -> dict[str, Any]:
+        from .emotion_event_contract import normalize_emotion_event
+
+        event = normalize_emotion_event(value, producer_plugin="memory_companion")
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO emotion_events(
+                    event_id, revision, trace_id, producer_plugin, origin_kind, platform,
+                    bot_id, scope, session_id, actor_ref, target_ref, quoted_target_ref,
+                    event_type, intensity, confidence, valence_hint, arousal_hint,
+                    vulnerability_hint, source_rule, occurred_at, expires_at, dedupe_key,
+                    payload_hash, privacy_level, applied_interaction, applied_energy_delta,
+                    correction_of, status, reason_codes, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    event["event_id"], event["revision"], event["trace_id"], event["producer_plugin"],
+                    event["origin_kind"], event["platform"], event["bot_id"], event["scope"],
+                    event["session_id"], json_dumps(event["actor_ref"]), json_dumps(event["target_ref"]),
+                    json_dumps(event["quoted_target_ref"]), event["event_type"], event["intensity"],
+                    event["confidence"], event["valence_hint"], event["arousal_hint"],
+                    event["vulnerability_hint"], event["source_rule"], event["occurred_at"],
+                    event["expires_at"], event["dedupe_key"], event["payload_hash"],
+                    event["privacy_level"], event["applied_interaction"], event["applied_energy_delta"],
+                    event["correction_of"], event["status"], json_dumps(event["reason_codes"]), utc_now(),
+                ),
+            )
+            self._conn.commit()
+        return event
+
+    async def get_emotion_trace(self, trace_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        return await self._run_recoverable_database_operation(self._get_emotion_trace_sync, trace_id, limit)
+
+    def _get_emotion_trace_sync(self, trace_id: str, limit: int) -> list[dict[str, Any]]:
+        trace = clean_text(trace_id, 96)
+        if not trace:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM emotion_events WHERE trace_id=? ORDER BY revision ASC LIMIT ?",
+                (trace, max(1, min(500, int(limit or 100)))),
+            ).fetchall()
+        return [self._emotion_event_row(row) for row in rows]
+
+    async def list_emotion_events(
+        self,
+        *,
+        bot_id: str = "",
+        session_id: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        return await self._run_recoverable_database_operation(
+            self._list_emotion_events_sync, bot_id, session_id, limit
+        )
+
+    def _list_emotion_events_sync(self, bot_id: str, session_id: str, limit: int) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if clean_text(bot_id, 160):
+            clauses.append("bot_id=?")
+            params.append(clean_text(bot_id, 160))
+        if clean_text(session_id, 220):
+            clauses.append("session_id=?")
+            params.append(clean_text(session_id, 220))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(500, int(limit or 50))))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM emotion_events{where} ORDER BY occurred_at DESC, revision DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._emotion_event_row(row) for row in rows]
+
+    @staticmethod
+    def _emotion_event_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        for key in ("actor_ref", "target_ref", "quoted_target_ref"):
+            result[key] = json_loads(result.get(key), {})
+        result["reason_codes"] = json_loads(result.get("reason_codes"), [])
+        result.pop("created_at", None)
+        result["schema_version"] = "companion_emotion_event.v1"
+        return result

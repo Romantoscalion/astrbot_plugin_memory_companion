@@ -589,6 +589,17 @@ class MemoryCompanionBridge:
         """Retrieve pending emotional drift events for the companion plugin."""
         return self._plugin.bridge_get_emotional_events(session_id=session_id, limit=limit)
 
+    async def record_emotion_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Persist one redacted event revision outside normal memory retrieval."""
+        return await self._plugin.store.upsert_emotion_event(event)
+
+    async def revise_emotion_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Persist a later revision of an existing event."""
+        return await self._plugin.store.upsert_emotion_event(event)
+
+    async def get_emotion_trace(self, trace_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        return await self._plugin.store.get_emotion_trace(trace_id, limit=limit)
+
     async def search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
         return await self._plugin.bridge_search_open_loops(session_id=session_id, limit=limit)
