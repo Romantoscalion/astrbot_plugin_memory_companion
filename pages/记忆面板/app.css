@@ -1493,6 +1493,33 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   align-items:center;
   gap:8px;
 }
+
+.user-memory-filter{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin:0 0 14px;
+  padding:8px;
+  border:1px solid var(--line);
+  border-radius:14px;
+  background:color-mix(in srgb,var(--panel) 88%,transparent);
+}
+.user-memory-filter button{
+  min-height:34px;
+  padding:7px 13px;
+  border:1px solid transparent;
+  border-radius:999px;
+  background:transparent;
+  color:var(--muted);
+  cursor:pointer;
+}
+.user-memory-filter button:hover,
+.user-memory-filter button.is-active{
+  border-color:color-mix(in srgb,var(--accent) 42%,var(--line));
+  background:color-mix(in srgb,var(--accent) 13%,var(--panel));
+  color:var(--text);
+}
+.compatibility-note{color:var(--muted);font-size:13px}
 .scoped-clear-actions{
   max-width:520px;
 }

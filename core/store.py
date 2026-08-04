@@ -4536,6 +4536,110 @@ class MemoryStore:
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
+    async def read_user_memory_summary_records(
+        self,
+        user_id: str,
+        *,
+        session_id: str = "",
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        """Read a bounded exact-identity private-memory set for a bridge DTO.
+
+        This is deliberately not a general search: it accepts no display name,
+        has no cross-window expansion, and never reads group rows. A supplied
+        session must itself resolve to the same private user identity.
+        """
+
+        return await self._run_recoverable_database_operation(
+            self._read_user_memory_summary_records_sync,
+            user_id,
+            session_id,
+            limit,
+        )
+
+    def _read_user_memory_summary_records_sync(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        identity = clean_text(user_id, 120)
+        requested_session = clean_text(session_id, 200)
+        empty = {"records": [], "total": 0, "type_counts": {}}
+        if not identity:
+            return empty
+        if requested_session:
+            scope, target_id = parse_scope_from_session(requested_session)
+            if scope != "private" or clean_text(target_id, 120) != identity:
+                return empty
+
+        try:
+            safe_limit = max(1, min(12, int(limit or 8)))
+        except (TypeError, ValueError, OverflowError):
+            safe_limit = 8
+        session_filters = [
+            "%:friendmessage:" + self._escape_like_suffix(identity),
+            "%:privatemessage:" + self._escape_like_suffix(identity),
+            "%:friend:" + self._escape_like_suffix(identity),
+            "%:private:" + self._escape_like_suffix(identity),
+        ]
+        identity_clause = " OR ".join(
+            ["subject_id=?", "object_id=?", *("LOWER(session_id) LIKE ? ESCAPE '\\'" for _ in session_filters)]
+        )
+        params: list[Any] = [identity, identity, *session_filters]
+        session_clause = ""
+        if requested_session:
+            session_clause = " AND session_id=?"
+            params.append(requested_session)
+        where = (
+            "scope='private' AND review_status!='pending' "
+            "AND visibility IN ('private_pair', 'shareable') "
+            f"AND ({identity_clause}){session_clause}"
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM memories
+                WHERE {where}
+                ORDER BY occurred_at DESC, created_at DESC
+                LIMIT ?
+                """,
+                [*params, safe_limit],
+            ).fetchall()
+            total_row = self._conn.execute(
+                f"SELECT COUNT(*) AS count FROM memories WHERE {where}",
+                params,
+            ).fetchone()
+            type_rows = self._conn.execute(
+                f"SELECT memory_type, COUNT(*) AS count FROM memories WHERE {where} GROUP BY memory_type",
+                params,
+            ).fetchall()
+
+        records: list[MemoryRecord] = []
+        for row in rows:
+            record = MemoryRecord.from_row(row)
+            parsed_scope, parsed_target = parse_scope_from_session(clean_text(record.session_id, 200))
+            direct_identity = identity in {clean_text(record.subject.id, 120), clean_text(record.object.id, 120)}
+            session_identity = parsed_scope == "private" and clean_text(parsed_target, 120) == identity
+            if requested_session and record.session_id != requested_session:
+                continue
+            if direct_identity or session_identity:
+                records.append(record)
+        type_counts = {
+            clean_text(row["memory_type"], 80): max(0, int(row["count"] or 0))
+            for row in type_rows
+            if clean_text(row["memory_type"], 80)
+        }
+        return {
+            "records": records,
+            "total": max(0, int(total_row["count"] or 0)) if total_row else 0,
+            "type_counts": type_counts,
+        }
+
+    @staticmethod
+    def _escape_like_suffix(value: str) -> str:
+        return clean_text(value, 120).lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     async def list_memory_buckets(
         self,
         limit: int | None = 160,

@@ -95,6 +95,7 @@ class PluginPageApi:
             ("/conversation-import/rebind", self.conversation_import_rebind, ["POST"], "MemoryCompanion historical chat rebind"),
             ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
             ("/profiles", self.profiles, ["GET"], "MemoryCompanion Bot Profiles"),
+            ("/user-memory-summary", self.user_memory_summary, ["GET"], "MemoryCompanion User Memory workspace summary"),
             ("/capabilities/bot-personal", self.bot_personal_capabilities, ["GET"], "MemoryCompanion Bot Personal capability"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
@@ -135,6 +136,49 @@ class PluginPageApi:
             current_window=current_window,
             authorized=False,
         )
+        return self._ok({"result": result})
+
+    async def user_memory_summary(self):
+        user_id = clean_text(request.args.get("user_id", ""), 120)
+        session_id = clean_text(request.args.get("session_id", ""), 200)
+        try:
+            limit = max(1, min(8, int(request.args.get("limit", "6"))))
+        except (TypeError, ValueError):
+            limit = 6
+        reader = getattr(getattr(self.plugin, "service", None), "read_user_memory_summary", None)
+        if not callable(reader):
+            result = {
+                "contract": "memory.user_memory_summary.v1",
+                "ok": False,
+                "read_only": True,
+                "state": "degraded",
+                "degraded": True,
+                "pending": True,
+                "user_id": user_id,
+                "session_id": session_id,
+                "counts": {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0},
+                "summaries": [],
+                "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": user_id},
+                "error_code": "bridge_method_unavailable",
+            }
+        else:
+            try:
+                result = await reader(user_id, session_id=session_id, limit=limit)
+            except Exception:
+                result = {
+                    "contract": "memory.user_memory_summary.v1",
+                    "ok": False,
+                    "read_only": True,
+                    "state": "degraded",
+                    "degraded": True,
+                    "pending": True,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "counts": {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0},
+                    "summaries": [],
+                    "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": user_id},
+                    "error_code": "summary_unavailable",
+                }
         return self._ok({"result": result})
 
     async def bot_personal_capabilities(self):

@@ -6,7 +6,7 @@ const VIEWS = {
   objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和互动协同概览。" },
   film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。" },
   microscope: { title: "记忆显微镜", hint: "对比全库管理检索与指定会话中的实际召回和过滤。" },
-  relations: { title: "用户记忆", hint: "聚焦用户画像、偏好、称呼和关系声明。" },
+  relations: { title: "用户档案与记忆", hint: "按用户统一查看私聊、画像、偏好、称呼和关系记忆。" },
   review: { title: "个人记忆", hint: "查看 Bot 自身的每日生活日程、相册、主观记忆和细化片段。" },
   archive: { title: "维护 / 迁移 / 配置", hint: "执行维护、迁移、清理和导入修复。" },
   maintain: { title: "私聊记忆", hint: "查看私聊范围内的对话、偏好、事实和稳定记忆。" },
@@ -42,13 +42,6 @@ const SECONDARY_NAV = {
     { id: "query", label: "召回测试", sublabel: "输入一句话模拟检索", badge: "测试" },
     { id: "hits", label: "命中记忆", sublabel: "查看检索结果", badge: "命中" },
     { id: "blocked", label: "过滤原因", sublabel: "查看被挡下的记忆", badge: "过滤" },
-  ],
-  relations: [
-    { id: "all", label: "全部用户记忆", sublabel: "画像、偏好与关系", badge: "全部" },
-    { id: "profile", label: "用户画像", sublabel: "稳定画像片段", badge: "画像" },
-    { id: "preference", label: "偏好", sublabel: "喜好、习惯、倾向", badge: "偏好" },
-    { id: "relationship", label: "关系声明", sublabel: "身份和关系线索", badge: "关系" },
-    { id: "explicit", label: "明确记住", sublabel: "用户主动要求记住", badge: "记住" },
   ],
   archive: [
     { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
@@ -166,6 +159,7 @@ const state = {
   overviewLayout: document.documentElement.dataset.overviewLayout === "cinema" ? "cinema" : "standard",
   activeView: "objects",
   activeBucketId: "all",
+  userMemoryFilter: "all",
   microscopeBucketId: "all",
   microscopeSearchToken: 0,
   bucketLoadToken: 0,
@@ -1225,18 +1219,21 @@ function bindBucketListInteractions() {
 
 function currentRailScope() {
   if (state.activeView === "film") return "group";
+  if (state.activeView === "relations") return "private";
   if (state.activeView === "maintain") return "private";
   return "";
 }
 
 function scopedViewScope(view = state.activeView) {
   if (view === "film") return "group";
+  if (view === "relations") return "private";
   if (view === "maintain") return "private";
   return "";
 }
 
 function scopedViewTarget(view = state.activeView) {
   if (view === "film") return "#groupMemoryList";
+  if (view === "relations") return "#relationList";
   if (view === "maintain") return "#privateMemoryList";
   return "";
 }
@@ -1244,15 +1241,15 @@ function scopedViewTarget(view = state.activeView) {
 function renderScopedModeControls(view = state.activeView) {
   const scope = scopedViewScope(view);
   if (!scope) return;
-  const title = view === "film" ? $("#groupMemoryTitle") : $("#privateMemoryTitle");
-  const hint = view === "film" ? $("#groupMemoryHint") : $("#privateMemoryHint");
-  if (title) title.textContent = `${windowKindLabel(scope)}记忆`;
+  const title = view === "film" ? $("#groupMemoryTitle") : view === "relations" ? $("#userMemoryTitle") : $("#privateMemoryTitle");
+  const hint = view === "film" ? $("#groupMemoryHint") : view === "relations" ? $("#userMemoryHint") : $("#privateMemoryHint");
+  if (title) title.textContent = view === "relations" ? "用户档案与记忆" : `${windowKindLabel(scope)}记忆`;
   if (hint) hint.textContent = VIEWS[view]?.hint || "";
   updateScopedClearButton(view);
 }
 
 function updateScopedClearButton(view = state.activeView) {
-  const button = view === "film" ? $("#clearCurrentGroupMemoryBtn") : view === "maintain" ? $("#clearCurrentPrivateMemoryBtn") : null;
+  const button = view === "film" ? $("#clearCurrentGroupMemoryBtn") : ["relations", "maintain"].includes(view) ? $("#clearCurrentPrivateMemoryBtn") : null;
   const bucket = activeBucket();
   const scope = scopedViewScope(view);
   const canClear = Boolean(bucket && bucket.id !== "all" && bucket.scope === scope && bucket.target_id);
@@ -1738,6 +1735,11 @@ async function playRailRefreshTransition(task) {
 }
 
 async function openView(view, { preserveBucket = false } = {}) {
+  if (view === "maintain") {
+    view = "relations";
+    state.userMemoryFilter = "private";
+    preserveBucket = true;
+  }
   const app = $("#app");
   const wasWorkspace = app.classList.contains("is-workspace");
   const switchingWorkspaceView = wasWorkspace && state.activeView !== view;
@@ -1777,7 +1779,7 @@ async function openView(view, { preserveBucket = false } = {}) {
   renderScopedModeControls(view);
   if (view === "film") {
     renderScopedBucketRail("group");
-  } else if (view === "maintain") {
+  } else if (view === "relations" || view === "maintain") {
     renderScopedBucketRail("private");
   } else if (view !== "review") {
     renderSecondaryNav(view, !switchingWorkspaceView);
@@ -2009,14 +2011,30 @@ function renderMemoryList(selector, memories, emptyText) {
 }
 
 function relationTypesForSecondary() {
-  const active = activeSecondaryNav("relations");
+  const active = state.userMemoryFilter || "all";
   const map = {
     profile: ["user_profile"],
     preference: ["user_preference"],
     relationship: ["relationship_claim"],
     explicit: ["explicit_memory"],
   };
-  return map[active] || ["user_profile", "user_preference", "explicit_memory", "relationship_claim"];
+  return map[active] || [];
+}
+
+function syncUserMemoryFilterControls() {
+  $$('[data-user-memory-filter]').forEach((button) => {
+    if (!button.closest('#view-relations')) return;
+    const active = button.dataset.userMemoryFilter === state.userMemoryFilter;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+}
+
+async function selectUserMemoryFilter(filter) {
+  const allowed = new Set(['all', 'profile', 'preference', 'relationship', 'explicit', 'private']);
+  state.userMemoryFilter = allowed.has(filter) ? filter : 'all';
+  syncUserMemoryFilterControls();
+  if (state.activeView === 'relations') await loadUserMemory();
 }
 
 async function loadScopedMemories(selector, scope, loadingText, emptyText, extra = {}) {
@@ -2434,10 +2452,25 @@ function renderContextLogs(logs) {
 async function loadUserMemory() {
   const target = $("#relationList");
   if (!target) return;
-  target.innerHTML = loadingState("正在读取用户记忆...");
+  syncUserMemoryFilterControls();
+  target.innerHTML = loadingState("正在读取用户档案与记忆...");
   const types = relationTypesForSecondary();
-  const memories = (await loadMemories({ limit: 160 })).filter((memory) => hasMemoryType(memory, types));
-  renderMemoryList("#relationList", memories, "当前范围还没有用户画像、偏好或关系声明。");
+  const { params, incompatible } = scopedMemoryParams("private", { limit: 180 });
+  if (incompatible) {
+    target.innerHTML = '<div class="empty-state">当前对象不是私聊用户，请从左侧选择用户。</div>';
+    return;
+  }
+  // 用户工作区按精确用户身份聚合其全部私聊窗口；会话 ID 只用于旧私聊入口，
+  // 不能把同一用户在其他私聊窗口中的画像/偏好切掉。
+  if (activeBucket()?.target_id) params.delete("session_id");
+  const data = await apiGet(`/memories?${params.toString()}`);
+  const allMemories = data.memories || [];
+  let memories = allMemories;
+  if (types.length) memories = allMemories.filter((memory) => hasMemoryType(memory, types));
+  if (state.userMemoryFilter === 'private') {
+    memories = allMemories.filter((memory) => memory.scope === 'private');
+  }
+  renderMemoryList("#relationList", memories, "当前用户在这个分类下还没有记忆。");
 }
 
 async function loadPersonalMemory() {
@@ -6331,6 +6364,7 @@ function bindActions() {
     if (!button || !$("#standardOverview").contains(button)) return;
     const view = button.dataset.overviewView;
     if (!VIEWS[view]) return;
+    if (button.dataset.userMemoryFilter) state.userMemoryFilter = button.dataset.userMemoryFilter;
     const bucketId = button.dataset.overviewBucket || "";
     if (bucketId && state.buckets.some((bucket) => bucket.id === bucketId)) {
       state.activeBucketId = bucketId;
@@ -6376,7 +6410,10 @@ function bindActions() {
       strip.style.transition = "transform .95s cubic-bezier(.18,.88,.22,1)";
       strip.style.transform  = `rotate(${ang}deg) translateY(${off}px) translateX(${initialAxis}px)`;
     });
-    strip.addEventListener("click", () => openView(strip.dataset.view));
+    strip.addEventListener("click", () => {
+      if (strip.dataset.userMemoryFilter) state.userMemoryFilter = strip.dataset.userMemoryFilter;
+      openView(strip.dataset.view);
+    });
   });
   $("#backHomeBtn").addEventListener("click", returnHome);
   $("#refreshBtn").addEventListener("click", () => playRailRefreshTransition(refreshAll));
@@ -6393,6 +6430,10 @@ function bindActions() {
     }
   });
   $("#runSearchBtn").addEventListener("click", runSearch);
+  $$('[data-user-memory-filter]').forEach((button) => {
+    if (!button.closest('#view-relations')) return;
+    button.addEventListener('click', () => selectUserMemoryFilter(button.dataset.userMemoryFilter));
+  });
   $("#microscopeContext")?.addEventListener("change", (event) => {
     state.microscopeBucketId = event.currentTarget.value || "all";
     updateMicroscopeContextMeta();

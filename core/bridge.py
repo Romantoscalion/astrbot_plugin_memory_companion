@@ -479,6 +479,86 @@ class MemoryCompanionBridge:
             "items": safe_items,
         }
 
+    async def read_user_memory_summary(
+        self,
+        user_id: str,
+        *,
+        session_id: str = "",
+        limit: int = 6,
+    ) -> dict[str, Any]:
+        """Read a strict, exact-user Memory summary without exposing memory text."""
+
+        identity = clean_text(user_id, 120)
+        safe_session = clean_text(session_id, 200)
+        base = {
+            "contract": "memory.user_memory_summary.v1",
+            "ok": False,
+            "read_only": True,
+            "state": "degraded",
+            "degraded": True,
+            "pending": True,
+            "user_id": identity,
+            "session_id": safe_session,
+            "counts": {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0},
+            "summaries": [],
+            "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": identity},
+        }
+        if not identity:
+            return {**base, "error_code": "missing_user_id"}
+        try:
+            getter = getattr(self._plugin, "read_user_memory_summary", None)
+        except Exception:
+            getter = None
+        if not callable(getter):
+            return {**base, "error_code": "bridge_method_unavailable"}
+        try:
+            result = await getter(identity, session_id=safe_session, limit=limit)
+        except Exception:
+            return {**base, "error_code": "bridge_exception"}
+        if not isinstance(result, dict) or result.get("contract") != base["contract"]:
+            return {**base, "error_code": "invalid_bridge_response"}
+
+        counts = dict(base["counts"])
+        raw_counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+        for key in counts:
+            try:
+                counts[key] = max(0, int(raw_counts.get(key, 0)))
+            except (TypeError, ValueError, OverflowError):
+                counts[key] = 0
+        summaries: list[dict[str, Any]] = []
+        for item in result.get("summaries", []) if isinstance(result.get("summaries"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            category = clean_text(item.get("category"), 40)
+            if category not in {"profile", "preference", "relationship", "private_conversation", "other"}:
+                continue
+            summaries.append(
+                {
+                    "category": category,
+                    "memory_type": clean_text(item.get("memory_type"), 80),
+                    "occurred_at": clean_text(item.get("occurred_at"), 80),
+                    "summary": clean_text(item.get("summary"), 100),
+                    "content_redacted": True,
+                    "truncated": True,
+                }
+            )
+            if len(summaries) >= 8:
+                break
+        state = clean_text(result.get("state"), 40)
+        return {
+            **base,
+            "ok": bool(result.get("ok")) and state == "ready",
+            "state": "ready" if state == "ready" else "degraded",
+            "degraded": state != "ready" or bool(result.get("degraded", False)),
+            "pending": state != "ready" or bool(result.get("pending", False)),
+            "user_id": identity,
+            "session_id": safe_session,
+            "counts": counts,
+            "summaries": summaries,
+            "workspace": base["workspace"],
+            **({"error_code": clean_text(result.get("error_code"), 80)} if state != "ready" and clean_text(result.get("error_code"), 80) else {}),
+        }
+
     async def search_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
         return await self.read_bot_personal_profile(query=query, limit=limit)
 

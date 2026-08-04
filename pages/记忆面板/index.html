@@ -17,7 +17,7 @@
       document.documentElement.dataset.overviewLayout = layout;
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=1.7.1" />
+  <link rel="stylesheet" href="./app.css?v=1.7.1-user-workspace" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -65,12 +65,12 @@
               <p class="eyebrow">Workspace</p>
               <h2 id="overviewDestinationsTitle">功能入口</h2>
             </div>
-            <span>7 个工作区</span>
+            <span>6 个工作区 · 1 个兼容入口</span>
           </div>
           <div class="overview-entry-grid">
-            <button class="overview-entry is-private" data-overview-view="maintain" type="button">
+            <button class="overview-entry is-private" data-overview-view="relations" data-user-memory-filter="private" type="button">
               <span class="overview-entry-index">01</span>
-              <span class="overview-entry-copy"><b>私聊记忆</b><small>对话 · 偏好 · 稳定事实</small></span>
+              <span class="overview-entry-copy"><b>用户档案与记忆</b><small>私聊 · 画像 · 偏好 · 关系</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
             <button class="overview-entry is-group" data-overview-view="film" type="button">
@@ -78,9 +78,9 @@
               <span class="overview-entry-copy"><b>群聊记忆</b><small>群聊 · 成员 · 上下文</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
-            <button class="overview-entry is-user" data-overview-view="relations" type="button">
+            <button class="overview-entry is-user" data-overview-view="relations" data-user-memory-filter="all" type="button">
               <span class="overview-entry-index">03</span>
-              <span class="overview-entry-copy"><b>用户记忆</b><small>画像 · 偏好 · 关系</small></span>
+              <span class="overview-entry-copy"><b>用户档案与记忆</b><small>按用户统一查看全部记忆</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
             <button class="overview-entry is-personal" data-overview-view="review" type="button">
@@ -140,10 +140,10 @@
       <button class="filmstrip" style="--a:-18deg;--z:2;--off:240px"  data-view="objects"    data-tip-title="知识图谱" data-tip-sub="关系 · 线程 · 时间线"     type="button"><span class="strip-label"><b>知识图谱</b><small>关系 · 节点</small></span></button>
       <button class="filmstrip" style="--a:76deg; --z:4;--off:-200px" data-view="film"       data-tip-title="群聊记忆" data-tip-sub="群聊范围内的记忆"      type="button"><span class="strip-label"><b>群聊记忆</b><small>群聊 · 记忆</small></span></button>
       <button class="filmstrip" style="--a:44deg; --z:7;--off:260px"  data-view="microscope" data-tip-title="记忆显微镜" data-tip-sub="模拟召回 · 检查注入"     type="button"><span class="strip-label" style="--label-edge:-260px"><b>记忆显微镜</b><small>模拟召回</small></span></button>
-      <button class="filmstrip" style="--a:14deg; --z:5;--off:-225px;--tx:-440px" data-view="relations"  data-tip-title="用户记忆"     data-tip-sub="用户画像 · 偏好 · 关系"     type="button"><span class="strip-label" style="--label-edge:380px"><b>用户记忆</b><small>画像 · 偏好</small></span></button>
+      <button class="filmstrip" style="--a:14deg; --z:5;--off:-225px;--tx:-440px" data-view="relations" data-user-memory-filter="all" data-tip-title="用户档案与记忆" data-tip-sub="私聊 · 画像 · 偏好 · 关系" type="button"><span class="strip-label" style="--label-edge:380px"><b>用户档案与记忆</b><small>按用户统一查看</small></span></button>
       <button class="filmstrip" style="--a:162deg;--z:1;--off:215px;--tx:-260px" data-view="review"     data-tip-title="个人记忆"       data-tip-sub="Bot 日程 · 生活细化"         type="button"><span class="strip-label is-flipped"><b>个人记忆</b><small>日程 · 细化</small></span></button>
       <button class="filmstrip" style="--a:136deg;--z:3;--off:-390px" data-view="archive"    data-tip-title="维护/迁移/配置"   data-tip-sub="工具 · 迁移 · 配置"        type="button"><span class="strip-label is-flipped"><b>维护/迁移/配置</b><small>工具 · 配置</small></span></button>
-      <button class="filmstrip" style="--a:106deg;--z:6;--off:220px"  data-view="maintain"   data-tip-title="私聊记忆"  data-tip-sub="私聊范围内的记忆" type="button"><span class="strip-label is-flipped"><b>私聊记忆</b><small>私聊 · 记忆</small></span></button>
+      <button class="filmstrip" style="--a:106deg;--z:6;--off:220px" data-view="relations" data-user-memory-filter="private" data-tip-title="私聊记忆（兼容入口）" data-tip-sub="进入用户档案与记忆" type="button"><span class="strip-label is-flipped"><b>私聊记忆</b><small>进入统一工作区</small></span></button>
 
       <section class="overview-core" aria-live="polite">
         <div class="core-ring"></div>
@@ -242,8 +242,19 @@
 
           <section id="view-relations" class="view">
             <div class="section-head">
-              <h3>用户记忆</h3>
-              <p>聚焦用户画像、偏好、称呼、关系声明等以用户为核心的记忆。</p>
+              <div>
+                <h3 id="userMemoryTitle">用户档案与记忆</h3>
+                <p id="userMemoryHint">选择左侧用户后，在同一工作区查看私聊、画像、偏好和关系记忆。</p>
+              </div>
+              <button id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>
+            </div>
+            <div class="user-memory-filter" role="tablist" aria-label="用户记忆分类">
+              <button class="is-active" data-user-memory-filter="all" type="button" role="tab" aria-selected="true">全部</button>
+              <button data-user-memory-filter="profile" type="button" role="tab" aria-selected="false">画像</button>
+              <button data-user-memory-filter="preference" type="button" role="tab" aria-selected="false">偏好</button>
+              <button data-user-memory-filter="relationship" type="button" role="tab" aria-selected="false">关系</button>
+              <button data-user-memory-filter="explicit" type="button" role="tab" aria-selected="false">明确记住</button>
+              <button data-user-memory-filter="private" type="button" role="tab" aria-selected="false">私聊记忆</button>
             </div>
             <div id="relationList" class="row-list"></div>
           </section>
@@ -262,7 +273,7 @@
                 <h3 id="privateMemoryTitle">私聊记忆</h3>
                 <p id="privateMemoryHint">查看私聊范围内的对话、偏好、事实和稳定记忆。</p>
               </div>
-              <button id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>
+              <span class="compatibility-note">此旧入口已合并到“用户档案与记忆”。</span>
             </div>
             <div id="privateMemoryList" class="row-list"></div>
           </section>
@@ -461,6 +472,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=1.7.1"></script>
+  <script src="./app.js?v=1.7.1-user-workspace"></script>
 </body>
 </html>
