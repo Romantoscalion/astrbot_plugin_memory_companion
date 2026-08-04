@@ -590,22 +590,22 @@ class MemoryCompanionBridge:
                 read_only=False,
             )
         except Exception:
-            return self._degraded_personal_capability_probe("contract_descriptor_exception")
+            return self._negative_personal_capability_probe("contract_descriptor_exception")
 
         if not isinstance(descriptor, dict):
-            return self._degraded_personal_capability_probe("contract_descriptor_invalid")
+            return self._negative_personal_capability_probe("contract_descriptor_invalid")
 
         result = dict(descriptor)
         try:
             problems = bot_personal_contract.contract_self_check()
         except Exception:
-            return self._degraded_personal_capability_probe(
+            return self._negative_personal_capability_probe(
                 "contract_self_check_exception",
                 base=result,
             )
 
         if not isinstance(problems, list):
-            return self._degraded_personal_capability_probe(
+            return self._negative_personal_capability_probe(
                 "contract_self_check_invalid",
                 base=result,
             )
@@ -622,7 +622,7 @@ class MemoryCompanionBridge:
                 code = str(problem).split(":", 1)[0]
                 if code in known_codes and code not in warnings:
                     warnings.append(code)
-            return self._degraded_personal_capability_probe(
+            return self._negative_personal_capability_probe(
                 "contract_self_check_failed",
                 base=result,
                 warnings=warnings,
@@ -725,6 +725,34 @@ class MemoryCompanionBridge:
         )
         result.setdefault("contract_version", str(result.get("contract_revision", "")))
         result.setdefault("schema_version", str(result.get("capability_schema_version", "")))
+        return result
+
+    def _negative_personal_capability_probe(
+        self,
+        reason: str,
+        *,
+        base: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return a bounded failure and suppress repeated probes for the TTL."""
+
+        safe_reason = clean_text(reason, 120) or "capability_negative"
+        result = self._degraded_personal_capability_probe(
+            safe_reason,
+            base=base,
+            warnings=warnings,
+        )
+        cached = self._capability_cache.mark_negative(safe_reason)
+        for key in ("available", "state", "degraded", "pending", "error_code"):
+            if key in cached:
+                result[key] = cached[key]
+        result["available"] = False
+        result["state"] = "negative"
+        result["capability_state"] = "negative"
+        result["degraded"] = True
+        result["pending"] = False
+        result["error_code"] = safe_reason
+        result["p5"] = {"state": "degraded", "error_code": safe_reason}
         return result
 
     @staticmethod

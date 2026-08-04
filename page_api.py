@@ -845,7 +845,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] timeline 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("timeline_unavailable", 500)
 
     async def relations(self):
         try:
@@ -859,7 +859,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] relations 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("relations_unavailable", 500)
 
     async def graph(self):
         try:
@@ -873,7 +873,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] graph 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("graph_unavailable", 500)
 
     async def threads(self):
         try:
@@ -885,7 +885,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] threads 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("threads_unavailable", 500)
 
     async def thread_status(self):
         payload = await self._json()
@@ -916,7 +916,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] logs 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("logs_unavailable", 500)
 
     async def context_config(self):
         config = self.plugin.service.config

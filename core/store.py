@@ -14,6 +14,8 @@ from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads,
 
 
 class MemoryStore:
+    EMBEDDING_CANDIDATE_CACHE_MAX = 64
+
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1464,14 +1466,14 @@ class MemoryStore:
             self._conn.commit()
         return row_id
 
-    async def list_identities(self, limit: int = 1000) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._list_identities_sync, limit)
+    async def list_identities(self, limit: int = 1000, *, offset: int = 0) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_identities_sync, limit, offset)
 
-    def _list_identities_sync(self, limit: int) -> list[dict[str, Any]]:
+    def _list_identities_sync(self, limit: int, offset: int) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM identities ORDER BY updated_at DESC LIMIT ?",
-                (max(1, int(limit)),),
+                "SELECT * FROM identities ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (max(1, int(limit)), max(0, int(offset))),
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
@@ -1606,6 +1608,8 @@ class MemoryStore:
         scope: str = "",
         session_id: str = "",
         group_id: str = "",
+        *,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self._list_relationships_sync,
@@ -1614,6 +1618,7 @@ class MemoryStore:
             scope,
             session_id,
             group_id,
+            offset,
         )
 
     def _list_relationships_sync(
@@ -1623,6 +1628,7 @@ class MemoryStore:
         scope: str,
         session_id: str,
         group_id: str,
+        offset: int,
     ) -> list[dict[str, Any]]:
         params: list[Any] = []
         where = "1=1"
@@ -1644,9 +1650,9 @@ class MemoryStore:
                 SELECT * FROM relationship_edges
                 WHERE {where}
                 ORDER BY updated_at DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                params + [max(1, int(limit))],
+                params + [max(1, int(limit)), max(0, int(offset))],
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1857,8 +1863,8 @@ class MemoryStore:
             params.append(clean_text(group_id, 120))
         node = clean_text(node, 160)
         if node:
-            where += " AND (s.label LIKE ? OR t.label LIKE ?)"
-            like = f"%{node}%"
+            where += " AND (s.label LIKE ? ESCAPE '\\' OR t.label LIKE ? ESCAPE '\\')"
+            like = self._like_pattern(node)
             params.extend([like, like])
         with self._lock:
             rows = self._conn.execute(
@@ -2110,8 +2116,8 @@ class MemoryStore:
         if group_id:
             scope_filter += " AND (n.group_id='' OR n.group_id=?)"
             params.append(group_id)
-        like_sql = " OR ".join(["lower(n.label) LIKE ?" for _ in cleaned_terms])
-        like_params = [f"%{term}%" for term in cleaned_terms]
+        like_sql = " OR ".join(["lower(n.label) LIKE ? ESCAPE '\\'" for _ in cleaned_terms])
+        like_params = [self._like_pattern(term) for term in cleaned_terms]
         with self._lock:
             matched = self._conn.execute(
                 f"""
@@ -3452,8 +3458,17 @@ class MemoryStore:
         scope: str = "",
         session_id: str = "",
         entity_id: str = "",
+        *,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._recent_timeline_sync, limit, scope, session_id, entity_id)
+        return await asyncio.to_thread(
+            self._recent_timeline_sync,
+            limit,
+            scope,
+            session_id,
+            entity_id,
+            offset,
+        )
 
     def _recent_timeline_sync(
         self,
@@ -3461,6 +3476,7 @@ class MemoryStore:
         scope: str,
         session_id: str,
         entity_id: str,
+        offset: int,
     ) -> list[dict[str, Any]]:
         params: list[Any] = []
         where = "1=1"
@@ -3479,9 +3495,9 @@ class MemoryStore:
                 SELECT * FROM timeline
                 WHERE {where}
                 ORDER BY occurred_at DESC, created_at DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                params + [max(1, int(limit))],
+                params + [max(1, int(limit)), max(0, int(offset))],
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -4428,6 +4444,7 @@ class MemoryStore:
         self,
         *,
         limit: int = 50,
+        offset: int = 0,
         include_pending: bool = True,
         query: str = "",
         memory_type: str = "",
@@ -4442,6 +4459,7 @@ class MemoryStore:
         return await self._run_recoverable_database_operation(
             self._list_memories_sync,
             limit,
+            offset,
             include_pending,
             query,
             memory_type,
@@ -4457,6 +4475,7 @@ class MemoryStore:
     def _list_memories_sync(
         self,
         limit: int,
+        offset: int,
         include_pending: bool,
         query: str,
         memory_type: str,
@@ -4473,11 +4492,11 @@ class MemoryStore:
         if not include_pending:
             where += " AND review_status != 'pending'"
         if query:
-            like = f"%{clean_text(query, 500)}%"
+            like = self._like_pattern(query)
             where += (
-                " AND (id LIKE ? OR content LIKE ? OR evidence LIKE ? OR subject_id LIKE ?"
-                " OR subject_name LIKE ? OR object_id LIKE ? OR object_name LIKE ?"
-                " OR session_id LIKE ? OR group_id LIKE ?)"
+                " AND (id LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR evidence LIKE ? ESCAPE '\\' OR subject_id LIKE ? ESCAPE '\\'"
+                " OR subject_name LIKE ? ESCAPE '\\' OR object_id LIKE ? ESCAPE '\\' OR object_name LIKE ? ESCAPE '\\'"
+                " OR session_id LIKE ? ESCAPE '\\' OR group_id LIKE ? ESCAPE '\\')"
             )
             params.extend([like] * 9)
         if memory_type:
@@ -4503,17 +4522,17 @@ class MemoryStore:
             params.append(clean_text(group_id, 120))
         if entity_id:
             entity = clean_text(entity_id, 120)
-            where += " AND (subject_id=? OR object_id=? OR group_id=? OR session_id LIKE ?)"
-            params.extend([entity, entity, entity, f"%{entity}%"])
+            where += " AND (subject_id=? OR object_id=? OR group_id=? OR session_id LIKE ? ESCAPE '\\')"
+            params.extend([entity, entity, entity, self._like_pattern(entity)])
         with self._lock:
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM memories
                 WHERE {where}
                 ORDER BY occurred_at DESC, created_at DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                params + [max(1, int(limit))],
+                params + [max(1, int(limit)), max(0, int(offset))],
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
@@ -4538,7 +4557,7 @@ class MemoryStore:
         if not user_id:
             return ""
         bot_clause = ""
-        params: list[Any] = [user_id, user_id, f"%{user_id}%"]
+        params: list[Any] = [user_id, user_id, self._like_pattern(user_id)]
         if bot_id:
             bot_clause = """
                   AND (
@@ -4562,7 +4581,7 @@ class MemoryStore:
                     MAX(COALESCE(NULLIF(occurred_at, ''), created_at)) AS latest_at
                 FROM memories
                 WHERE scope='private' AND session_id!=''
-                  AND (subject_id=? OR object_id=? OR session_id LIKE ?)
+                  AND (subject_id=? OR object_id=? OR session_id LIKE ? ESCAPE '\\')
                   {bot_clause}
                 GROUP BY session_id
                 ORDER BY native_count DESC, total_count DESC, latest_at DESC
@@ -6029,6 +6048,8 @@ class MemoryStore:
             result.append((MemoryRecord.from_row(row), vector, clean_text(row["embedding_text_hash"], 80)))
         with self._lock:
             self._embedding_candidate_cache[cache_key] = result
+            while len(self._embedding_candidate_cache) > self.EMBEDDING_CANDIDATE_CACHE_MAX:
+                self._embedding_candidate_cache.pop(next(iter(self._embedding_candidate_cache)), None)
         return deepcopy(result)
 
     async def list_memories_missing_embeddings(

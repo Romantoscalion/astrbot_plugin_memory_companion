@@ -77,6 +77,9 @@ from .turn_signal import analyze_turn_signal, message_terms
 from .visibility import VisibilityPolicy
 
 
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+
 _RECENT_FACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("meal", re.compile(r"吃过|吃完|吃了|没吃|还没吃|正在吃|吃饭|早饭|早餐|午饭|午餐|晚饭|晚餐|夜宵")),
     ("bath", re.compile(r"洗澡|洗完澡|冲澡|沐浴")),
@@ -2418,7 +2421,7 @@ class MemoryCompanionService:
         error: str = "",
     ) -> None:
         usage = self._extract_token_usage(resp, prompt, completion)
-        now_dt = datetime.now()
+        now_dt = datetime.now(LOCAL_TZ)
         now_ts = time.time()
         day = now_dt.strftime("%Y-%m-%d")
         hour = now_dt.strftime("%Y-%m-%dT%H:00")
@@ -2581,9 +2584,13 @@ class MemoryCompanionService:
         provider_id = clean_text(provider_id, 160)
         indexed = 0
         try:
+            batch_size = max(
+                1,
+                min(200, self.config.int("retrieval.embedding_backfill_batch_size", 50)),
+            )
             records = await self.store.list_memories_missing_embeddings(
                 provider_id=provider_id,
-                limit=self.config.int("retrieval.embedding_backfill_batch_size", 50),
+                limit=batch_size,
                 include_pending=self.config.bool("retrieval.embedding_index_pending", False),
             )
             for record in records:
@@ -8113,7 +8120,7 @@ class MemoryCompanionService:
         if not check_like:
             return False
         try:
-            hour = datetime.now().hour
+            hour = datetime.now(LOCAL_TZ).hour
         except Exception:
             return True
         return hour >= 23 or hour < 7
@@ -8647,7 +8654,7 @@ class MemoryCompanionService:
     def _compute_time_of_day(self) -> str:
         """Compute time-of-day category for atmosphere hints."""
         try:
-            hour = datetime.now().hour
+            hour = datetime.now(LOCAL_TZ).hour
         except Exception:
             return ""
         if 23 <= hour or hour < 4:

@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if "astrbot_plugin_remember_you" not in sys.modules:
+    package = types.ModuleType("astrbot_plugin_remember_you")
+    package.__path__ = [str(ROOT)]
+    sys.modules["astrbot_plugin_remember_you"] = package
+if str(ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(ROOT.parent))
+
+from astrbot_plugin_remember_you.core.chat_import import HistoricalChatImporter
+from astrbot_plugin_remember_you.core.models import MemoryRecord
+from astrbot_plugin_remember_you.core.operations import PORTABLE_EXPORT_PAGE_SIZE, PortableMemoryArchive
+from astrbot_plugin_remember_you.core.retrieval import RetrievalEngine
+from astrbot_plugin_remember_you.core.store import MemoryStore
+
+
+class _Config:
+    def int(self, _key: str, default: int) -> int:
+        return default
+
+
+class _ResumeStore:
+    def __init__(self) -> None:
+        self.batch = {"id": "batch-1", "state": "running", "checkpoint_segment": 7}
+        self.segments = [{"id": "seg-1", "segment_index": 1, "status": "processing", "attempts": 2}]
+        self.updates: list[tuple[str, dict]] = []
+
+    async def get_chat_import_batch(self, _batch_id: str):
+        return dict(self.batch)
+
+    async def chat_import_segments(self, _batch_id: str, *, statuses=None):
+        if statuses is None:
+            return list(self.segments)
+        return [item for item in self.segments if item["status"] in statuses]
+
+    async def update_chat_import_segment(self, segment_id: str, **changes):
+        self.updates.append((segment_id, changes))
+        for item in self.segments:
+            if item["id"] == segment_id:
+                item.update(changes)
+        return dict(self.segments[0])
+
+    async def update_chat_import_batch(self, _batch_id: str, **changes):
+        self.batch.update(changes)
+        return dict(self.batch)
+
+
+class C7ImportRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_corrupt_manifest_has_stable_redacted_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            importer = HistoricalChatImporter(SimpleNamespace(data_dir=Path(temp), store=object()))
+            upload_id = "chatup_" + "a" * 24
+            upload_dir = importer._upload_dir(upload_id)
+            upload_dir.mkdir(parents=True)
+            (upload_dir / "manifest.json").write_text("{broken", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "历史导入暂存数据损坏") as raised:
+                importer.preview_upload(upload_id)
+            self.assertNotIn(str(upload_dir), str(raised.exception))
+
+    def test_corrupt_parsed_jsonl_does_not_become_empty_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            importer = HistoricalChatImporter(SimpleNamespace(data_dir=Path(temp), store=object()))
+            upload_id = "chatup_" + "b" * 24
+            upload_dir = importer._upload_dir(upload_id)
+            upload_dir.mkdir(parents=True)
+            (upload_dir / "manifest.json").write_text(
+                json.dumps({"upload_id": upload_id}), encoding="utf-8"
+            )
+            (upload_dir / "parsed.jsonl").write_text('{"message_id":"ok"}\n{broken\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "历史导入暂存数据损坏"):
+                importer._load_upload_messages(upload_id)
+
+    async def test_processing_segment_is_retried_only_without_active_worker(self) -> None:
+        store = _ResumeStore()
+        service = SimpleNamespace(data_dir=Path(tempfile.gettempdir()), store=store, config=_Config())
+        importer = HistoricalChatImporter(service)
+        importer._start_worker = lambda _batch_id: None
+        result = await importer.resume_batch("batch-1")
+        self.assertEqual("retry", store.segments[0]["status"])
+        self.assertEqual("running", result["batch"]["state"])
+        self.assertEqual(0, store.segments[0]["attempts"])
+
+
+class C7RetrievalBoundaryTests(unittest.TestCase):
+    def test_materialize_limit_is_explicit_and_bounded(self) -> None:
+        self.assertGreater(RetrievalEngine.DEFAULT_MATERIALIZE_LIMIT, 0)
+        self.assertLessEqual(RetrievalEngine.DEFAULT_MATERIALIZE_LIMIT, 2000)
+
+    def test_panel_polling_has_attempt_and_time_bounds(self) -> None:
+        panel = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("historicalChatPollAttempts > 120", panel)
+        self.assertIn("elapsed > 10 * 60 * 1000", panel)
+        self.assertIn("历史导入轮询已达到上限", panel)
+
+
+class C7PerformanceBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_embedding_candidate_cache_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = MemoryStore(Path(temp) / "memory.db")
+            store.initialize()
+            try:
+                for index in range(store.EMBEDDING_CANDIDATE_CACHE_MAX + 1):
+                    await store.list_embedding_candidate_rows(
+                        provider_id=f"provider-{index}",
+                        limit=1,
+                    )
+                self.assertLessEqual(
+                    len(store._embedding_candidate_cache),
+                    store.EMBEDDING_CANDIDATE_CACHE_MAX,
+                )
+            finally:
+                store.close()
+
+    async def test_portable_export_pages_large_memory_sets_without_materializing_all_rows(self) -> None:
+        records = [
+            MemoryRecord(
+                id=f"memory-{index}",
+                memory_type="user_fact",
+                scope="private",
+                visibility="private_pair",
+                content=f"content-{index}",
+            )
+            for index in range(PORTABLE_EXPORT_PAGE_SIZE + 1)
+        ]
+
+        class PagedStore:
+            def __init__(self) -> None:
+                self.memory_calls: list[tuple[int, int]] = []
+
+            async def stats(self):
+                return {
+                    "total_memories": len(records),
+                    "identities": 0,
+                    "relationships": 0,
+                    "timeline_events": 0,
+                }
+
+            async def list_memories(self, *, limit, offset=0):
+                self.memory_calls.append((limit, offset))
+                return records[offset : offset + limit]
+
+            async def list_identities(self, *, limit, offset=0):
+                return []
+
+            async def list_relationships(self, *, limit, offset=0):
+                return []
+
+            async def recent_timeline(self, *, limit, offset=0):
+                return []
+
+            async def list_acl_rules(self):
+                return []
+
+            async def list_acl_policies(self):
+                return []
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = PagedStore()
+            result = await PortableMemoryArchive(store, Path(temp)).export()
+            self.assertEqual(
+                [
+                    (PORTABLE_EXPORT_PAGE_SIZE, 0),
+                    (PORTABLE_EXPORT_PAGE_SIZE, PORTABLE_EXPORT_PAGE_SIZE),
+                ],
+                store.memory_calls,
+            )
+            self.assertEqual(len(records), result["counts"]["memory"])
+            self.assertEqual(
+                len(records) + 1,
+                len(Path(result["path"]).read_text(encoding="utf-8").splitlines()),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

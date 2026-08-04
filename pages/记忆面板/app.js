@@ -194,6 +194,8 @@ const state = {
   historicalChatTargetContextId: "",
   historicalChatTargetBuckets: [],
   historicalChatPollTimer: 0,
+  historicalChatPollAttempts: 0,
+  historicalChatPollStartedAt: 0,
   historicalChatFile: null,
   conversationImportSource: "qq",
   qqHistoryCapabilities: null,
@@ -495,7 +497,21 @@ async function httpRequest(path, method, body) {
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
-  return response.json();
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (error) {
+    if (!response.ok) {
+      throw new Error(`请求失败（HTTP ${response.status}）`);
+    }
+    throw new Error("页面 API 返回了无效 JSON");
+  }
+  if (!response.ok || data?.success === false) {
+    const error = new Error(data?.error || `请求失败（HTTP ${response.status}）`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
 }
 
 function sleep(ms) {
@@ -2076,20 +2092,34 @@ async function loadContextPanel() {
       apiGet(`/timeline?${params.toString()}`),
       apiGet(`/logs?${params.toString()}`),
     ]);
-    const settled = (idx) => results[idx].status === "fulfilled" ? (results[idx].value?.items || []) : [];
-    const failures = results.filter(r => r.status === "rejected");
+    const settled = (idx) => {
+      const result = results[idx];
+      if (result.status === "fulfilled") {
+        return { items: Array.isArray(result.value?.items) ? result.value.items : [], error: "" };
+      }
+      return { items: [], error: result.reason?.message || "读取失败，请稍后重试" };
+    };
+    const sections = results.map((_, idx) => settled(idx));
+    const failures = sections.filter((item) => item.error);
     if (failures.length === results.length) {
       throw results[0].reason || new Error("所有知识图谱 API 请求失败");
     }
     target.innerHTML = renderKnowledgeOverview({
-      graph: settled(0),
-      relations: settled(1),
-      threads: settled(2),
-      timeline: settled(3),
-      logs: settled(4),
+      graph: sections[0].items,
+      relations: sections[1].items,
+      threads: sections[2].items,
+      timeline: sections[3].items,
+      logs: sections[4].items,
+      errors: {
+        graph: sections[0].error,
+        relations: sections[1].error,
+        threads: sections[2].error,
+        timeline: sections[3].error,
+        logs: sections[4].error,
+      },
     });
     if (failures.length > 0) {
-      const failedNames = ["图谱边", "身份关系", "跨窗口线程", "时间线", "注入日志"].filter((_, i) => results[i].status === "rejected");
+      const failedNames = ["图谱边", "身份关系", "跨窗口线程", "时间线", "注入日志"].filter((_, i) => sections[i].error);
       showToast(`${failedNames.join("、")}加载失败，已显示可用数据`, "error");
     }
   }
@@ -2109,7 +2139,16 @@ function rawAttr(value) {
   return escapeHtml(JSON.stringify(value || {}));
 }
 
-function renderKnowledgeOverview({ graph = [], relations = [], threads = [], timeline = [], logs = [] } = {}) {
+function renderContextPanelErrors(errors = {}) {
+  const labels = { graph: "图谱边", relations: "身份关系", threads: "跨窗口线程", timeline: "时间线", logs: "注入日志" };
+  const rows = Object.entries(errors)
+    .filter(([, message]) => message)
+    .map(([key, message]) => `<div class="empty-state error-state"><b>${escapeHtml(labels[key] || key)}读取失败</b><span>${escapeHtml(message)}</span></div>`)
+    .join("");
+  return rows ? `<section class="context-section film-panel"><h4>部分数据暂不可用</h4>${rows}</section>` : "";
+}
+
+function renderKnowledgeOverview({ graph = [], relations = [], threads = [], timeline = [], logs = [], errors = {} } = {}) {
   const activeThreads = threads.filter((item) => (item.status || "open") === "open").length;
   return `
     <section class="context-section film-panel">
@@ -2121,6 +2160,7 @@ function renderKnowledgeOverview({ graph = [], relations = [], threads = [], tim
         ${configCard("时间线节点", `${timeline.length} 条`, "最近记录的事件、消息和整理结果", "blue", "时间")}
       </div>
     </section>
+    ${renderContextPanelErrors(errors)}
     ${renderKnowledgeGraphEdges(graph, "最近图谱边")}
     ${renderKnowledgeRelations(relations, "最近身份关系")}
     ${renderKnowledgeThreads(threads, "最近跨窗口线程")}
@@ -5793,7 +5833,16 @@ async function refreshHistoricalChatStatus() {
 
 function scheduleHistoricalChatPoll() {
   stopHistoricalChatPoll();
+  state.historicalChatPollAttempts = 0;
+  state.historicalChatPollStartedAt = Date.now();
   state.historicalChatPollTimer = window.setInterval(() => {
+    state.historicalChatPollAttempts += 1;
+    const elapsed = Date.now() - state.historicalChatPollStartedAt;
+    if (state.historicalChatPollAttempts > 120 || elapsed > 10 * 60 * 1000) {
+      stopHistoricalChatPoll();
+      showToast("历史导入轮询已达到上限，请手动刷新任务状态", "error");
+      return;
+    }
     refreshHistoricalChatStatus().catch(() => stopHistoricalChatPoll());
   }, 3000);
 }
@@ -5801,6 +5850,7 @@ function scheduleHistoricalChatPoll() {
 function stopHistoricalChatPoll() {
   if (state.historicalChatPollTimer) window.clearInterval(state.historicalChatPollTimer);
   state.historicalChatPollTimer = 0;
+  state.historicalChatPollStartedAt = 0;
 }
 
 function historicalChatSegmentStatusLabel(value) {

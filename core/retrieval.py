@@ -16,6 +16,7 @@ from .visibility import VisibilityPolicy
 
 
 class RetrievalEngine:
+    DEFAULT_MATERIALIZE_LIMIT = 2000
     def __init__(
         self,
         store: MemoryStore,
@@ -1005,7 +1006,11 @@ class RetrievalEngine:
             )
         expanded_terms = self._merge_terms(terms, graph_terms)
         include_pending = not self.policy.hide_pending_review
-        ranked_candidates = await self.store.list_candidate_memories(limit=2000, include_pending=include_pending)
+        # Keep the broad priority scan explicitly bounded.
+        ranked_candidates = await self.store.list_candidate_memories(
+            limit=self.DEFAULT_MATERIALIZE_LIMIT,
+            include_pending=include_pending,
+        )
         current_window_candidates = await self.store.list_current_window_candidate_memories(
             scope=ctx.scope,
             session_id=ctx.session_id,
