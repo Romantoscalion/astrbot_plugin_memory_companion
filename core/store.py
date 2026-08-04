@@ -596,6 +596,10 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_emotion_events_session ON emotion_events(bot_id, scope, session_id, occurred_at DESC)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_delivery_domain "
+                "ON emotion_events(bot_id, scope, platform, occurred_at DESC, event_id DESC, revision DESC)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_emotion_events_dedupe ON emotion_events(dedupe_key, event_type)"
             )
             self._conn.execute(
@@ -6625,23 +6629,61 @@ class MemoryStore:
             bounded_limit = max(1, min(20, int(limit or 10)))
         except (TypeError, ValueError):
             bounded_limit = 10
+        cursor_value = clean_text(cursor, 400)
+        cursor_position = self._parse_emotion_delivery_cursor(cursor_value)
+        if cursor_value and cursor_position is None:
+            return self._empty_emotion_delivery()
         clauses = [
             "e.origin_kind='memory_recall'",
             "e.status NOT IN ('ignored','expired')",
             "COALESCE(d.acked_at, '')=''",
             "e.bot_id=?",
-            "e.scope=?",
+            "LOWER(e.scope)=?",
             "e.platform=?",
+            "json_valid(e.actor_ref)",
+            "json_extract(e.actor_ref, '$.kind')='user'",
+            "CAST(json_extract(e.actor_ref, '$.id') AS TEXT)=?",
+            "json_valid(e.target_ref)",
+            "json_extract(e.target_ref, '$.kind')='bot'",
+            "CAST(json_extract(e.target_ref, '$.id') AS TEXT)=?",
+            """(
+                e.expires_at=''
+                OR (
+                    (instr(e.expires_at, 'Z') > 0 OR substr(e.expires_at, -6, 1) IN ('+', '-'))
+                    AND julianday(e.expires_at) IS NOT NULL
+                    AND julianday(e.expires_at) > julianday('now')
+                )
+            )""",
         ]
         params: list[Any] = [
             domain["consumer_id"],
             domain["bot_id"],
             domain["scope"],
             domain["platform"],
+            domain["user_id"],
+            domain["bot_id"],
         ]
         if not domain["allow_cross_window"]:
             clauses.append("e.session_id=?")
             params.append(domain["session_id"])
+        if cursor_position is not None:
+            occurred_at, event_id, revision = cursor_position
+            clauses.append(
+                """(
+                    e.occurred_at < ?
+                    OR (e.occurred_at=? AND e.event_id < ?)
+                    OR (e.occurred_at=? AND e.event_id=? AND e.revision < ?)
+                )"""
+            )
+            params.extend((
+                occurred_at,
+                occurred_at,
+                event_id,
+                occurred_at,
+                event_id,
+                revision,
+            ))
+        params.append(bounded_limit + 1)
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -6656,7 +6698,7 @@ class MemoryStore:
                   ON d.event_id=e.event_id AND d.revision=e.revision AND d.consumer_id=?
                 WHERE {' AND '.join(clauses)}
                 ORDER BY e.occurred_at DESC, e.event_id DESC, e.revision DESC
-                LIMIT 1001
+                LIMIT ?
                 """,
                 params,
             ).fetchall()
@@ -6668,13 +6710,6 @@ class MemoryStore:
                     and not self._emotion_event_is_expired(event)
                 )
             ]
-            cursor_value = clean_text(cursor, 400)
-            if cursor_value:
-                positions = [self._emotion_delivery_cursor(item) for item in events]
-                try:
-                    events = events[positions.index(cursor_value) + 1 :]
-                except ValueError:
-                    events = []
             page = events[:bounded_limit]
             has_more = len(events) > bounded_limit
             delivered_at = utc_now()
@@ -6865,11 +6900,38 @@ class MemoryStore:
 
     @staticmethod
     def _emotion_delivery_cursor(event: dict[str, Any]) -> str:
-        return "|".join((
-            clean_text(event.get("occurred_at"), 48),
-            clean_text(event.get("event_id"), 96),
-            str(max(1, int(event.get("revision") or 1))),
-        ))
+        return json_dumps({
+            "occurred_at": clean_text(event.get("occurred_at"), 48),
+            "event_id": clean_text(event.get("event_id"), 96),
+            "revision": max(1, int(event.get("revision") or 1)),
+        })
+
+    @staticmethod
+    def _parse_emotion_delivery_cursor(value: Any) -> tuple[str, str, int] | None:
+        cursor = clean_text(value, 400)
+        if not cursor:
+            return None
+        payload = json_loads(cursor, {})
+        if isinstance(payload, dict):
+            occurred_at = clean_text(payload.get("occurred_at"), 48)
+            event_id = clean_text(payload.get("event_id"), 96)
+            revision = payload.get("revision")
+            try:
+                normalized_revision = max(1, min(1_000_000, int(revision)))
+            except (TypeError, ValueError):
+                normalized_revision = 0
+            if occurred_at and event_id and normalized_revision:
+                return occurred_at, event_id, normalized_revision
+        legacy = cursor.rsplit("|", 2)
+        if len(legacy) != 3:
+            return None
+        occurred_at = clean_text(legacy[0], 48)
+        event_id = clean_text(legacy[1], 96)
+        try:
+            revision = max(1, min(1_000_000, int(legacy[2])))
+        except (TypeError, ValueError):
+            return None
+        return (occurred_at, event_id, revision) if occurred_at and event_id else None
 
     @staticmethod
     def _emotion_delivery_projection(event: dict[str, Any]) -> dict[str, Any]:

@@ -163,6 +163,72 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(1, own_ack["acked"])
 
+    async def test_keyset_pagination_skips_foreign_flood_and_reaches_every_local_event(self) -> None:
+        store = self.make_store()
+        bridge, capability = self.make_bridge(store)
+        local_ids: set[str] = set()
+        for index in range(1002):
+            local = normalize_emotion_event(
+                {
+                    "event_id": f"local-{index:04d}",
+                    "trace_id": f"local-trace-{index:04d}",
+                    "origin_kind": "memory_recall",
+                    "bot_id": "bot-1",
+                    "scope": "private",
+                    "platform": "qq",
+                    "session_id": "session-a",
+                    "actor_ref": {"kind": "user", "id": "user-1", "role": "speaker"},
+                    "target_ref": {"kind": "bot", "id": "bot-1", "role": "bot_self"},
+                    "event_type": "warm_memory",
+                    "occurred_at": "2026-08-05T00:00:00+00:00",
+                    "dedupe_key": f"local-{index:04d}",
+                },
+                producer_plugin="memory_companion",
+            )
+            store._upsert_emotion_event_sync(local)
+            local_ids.add(local["event_id"])
+        for index in range(1002):
+            foreign = normalize_emotion_event(
+                {
+                    "event_id": f"foreign-{index:04d}",
+                    "trace_id": f"foreign-trace-{index:04d}",
+                    "origin_kind": "memory_recall",
+                    "bot_id": "bot-1",
+                    "scope": "private",
+                    "platform": "qq",
+                    "session_id": "foreign-session",
+                    "actor_ref": {"kind": "user", "id": "user-2", "role": "speaker"},
+                    "target_ref": {"kind": "bot", "id": "bot-1", "role": "bot_self"},
+                    "event_type": "warm_memory",
+                    "occurred_at": "2030-08-05T00:00:00+00:00",
+                    "dedupe_key": f"foreign-{index:04d}",
+                },
+                producer_plugin="memory_companion",
+            )
+            store._upsert_emotion_event_sync(foreign)
+
+        delivery_context = self.delivery_context(bridge, capability)
+        self.assertIsNotNone(delivery_context)
+        cursor = ""
+        received: set[str] = set()
+        for _ in range(60):
+            page = await bridge.list_emotion_events(
+                delivery_context=delivery_context,
+                cursor=cursor,
+                limit=20,
+            )
+            ids = {item["event_id"] for item in page["events"]}
+            self.assertFalse(ids - local_ids)
+            self.assertFalse(received & ids)
+            received.update(ids)
+            if not page["has_more"]:
+                break
+            self.assertTrue(page["next_cursor"])
+            cursor = page["next_cursor"]
+        else:
+            self.fail("keyset pagination did not finish")
+        self.assertEqual(local_ids, received)
+
 
 if __name__ == "__main__":
     unittest.main()
