@@ -1,4 +1,4 @@
-"""Versioned, redacted emotion-event contract shared with Companion."""
+"""Versioned, redacted emotion-event contract shared across companion plugins."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
