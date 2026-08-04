@@ -834,6 +834,17 @@ class MemoryCompanionService:
         ctx.companion_relationship_phase_label = clean_text(projection.get("phase_label"), 40)
         ctx.companion_relationship_tone = clean_text(projection.get("tone"), 160)
         ctx.companion_relationship_address_level = clean_text(projection.get("address_level"), 120)
+        interaction = projection.get("current_interaction")
+        if isinstance(interaction, dict):
+            ctx.companion_interaction_dynamics_version = clean_text(interaction.get("dynamics_version"), 48)
+            ctx.companion_interaction_band = clean_text(interaction.get("expression_band"), 24)
+            ctx.companion_interaction_recovery_band = clean_text(interaction.get("recovery_band"), 24)
+            try:
+                ctx.companion_interaction_expires_at = max(0.0, min(10**12, float(interaction.get("expires_at") or 0.0)))
+                ctx.companion_interaction_projection_revision = max(0, min(1000000, int(interaction.get("projection_revision") or 0)))
+            except (TypeError, ValueError):
+                ctx.companion_interaction_expires_at = 0.0
+                ctx.companion_interaction_projection_revision = 0
 
     @staticmethod
     def _apply_companion_expression_decision(

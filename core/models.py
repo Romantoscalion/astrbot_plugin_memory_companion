@@ -84,6 +84,11 @@ class SessionContext:
     companion_relationship_phase_label: str = ""
     companion_relationship_tone: str = ""
     companion_relationship_address_level: str = ""
+    companion_interaction_dynamics_version: str = ""
+    companion_interaction_band: str = ""
+    companion_interaction_recovery_band: str = ""
+    companion_interaction_expires_at: float = 0.0
+    companion_interaction_projection_revision: int = 0
     companion_expression_contract: str = ""
     companion_expression_band: str = ""
     companion_expression_allowed_behaviors: tuple[str, ...] = ()

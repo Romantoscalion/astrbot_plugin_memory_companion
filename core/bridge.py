@@ -166,13 +166,29 @@ def sanitize_companion_relationship_projection(value: Any) -> dict[str, Any]:
     if type(current_interaction) is dict:
         expression_band = current_interaction.get("expression_band")
         if type(expression_band) is str and expression_band in _COMPANION_INTERACTION_BANDS:
-            projection["current_interaction"] = {
+            interaction_projection = {
                 "expression_band": expression_band,
                 "label": clean_text(current_interaction.get("label"), 40),
                 "source": clean_text(current_interaction.get("source"), 40),
                 "reason": clean_text(current_interaction.get("reason"), 120),
                 "manual_override": current_interaction.get("manual_override") is True,
             }
+            dynamics_version = current_interaction.get("dynamics_version")
+            recovery_band = current_interaction.get("recovery_band")
+            expires_at = current_interaction.get("expires_at")
+            projection_revision = current_interaction.get("projection_revision")
+            if dynamics_version == "interaction_dynamics.v1" and recovery_band in {"steady", "recovering", "reinforced"}:
+                if type(expires_at) not in {int, float} or type(expires_at) is bool:
+                    return fallback
+                if type(projection_revision) is not int or not 1 <= projection_revision <= 1000000:
+                    return fallback
+                interaction_projection.update({
+                    "dynamics_version": dynamics_version,
+                    "recovery_band": recovery_band,
+                    "expires_at": max(0.0, min(10**12, float(expires_at))),
+                    "projection_revision": projection_revision,
+                })
+            projection["current_interaction"] = interaction_projection
     return {"status": "accepted", "read_only": True, "projection": projection}
 
 
