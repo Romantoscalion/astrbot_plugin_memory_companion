@@ -17,6 +17,8 @@ if str(ROOT.parent) not in sys.path:
 
 from astrabot_plugin_remember_you.core import bot_personal_contract
 from astrabot_plugin_remember_you.core.bridge import MemoryCompanionBridge
+from astrabot_plugin_remember_you.core.config import ConfigView
+from astrabot_plugin_remember_you.core.service import MemoryCompanionService
 
 
 class _PluginMustNotBeTouched:
@@ -68,3 +70,17 @@ class C1BridgeProbeTests(unittest.TestCase):
         self.assertEqual(["contract_self_check_exception"], result["warnings"])
         for secret in ("raw prompt", "user identity", "database object"):
             self.assertNotIn(secret, str(result))
+
+    def test_official_bridge_switch_is_not_overridden_by_legacy_flat_flag(self) -> None:
+        service = object.__new__(MemoryCompanionService)
+        service.config = ConfigView(
+            {
+                "enable_memory_companion_bridge": True,
+                "private_companion_bridge": {"enabled": False},
+            }
+        )
+
+        status = service.companion_coordination_status()
+
+        self.assertFalse(status["bridge_enabled"])
+        self.assertEqual("local_only", status["state"])

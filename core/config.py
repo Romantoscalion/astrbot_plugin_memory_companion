@@ -80,26 +80,6 @@ class ConfigView:
     def __init__(self, raw: Any):
         self.raw = raw or {}
 
-    def bridge_enabled(self) -> bool:
-        """Resolve the bridge switch without changing migration behavior."""
-        marker = object()
-        explicit = self._get_exact("enable_memory_companion_bridge", marker)
-        if explicit is not marker:
-            return self._coerce_bool(explicit, True)
-        return self.bool("private_companion_bridge.enabled", True)
-
-    @staticmethod
-    def _coerce_bool(value: Any, default: bool = False) -> bool:
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"1", "true", "yes", "on", "enabled"}:
-                return True
-            if normalized in {"0", "false", "no", "off", "disabled"}:
-                return False
-        if value is None:
-            return default
-        return bool(value)
-
     def get(self, dotted: str, default: Any = None) -> Any:
         marker = object()
         value = self._get_exact(dotted, marker)

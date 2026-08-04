@@ -64,7 +64,7 @@ class MemoryCompanionPlugin(Star):
         self.page_api = None
 
         global _ACTIVE_BRIDGE
-        _ACTIVE_BRIDGE = self.memory_companion if self.service.config.bridge_enabled() else None
+        _ACTIVE_BRIDGE = self.memory_companion if self.service.config.bool("private_companion_bridge.enabled", True) else None
         self._register_page_api_if_available()
 
         logger.info("[MemoryCompanion] 我会牢牢记住你 已启动，数据目录=%s", self.service.data_dir)

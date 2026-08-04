@@ -5,6 +5,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
+from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
 from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 from .person_projection import consume_person_projection
@@ -228,6 +229,91 @@ class MemoryCompanionBridge:
         kwargs.setdefault("tags", ["schedule", "persona_life"])
         kwargs.setdefault("importance", 0.45)
         return await self.record_event(content=content, **kwargs)
+
+    async def record_bot_personal_archive(self, envelope: BotPersonalArchiveDTO | dict[str, Any]) -> dict[str, Any]:
+        """Send one validated Bot Personal archive envelope without leaking failures."""
+        base = {
+            "ok": False,
+            "record_id": "",
+            "deduplicated": False,
+            "version": 0,
+            "error_code": None,
+            "state": "degraded",
+        }
+        try:
+            dto = build_bot_personal_archive(envelope)
+        except Exception as exc:
+            return {**base, "state": "invalid", "error_code": getattr(exc, "error_code", "invalid")}
+        try:
+            recorder = getattr(self._plugin, "record_bot_personal_archive", None)
+        except Exception:
+            recorder = None
+        if not callable(recorder):
+            return {**base, "error_code": "bridge_method_unavailable", "state": "degraded"}
+        try:
+            result = await recorder(dto)
+        except Exception:
+            return {**base, "error_code": "bridge_exception", "state": "degraded"}
+        if not isinstance(result, dict):
+            return {**base, "error_code": "invalid_bridge_response", "state": "degraded"}
+        normalized = dict(base)
+        for key in base:
+            if key in result:
+                normalized[key] = result[key]
+        normalized["ok"] = bool(result.get("ok"))
+        normalized["deduplicated"] = bool(result.get("deduplicated"))
+        normalized["version"] = int(result.get("version") or 0)
+        if normalized["ok"]:
+            normalized["state"] = "deduplicated" if normalized["deduplicated"] else "sent"
+        elif normalized["state"] == "ready":
+            normalized["state"] = "degraded"
+        return normalized
+
+    async def record_bot_personal_memory(self, *, memory_type: str, payload: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        """Compatibility alias that still crosses the structured archive boundary."""
+        try:
+            envelope = build_bot_personal_archive(memory_type=memory_type, payload=payload or {}, **kwargs)
+        except Exception as exc:
+            return {
+                "ok": False, "record_id": "", "deduplicated": False, "version": 0,
+                "error_code": getattr(exc, "error_code", "invalid"), "state": "invalid",
+            }
+        return await self.record_bot_personal_archive(envelope)
+
+    async def read_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
+        """Read only safe Bot Personal summaries; never return archive payloads."""
+        base = {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": []}
+        try:
+            getter = getattr(self._plugin, "read_bot_personal_profile", None)
+        except Exception:
+            getter = None
+        if not callable(getter):
+            return {**base, "error_code": "bridge_method_unavailable"}
+        try:
+            result = await getter(query=query, limit=limit)
+        except Exception:
+            return {**base, "error_code": "bridge_exception"}
+        if not isinstance(result, dict):
+            return {**base, "error_code": "invalid_bridge_response"}
+        safe_keys = {
+            "record_id", "memory_type", "memory_domain", "subject", "date", "window", "occurred_at",
+            "source_kind", "source_refs", "evidence_level", "status", "version", "summary", "reference",
+        }
+        items = result.get("items", result.get("memories", []))
+        safe_items: list[dict[str, Any]] = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            safe_items.append({key: item[key] for key in safe_keys if key in item and key not in {"payload", "content"}})
+        return {
+            "ok": bool(result.get("ok", True)), "read_only": True,
+            "state": "ready" if result.get("state") in (None, "ready") else result.get("state"),
+            "degraded": bool(result.get("degraded", False)), "pending": bool(result.get("pending", False)),
+            "items": safe_items,
+        }
+
+    async def search_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
+        return await self.read_bot_personal_profile(query=query, limit=limit)
 
     async def search(
         self,

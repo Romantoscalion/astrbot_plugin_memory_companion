@@ -24,6 +24,13 @@ from .astrbot_compat import (
     sanitize_request_history,
 )
 from .bridge import serialize_memory
+from .bot_personal_dto import (
+    BotPersonalArchiveDTO,
+    BotPersonalValidationError,
+    bot_personal_payload_fingerprint,
+    build_bot_personal_archive,
+    sanitize_bot_personal_value,
+)
 from .chat_import import HistoricalChatImporter
 from .classifier import MemoryClassifier
 from .config import ConfigView
@@ -744,6 +751,189 @@ class MemoryCompanionService:
                 metadata={"memory_id": memory_id, "source_plugin": record.source_plugin},
             )
         return memory_id
+
+    async def record_bot_personal_archive(self, envelope: BotPersonalArchiveDTO | dict[str, Any]) -> dict[str, Any]:
+        """Persist one Bot Personal envelope in its isolated memory domain."""
+        result = {
+            "ok": False, "record_id": "", "deduplicated": False, "version": 0,
+            "error_code": None, "state": "degraded",
+        }
+        try:
+            dto = build_bot_personal_archive(envelope)
+        except BotPersonalValidationError as exc:
+            return {**result, "state": "invalid", "error_code": exc.error_code, "field": exc.field}
+        except Exception:
+            return {**result, "state": "invalid", "error_code": "invalid"}
+
+        store = getattr(self, "store", None)
+        getter = getattr(store, "get_memory", None)
+        inserter = getattr(store, "insert_memory", None)
+        if not callable(inserter):
+            return {**result, "error_code": "store_unavailable", "state": "degraded"}
+        fingerprint = bot_personal_payload_fingerprint(dto)
+        existing = None
+        if callable(getter):
+            try:
+                existing = await getter(dto.record_id)
+            except Exception:
+                return {**result, "record_id": dto.record_id, "error_code": "store_unavailable", "state": "degraded"}
+        if existing is not None:
+            metadata = existing.metadata if isinstance(existing.metadata, dict) else {}
+            old_version = int(metadata.get("version") or 0)
+            old_fingerprint = str(metadata.get("payload_fingerprint") or "")
+            if old_version > dto.version:
+                return {**result, "record_id": dto.record_id, "version": old_version, "error_code": "stale_version", "state": "stale_version"}
+            if old_version == dto.version:
+                if old_fingerprint == fingerprint:
+                    return {**result, "ok": True, "record_id": dto.record_id, "deduplicated": True, "version": old_version, "state": "deduplicated"}
+                return {**result, "record_id": dto.record_id, "version": old_version, "error_code": "version_conflict", "state": "version_conflict"}
+
+        payload = dict(dto.payload)
+        # The raw payload stays in the isolated Bot domain for future internal use;
+        # Profile readers below deliberately expose only a safe reference.
+        metadata = {
+            "bot_personal": True,
+            "memory_domain": dto.memory_domain,
+            "subject": dto.subject,
+            "date": dto.date,
+            "window": dto.window,
+            "occurred_at": dto.occurred_at,
+            "source_kind": dto.source_kind,
+            "source_refs": list(dto.source_refs),
+            "certainty": dto.certainty,
+            "evidence_level": dto.evidence_level,
+            "status": dto.status,
+            "version": dto.version,
+            "idempotency_key": dto.idempotency_key,
+            "payload_schema_version": dto.payload_schema_version,
+            "payload_fingerprint": fingerprint,
+            "payload": payload,
+        }
+        reality_level = {
+            "planned": "planned",
+            "observed": "observed_activity",
+            "reconciled": "reconciled",
+            "projection": "window_projection",
+            "subjective": "subjective",
+            "creative": "creative_work",
+            "media": "media_index",
+            "shared": "shared_activity",
+            "detail": "detail_fragment",
+            "calendar": "calendar_event",
+            "proactive": "proactive_action",
+        }.get(dto.source_kind, dto.source_kind)
+        record = MemoryRecord(
+            id=dto.record_id,
+            memory_type=dto.memory_type,
+            subject=EntityRef(kind="bot", id=dto.subject, role="subject"),
+            object=EntityRef(kind="bot", id=dto.subject, role="object"),
+            scope="private",
+            session_id="bot_personal",
+            visibility="bot_self",
+            sayability="indirect",
+            reality_level=reality_level,
+            lifecycle="planned_projection" if dto.status == "planned" else "stable_memory",
+            content=f"Bot Personal archive reference [{dto.memory_type}]",
+            evidence="; ".join(dto.source_refs),
+            confidence=dto.certainty,
+            importance=0.55,
+            review_status="auto",
+            tags=["bot_personal", dto.memory_type, dto.source_kind],
+            metadata=metadata,
+            source_plugin="bot_personal_bridge",
+            occurred_at=dto.occurred_at,
+            # MemoryStore's generic content dedupe intentionally ignores the
+            # metadata payload.  Bot Personal records therefore need a stable
+            # key-derived fingerprint or different agenda keys would merge
+            # into one row merely because their display reference is similar.
+            content_fingerprint=hashlib.sha256(
+                f"bot_personal|{dto.memory_type}|{dto.idempotency_key}".encode("utf-8")
+            ).hexdigest(),
+        )
+        try:
+            memory_id = await inserter(record)
+            scheduler = getattr(self, "_schedule_memory_embedding", None)
+            if callable(scheduler):
+                try:
+                    scheduler(memory_id, record)
+                except Exception:
+                    pass
+        except Exception:
+            return {**result, "record_id": dto.record_id, "version": dto.version, "error_code": "store_write_failed", "state": "degraded"}
+        return {**result, "ok": True, "record_id": dto.record_id, "version": dto.version, "state": "sent"}
+
+    async def record_bot_personal_memory(self, *, memory_type: str, payload: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        try:
+            dto = build_bot_personal_archive(memory_type=memory_type, payload=payload or {}, **kwargs)
+        except BotPersonalValidationError as exc:
+            return {"ok": False, "record_id": "", "deduplicated": False, "version": 0, "error_code": exc.error_code, "state": "invalid"}
+        return await self.record_bot_personal_archive(dto)
+
+    async def read_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
+        """Read-only, domain-isolated Bot Personal references with no payload output."""
+        store = getattr(self, "store", None)
+        lister = getattr(store, "list_memories", None)
+        if not callable(lister):
+            return {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": [], "error_code": "store_unavailable"}
+        try:
+            records = await lister(
+                limit=max(1, min(100, int(limit or 10) * 3)),
+                include_pending=False,
+                query="",
+                scope="private",
+                visibility="bot_self",
+                session_id="bot_personal",
+            )
+        except Exception:
+            return {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": [], "error_code": "store_unavailable"}
+        query_text = clean_text(query, 240).lower()
+        items: list[dict[str, Any]] = []
+        for record in records:
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            if clean_text(metadata.get("memory_domain"), 80) != "bot_self_schedule":
+                continue
+            source_refs: list[str] = []
+            raw_source_refs = metadata.get("source_refs")
+            if isinstance(raw_source_refs, (list, tuple)):
+                for raw_reference in raw_source_refs:
+                    if not isinstance(raw_reference, str):
+                        continue
+                    try:
+                        safe_reference = sanitize_bot_personal_value(
+                            raw_reference,
+                            path="source_refs",
+                        )
+                    except BotPersonalValidationError:
+                        continue
+                    source_refs.append(clean_text(safe_reference, 240))
+            searchable = " ".join([
+                clean_text(record.memory_type, 80), clean_text(metadata.get("date"), 20),
+                clean_text(metadata.get("window"), 40), clean_text(metadata.get("source_kind"), 40),
+                clean_text((metadata.get("payload") or {}).get("summary"), 240)
+                if isinstance(metadata.get("payload"), dict) else "",
+                clean_text((metadata.get("payload") or {}).get("title"), 240)
+                if isinstance(metadata.get("payload"), dict) else "",
+                clean_text((metadata.get("payload") or {}).get("activity"), 240)
+                if isinstance(metadata.get("payload"), dict) else "",
+            ]).lower()
+            if query_text and query_text not in searchable:
+                continue
+            items.append({
+                "record_id": record.id,
+                "memory_domain": "bot_self_schedule",
+                "memory_type": record.memory_type,
+                "subject": "bot_self",
+                "date": clean_text(metadata.get("date"), 20),
+                "window": clean_text(metadata.get("window"), 40),
+                "occurred_at": clean_text(record.occurred_at, 80),
+                "source_kind": clean_text(metadata.get("source_kind"), 40),
+                "source_refs": source_refs[:8],
+                "evidence_level": clean_text(metadata.get("evidence_level"), 8),
+                "status": clean_text(metadata.get("status"), 40),
+                "version": int(metadata.get("version") or 0),
+                "summary": f"Bot Personal archive reference [{record.memory_type}]",
+            })
+        return {"ok": True, "read_only": True, "state": "ready", "degraded": False, "pending": False, "items": items[:max(1, min(100, int(limit or 10)))]}
 
     async def bridge_search(
         self,
@@ -6975,7 +7165,7 @@ class MemoryCompanionService:
             )
 
     def companion_coordination_status(self) -> dict[str, Any]:
-        bridge_enabled = self.config.bridge_enabled()
+        bridge_enabled = self.config.bool("private_companion_bridge.enabled", True)
         return {
             "available": True,
             "state": "ready" if bridge_enabled else "local_only",
