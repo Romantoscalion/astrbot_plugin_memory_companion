@@ -54,14 +54,23 @@ class MemoryCompanionPlugin(Star):
             data_dir=data_dir,
         )
         self.memory_companion = MemoryCompanionBridge(self.service)
+        self.bot_personal_capabilities = self.memory_companion.probe_bot_personal_memory_capabilities()
+        if not self.bot_personal_capabilities.get("available", False):
+            logger.warning(
+                "[MemoryCompanion] Bot Personal capability probe degraded: %s",
+                ";".join(str(item) for item in self.bot_personal_capabilities.get("warnings", [])),
+            )
         self.commands = MemoryCompanionCommandHandler(self.service, PLUGIN_VERSION)
         self.page_api = None
 
         global _ACTIVE_BRIDGE
-        _ACTIVE_BRIDGE = self.memory_companion if self.service.config.bool("private_companion_bridge.enabled", True) else None
+        _ACTIVE_BRIDGE = self.memory_companion if self.service.config.bridge_enabled() else None
         self._register_page_api_if_available()
 
         logger.info("[MemoryCompanion] 我会牢牢记住你 已启动，数据目录=%s", self.service.data_dir)
+
+    def bot_personal_capability_status(self) -> dict[str, Any]:
+        return dict(self.bot_personal_capabilities)
 
     def _register_page_api_if_available(self) -> None:
         if not hasattr(self.context, "register_web_api"):

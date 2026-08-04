@@ -6975,9 +6975,11 @@ class MemoryCompanionService:
             )
 
     def companion_coordination_status(self) -> dict[str, Any]:
-        bridge_enabled = self.config.bool("private_companion_bridge.enabled", True)
+        bridge_enabled = self.config.bridge_enabled()
         return {
             "available": True,
+            "state": "ready" if bridge_enabled else "local_only",
+            "degraded": False,
             "schedule_fast_context": bridge_enabled and self.config.bool(
                 "private_companion_bridge.schedule_fast_context_enabled",
                 True,

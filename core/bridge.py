@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import bot_personal_contract
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 
 
@@ -291,10 +292,141 @@ class MemoryCompanionBridge:
         return await self._plugin.tool_note_delete(event, memory_id, title=title)
 
     def coordination_status(self) -> dict[str, Any]:
-        getter = getattr(self._plugin, "companion_coordination_status", None)
-        if callable(getter):
-            return getter()
-        return {"available": True}
+        try:
+            getter = getattr(self._plugin, "companion_coordination_status", None)
+        except Exception:
+            return {"available": False, "state": "degraded", "degraded": True, "reason": "bridge_exception"}
+        if not callable(getter):
+            return {"available": False, "state": "degraded", "degraded": True, "reason": "method_missing"}
+        try:
+            result = getter()
+        except Exception as exc:
+            return {"available": False, "state": "degraded", "degraded": True, "reason": "bridge_exception", "error": str(exc)[:160]}
+        if not isinstance(result, dict):
+            return {"available": False, "state": "degraded", "degraded": True, "reason": "invalid_status"}
+        result = dict(result)
+        result.setdefault("available", True)
+        result.setdefault("state", "ready")
+        result.setdefault("degraded", False)
+        return result
+
+    def probe_bot_personal_memory_capabilities(self) -> dict[str, Any]:
+        """Return a database-free capability snapshot for the bot-personal contract.
+
+        The probe is intentionally based only on the shared contract module. It
+        must remain safe to call from ordinary chat paths even when the contract
+        is stale or the local module is otherwise malformed.
+        """
+        try:
+            descriptor = bot_personal_contract.capability_descriptor(
+                available=True,
+                read_only=False,
+            )
+        except Exception:
+            return self._degraded_personal_capability_probe("contract_descriptor_exception")
+
+        if not isinstance(descriptor, dict):
+            return self._degraded_personal_capability_probe("contract_descriptor_invalid")
+
+        result = dict(descriptor)
+        try:
+            problems = bot_personal_contract.contract_self_check()
+        except Exception:
+            return self._degraded_personal_capability_probe(
+                "contract_self_check_exception",
+                base=result,
+            )
+
+        if not isinstance(problems, list):
+            return self._degraded_personal_capability_probe(
+                "contract_self_check_invalid",
+                base=result,
+            )
+        if problems:
+            warnings = ["contract_self_check_failed"]
+            known_codes = {
+                "contract_fingerprint_stale",
+                "duplicate_window_slug",
+                "type_contracts_out_of_sync",
+                "window_coverage_gap",
+                "alias_points_to_unknown_window",
+            }
+            for problem in problems:
+                code = str(problem).split(":", 1)[0]
+                if code in known_codes and code not in warnings:
+                    warnings.append(code)
+            return self._degraded_personal_capability_probe(
+                "contract_self_check_failed",
+                base=result,
+                warnings=warnings,
+            )
+
+        result["available"] = True
+        result["state"] = "ready"
+        result["degraded"] = False
+        self._add_personal_capability_contract_aliases(result)
+        result.setdefault("warnings", [])
+        return result
+
+    @staticmethod
+    def _add_personal_capability_contract_aliases(result: dict[str, Any]) -> dict[str, Any]:
+        """Expose stable C1 aliases without changing the shared contract copy."""
+
+        result.setdefault("domain", result.get("memory_domain", ""))
+        result.setdefault("domains", [result.get("memory_domain", "")])
+        result.setdefault("profiles", ["bot_personal_archive"])
+        result.setdefault(
+            "methods",
+            [
+                "record_event",
+                "record_visible_turn",
+                "search",
+                "compose_injection",
+                "compose_context",
+                "remember",
+                "recall",
+                "probe_bot_personal_memory_capabilities",
+            ],
+        )
+        result.setdefault("contract_version", str(result.get("contract_revision", "")))
+        result.setdefault("schema_version", str(result.get("capability_schema_version", "")))
+        return result
+
+    @staticmethod
+    def _degraded_personal_capability_probe(
+        reason: str,
+        *,
+        base: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
+    ) -> dict[str, Any]:
+        result = {
+            "available": False,
+            "read_only": False,
+            "memory_domain": getattr(bot_personal_contract, "BOT_PERSONAL_MEMORY_DOMAIN", ""),
+            "contract_name": getattr(bot_personal_contract, "CONTRACT_NAME", ""),
+            "contract_revision": getattr(bot_personal_contract, "CONTRACT_REVISION", 0),
+            "contract_fingerprint": getattr(bot_personal_contract, "CONTRACT_FINGERPRINT", ""),
+            "capability_schema_version": getattr(
+                bot_personal_contract, "BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION", ""
+            ),
+            "payload_schema_version": getattr(
+                bot_personal_contract, "BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION", ""
+            ),
+            "windows": list(getattr(bot_personal_contract, "WINDOW_SLUGS", ())),
+            "memory_types": list(getattr(bot_personal_contract, "BOT_PERSONAL_MEMORY_TYPES", ())),
+            "max_payload_bytes": getattr(bot_personal_contract, "BOT_PERSONAL_MAX_PAYLOAD_BYTES", 0),
+            "warnings": [],
+        }
+        result.update(base or {})
+        result.update(
+            {
+                "available": False,
+                "state": "degraded",
+                "degraded": True,
+                "warnings": list(warnings or [reason]),
+            }
+        )
+        return MemoryCompanionBridge._add_personal_capability_contract_aliases(result)
 
     def get_token_usage_summary(self) -> dict[str, Any]:
         getter = getattr(self._plugin, "token_usage_summary", None)
