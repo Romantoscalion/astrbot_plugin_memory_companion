@@ -67,6 +67,7 @@ _COMPANION_EXPRESSION_REASON_CODES = {
     "low_energy_expression_cap",
     "down_mood_expression_cap",
     "up_mood_expression_lift",
+    "affect_modulation_applied",
     "relationship_proactive_cap",
     "interaction_proactive_suppressed",
     "schedule_proactive_suppressed",

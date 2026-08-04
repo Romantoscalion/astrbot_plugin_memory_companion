@@ -6560,7 +6560,9 @@ class MemoryStore:
 
     @staticmethod
     def _emotion_delivery_projection(event: dict[str, Any]) -> dict[str, Any]:
-        return {
+        from .affect_modulation import normalize_affect_modulation
+
+        projection = {
             "event_id": clean_text(event.get("event_id"), 96),
             "revision": max(1, int(event.get("revision") or 1)),
             "trace_id": clean_text(event.get("trace_id"), 96),
@@ -6575,6 +6577,14 @@ class MemoryStore:
             "occurred_at": clean_text(event.get("occurred_at"), 48),
             "expires_at": clean_text(event.get("expires_at"), 48),
         }
+        projection["affect_modulation"] = normalize_affect_modulation({
+            "valence": projection["valence"],
+            "arousal": projection["arousal"],
+            "vulnerability": projection["vulnerability"],
+            "confidence": projection["confidence"],
+            "source_event_ids": [projection["event_id"]],
+        })
+        return projection
 
     @staticmethod
     def _emotion_event_row(row: sqlite3.Row) -> dict[str, Any]:
