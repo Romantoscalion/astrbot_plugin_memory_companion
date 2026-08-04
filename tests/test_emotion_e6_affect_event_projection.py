@@ -29,8 +29,13 @@ class EmotionE6AffectEventProjectionTests(unittest.IsolatedAsyncioTestCase):
         event = normalize_emotion_event({
             "event_id": "emo-affect",
             "origin_kind": "memory_recall",
+            "bot_id": "bot-1",
+            "scope": "private",
+            "platform": "qq",
             "event_type": "warm_memory",
             "session_id": "session-a",
+            "actor_ref": {"kind": "user", "id": "user-1", "role": "speaker"},
+            "target_ref": {"kind": "bot", "id": "bot-1", "role": "bot_self"},
             "valence_hint": 2.0,
             "arousal_hint": 0.6,
             "vulnerability_hint": 0.4,
@@ -38,7 +43,15 @@ class EmotionE6AffectEventProjectionTests(unittest.IsolatedAsyncioTestCase):
             "dedupe_key": "affect",
         }, producer_plugin="memory_companion")
         await store.upsert_emotion_event(event)
-        page = await store.list_emotion_event_deliveries(consumer_id="companion", limit=5)
+        page = await store.list_emotion_event_deliveries(
+            consumer_id="private_companion.daily_state",
+            bot_id="bot-1",
+            scope="private",
+            platform="qq",
+            user_id="user-1",
+            session_id="session-a",
+            limit=5,
+        )
         delivered = page["events"][0]
         self.assertEqual(1.0, delivered["affect_modulation"]["valence"])
         self.assertEqual(["emo-affect"], delivered["affect_modulation"]["source_event_ids"])

@@ -480,7 +480,7 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, service._retrieval_result_cache)
         self.assertEqual({}, json.loads(service._RELATIONSHIP_PHASE_FILE.read_text(encoding="utf-8")))
 
-    async def test_cross_window_emotional_reads_are_opt_in(self) -> None:
+    async def test_cross_window_emotional_reads_without_context_are_disabled(self) -> None:
         config: dict = {"private_companion_bridge": {}}
         service = self.make_service(config)
         service._emotional_event_queue["qq:FriendMessage:u1"] = [
@@ -495,8 +495,8 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(service._emotional_event_queue["qq:FriendMessage:u1"]))
 
         config["private_companion_bridge"]["cross_window_emotional_continuity_enabled"] = True
-        events = service.bridge_get_emotional_events(session_id="")
-        self.assertEqual(["emotion-1"], [item["id"] for item in events])
+        self.assertEqual([], service.bridge_get_emotional_events(session_id=""))
+        self.assertEqual(1, len(service._emotional_event_queue["qq:FriendMessage:u1"]))
 
     async def test_note_tools_keep_read_and_delete_scoped_to_current_bot(self) -> None:
         service = self.make_service({"retrieval": {"embedding_enabled": False}})

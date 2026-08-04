@@ -10,19 +10,45 @@ from .models import clean_text
 def memory_emotion_refs(memory: Any, ctx: Any) -> dict[str, dict[str, str]] | None:
     memory_session = clean_text(getattr(memory, "session_id", ""), 220)
     current_session = clean_text(getattr(ctx, "session_id", ""), 220)
-    if memory_session and current_session and memory_session != current_session:
+    memory_scope = clean_text(getattr(memory, "scope", ""), 24).lower()
+    current_scope = clean_text(getattr(ctx, "scope", ""), 24).lower()
+    memory_platform = clean_text(getattr(memory, "platform", ""), 80)
+    current_platform = clean_text(getattr(ctx, "platform", ""), 80)
+    user_id = clean_text(getattr(ctx, "user_id", ""), 160)
+    bot_id = clean_text(getattr(ctx, "bot_id", ""), 160)
+    if (
+        not all((memory_session, current_session, memory_platform, current_platform, user_id, bot_id))
+        or memory_session != current_session
+        or memory_scope != "private"
+        or current_scope != "private"
+        or memory_platform != current_platform
+    ):
         return None
     subject = getattr(memory, "subject", None)
     subject_kind = clean_text(getattr(subject, "kind", ""), 24)
     subject_id = clean_text(getattr(subject, "id", ""), 160)
-    user_id = clean_text(getattr(ctx, "user_id", ""), 160)
-    bot_id = clean_text(getattr(ctx, "bot_id", ""), 160) or "self"
-    if subject_kind == "user" and user_id and subject_id != user_id:
+    if subject_kind != "user" or subject_id != user_id:
         return None
-    if subject_kind not in {"user", "bot"} or not subject_id:
+    metadata = getattr(memory, "metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    owner_bot_id = clean_text(metadata.get("owner_bot_id"), 160)
+    target = getattr(memory, "object", None)
+    target_kind = clean_text(getattr(target, "kind", ""), 24)
+    target_id = clean_text(getattr(target, "id", ""), 160)
+    if owner_bot_id:
+        if owner_bot_id != bot_id:
+            return None
+    elif target_kind != "bot" or target_id != bot_id:
+        # A legacy record without an explicit owner must at least name this Bot.
+        return None
+    if target_id and (
+        (target_kind == "bot" and target_id != bot_id)
+        or (target_kind == "user" and target_id != user_id)
+        or target_kind not in {"bot", "user"}
+    ):
         return None
     return {
-        "actor_ref": {"kind": subject_kind, "id": subject_id, "role": clean_text(getattr(subject, "role", ""), 40)},
+        "actor_ref": {"kind": "user", "id": subject_id, "role": clean_text(getattr(subject, "role", ""), 40)},
         "target_ref": {"kind": "bot", "id": bot_id, "role": "bot_self"},
         "quoted_target_ref": {"kind": "unknown", "id": "", "role": ""},
     }

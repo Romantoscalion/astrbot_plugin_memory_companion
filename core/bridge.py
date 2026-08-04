@@ -17,6 +17,7 @@ LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 _PRIVATE_COMPANION_ROOT = "astrbot_plugin_private_companion"
 _PRIVATE_COMPANION_NAMES = {"PrivateCompanion", "private_companion"}
 _EMOTION_INGRESS_ORIGINS = {"interaction", "system_condition"}
+_EMOTION_DELIVERY_CONSUMER = "private_companion.daily_state"
 
 
 class _EmotionProducerCapability:
@@ -60,6 +61,45 @@ class _EmotionProducerContext:
         self._bridge = bridge
         self._capability = capability
         self.bot_id = bot_id
+        self.platform = platform
+        self.scope = scope
+        self.session_id = session_id
+        self.user_id = user_id
+
+
+class _EmotionDeliveryContext:
+    """Opaque, scoped authorization context for afterglow delivery and ack."""
+
+    __slots__ = (
+        "_bridge",
+        "_capability",
+        "allow_cross_window",
+        "bot_id",
+        "consumer_id",
+        "platform",
+        "scope",
+        "session_id",
+        "user_id",
+    )
+
+    def __init__(
+        self,
+        bridge: Any,
+        capability: _EmotionProducerCapability,
+        *,
+        allow_cross_window: bool,
+        bot_id: str,
+        consumer_id: str,
+        platform: str,
+        scope: str,
+        session_id: str,
+        user_id: str,
+    ) -> None:
+        self._bridge = bridge
+        self._capability = capability
+        self.allow_cross_window = allow_cross_window
+        self.bot_id = bot_id
+        self.consumer_id = consumer_id
         self.platform = platform
         self.scope = scope
         self.session_id = session_id
@@ -347,6 +387,43 @@ class MemoryCompanionBridge:
             return None
         return _EmotionProducerContext(self, capability, **normalized)
 
+    def create_emotion_delivery_context(
+        self,
+        capability: Any,
+        *,
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        consumer_id: str = _EMOTION_DELIVERY_CONSUMER,
+        allow_cross_window: bool = False,
+    ) -> Any | None:
+        """Bind Companion afterglow delivery to one trusted private identity domain."""
+
+        if not self._is_valid_emotion_producer_capability(capability):
+            return None
+        if clean_text(consumer_id, 80) != _EMOTION_DELIVERY_CONSUMER:
+            return None
+        if type(allow_cross_window) is not bool:
+            return None
+        normalized = self._normalize_emotion_domain(
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if normalized is None:
+            return None
+        return _EmotionDeliveryContext(
+            self,
+            capability,
+            consumer_id=_EMOTION_DELIVERY_CONSUMER,
+            allow_cross_window=allow_cross_window,
+            **normalized,
+        )
+
     def bind_emotion_page_api(self, page_api: Any) -> Any | None:
         """Issue a private diagnostic capability to this Memory plugin's Page API."""
 
@@ -446,6 +523,22 @@ class MemoryCompanionBridge:
             type(context) is _EmotionProducerContext
             and context._bridge is self
             and self._is_valid_emotion_producer_capability(context._capability)
+            and self._normalize_emotion_domain(
+                bot_id=context.bot_id,
+                scope=context.scope,
+                platform=context.platform,
+                user_id=context.user_id,
+                session_id=context.session_id,
+            ) is not None
+        )
+
+    def _is_valid_emotion_delivery_context(self, context: Any) -> bool:
+        return (
+            type(context) is _EmotionDeliveryContext
+            and context._bridge is self
+            and self._is_valid_emotion_producer_capability(context._capability)
+            and context.consumer_id == _EMOTION_DELIVERY_CONSUMER
+            and type(context.allow_cross_window) is bool
             and self._normalize_emotion_domain(
                 bot_id=context.bot_id,
                 scope=context.scope,
@@ -1362,18 +1455,24 @@ class MemoryCompanionBridge:
     async def list_emotion_events(
         self,
         *,
-        consumer_id: str,
+        delivery_context: Any = None,
         cursor: str = "",
-        session_id: str = "",
-        exclude_session_id: str = "",
         limit: int = 10,
+        **_legacy: Any,
     ) -> dict[str, Any]:
-        """List redacted pending afterglow events without consuming them."""
+        """List afterglow events only for one opaque Companion delivery context."""
+
+        if not self._is_valid_emotion_delivery_context(delivery_context):
+            return self._emotion_delivery_forbidden_result("delivery_context_required")
         return await self._plugin.store.list_emotion_event_deliveries(
-            consumer_id=consumer_id,
+            consumer_id=delivery_context.consumer_id,
+            bot_id=delivery_context.bot_id,
+            scope=delivery_context.scope,
+            platform=delivery_context.platform,
+            user_id=delivery_context.user_id,
+            session_id=delivery_context.session_id,
+            allow_cross_window=delivery_context.allow_cross_window,
             cursor=cursor,
-            session_id=session_id,
-            exclude_session_id=exclude_session_id,
             limit=limit,
         )
 
@@ -1381,12 +1480,22 @@ class MemoryCompanionBridge:
         self,
         event_refs: list[dict[str, Any]],
         *,
-        consumer_id: str,
+        delivery_context: Any = None,
+        **_legacy: Any,
     ) -> dict[str, Any]:
-        """Acknowledge only events durably applied by the named consumer."""
+        """Acknowledge only events delivered inside one opaque identity domain."""
+
+        if not self._is_valid_emotion_delivery_context(delivery_context):
+            return self._emotion_ack_forbidden_result("delivery_context_required")
         return await self._plugin.store.ack_emotion_event_deliveries(
-            consumer_id=consumer_id,
+            consumer_id=delivery_context.consumer_id,
             event_refs=event_refs,
+            bot_id=delivery_context.bot_id,
+            scope=delivery_context.scope,
+            platform=delivery_context.platform,
+            user_id=delivery_context.user_id,
+            session_id=delivery_context.session_id,
+            allow_cross_window=delivery_context.allow_cross_window,
         )
 
     async def record_emotion_event(
@@ -1477,6 +1586,26 @@ class MemoryCompanionBridge:
             "state": "forbidden",
             "read_only": False,
             "event_id": "",
+            "error_code": error_code,
+        }
+
+    @staticmethod
+    def _emotion_delivery_forbidden_result(error_code: str) -> dict[str, Any]:
+        return {
+            "schema_version": "emotion_afterglow_delivery.v1",
+            "state": "forbidden",
+            "read_only": True,
+            "events": [],
+            "next_cursor": "",
+            "has_more": False,
+            "error_code": error_code,
+        }
+
+    @staticmethod
+    def _emotion_ack_forbidden_result(error_code: str) -> dict[str, Any]:
+        return {
+            "state": "forbidden",
+            "acked": 0,
             "error_code": error_code,
         }
 
@@ -1598,20 +1727,9 @@ class MemoryCompanionBridge:
         window_seconds: float = 1800.0,
         limit: int = 5,
     ) -> dict[str, Any]:
-        """Return a summary of recent emotional events across ALL sessions.
-
-        This provides cross-window emotional continuity for the companion plugin:
-        if the bot recently touched scar or warm memories in any session, the
-        companion plugin can factor this into its daily state calibration.
-        """
-        getter = getattr(self._plugin, "_get_cross_window_emotional_state", None)
-        if not callable(getter):
-            return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
-        return getter(
-            exclude_session_id=exclude_session_id,
-            window_seconds=window_seconds,
-            limit=limit,
-        )
+        """Deprecated unscoped aggregate; opaque delivery contexts are required."""
+        _ = (exclude_session_id, window_seconds, limit)
+        return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
 
     def _entity(self, payload: dict[str, Any]) -> EntityRef:
         return EntityRef(

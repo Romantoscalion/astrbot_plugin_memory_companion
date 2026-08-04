@@ -32,6 +32,7 @@ class EmotionE9TraceQueryTests(unittest.IsolatedAsyncioTestCase):
             "origin_kind": "memory_recall",
             "bot_id": bot_id,
             "scope": "private",
+            "platform": "qq",
             "session_id": session_id,
             "event_type": "warm_memory",
             "actor_ref": {"kind": "user", "id": "raw-user-id", "role": "speaker"},
@@ -58,7 +59,15 @@ class EmotionE9TraceQueryTests(unittest.IsolatedAsyncioTestCase):
         store = self.make_store()
         await self.add_event(store, event_id="e1", trace_id="trace-shared", bot_id="b1", session_id="s1")
         await self.add_event(store, event_id="e2", trace_id="trace-shared", bot_id="b2", session_id="s2")
-        await store.list_emotion_event_deliveries(consumer_id="companion", session_id="s1", limit=5)
+        await store.list_emotion_event_deliveries(
+            consumer_id="private_companion.daily_state",
+            bot_id="b1",
+            scope="private",
+            platform="qq",
+            user_id="raw-user-id",
+            session_id="s1",
+            limit=5,
+        )
         bridge = MemoryCompanionBridge(type("Plugin", (), {"store": store})())
 
         denied = await bridge.get_emotion_trace_diagnostic("trace-shared", {"is_admin": True})

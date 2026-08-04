@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 from contextlib import closing, contextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 import re
 import sqlite3
 import threading
@@ -6575,16 +6576,24 @@ class MemoryStore:
         self,
         *,
         consumer_id: str,
-        session_id: str = "",
-        exclude_session_id: str = "",
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool = False,
         cursor: str = "",
         limit: int = 10,
     ) -> dict[str, Any]:
         return await self._run_recoverable_database_operation(
             self._list_emotion_event_deliveries_sync,
             consumer_id,
+            bot_id,
+            scope,
+            platform,
+            user_id,
             session_id,
-            exclude_session_id,
+            allow_cross_window,
             cursor,
             limit,
         )
@@ -6592,29 +6601,47 @@ class MemoryStore:
     def _list_emotion_event_deliveries_sync(
         self,
         consumer_id: str,
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
         session_id: str,
-        exclude_session_id: str,
+        allow_cross_window: bool,
         cursor: str,
         limit: int,
     ) -> dict[str, Any]:
-        consumer = clean_text(consumer_id, 80)
-        if not consumer:
-            return {"schema_version": "emotion_afterglow_delivery.v1", "events": [], "next_cursor": "", "has_more": False}
-        session = clean_text(session_id, 220)
-        excluded = clean_text(exclude_session_id, 220)
-        bounded_limit = max(1, min(20, int(limit or 10)))
+        domain = self._emotion_delivery_domain(
+            consumer_id=consumer_id,
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+            allow_cross_window=allow_cross_window,
+        )
+        if domain is None:
+            return self._empty_emotion_delivery("delivery_domain_required")
+        try:
+            bounded_limit = max(1, min(20, int(limit or 10)))
+        except (TypeError, ValueError):
+            bounded_limit = 10
         clauses = [
             "e.origin_kind='memory_recall'",
             "e.status NOT IN ('ignored','expired')",
             "COALESCE(d.acked_at, '')=''",
+            "e.bot_id=?",
+            "e.scope=?",
+            "e.platform=?",
         ]
-        params: list[Any] = [consumer]
-        if session:
+        params: list[Any] = [
+            domain["consumer_id"],
+            domain["bot_id"],
+            domain["scope"],
+            domain["platform"],
+        ]
+        if not domain["allow_cross_window"]:
             clauses.append("e.session_id=?")
-            params.append(session)
-        if excluded:
-            clauses.append("e.session_id!=?")
-            params.append(excluded)
+            params.append(domain["session_id"])
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -6629,11 +6656,18 @@ class MemoryStore:
                   ON d.event_id=e.event_id AND d.revision=e.revision AND d.consumer_id=?
                 WHERE {' AND '.join(clauses)}
                 ORDER BY e.occurred_at DESC, e.event_id DESC, e.revision DESC
-                LIMIT 201
+                LIMIT 1001
                 """,
                 params,
             ).fetchall()
-            events = [self._emotion_event_row(row) for row in rows]
+            events = [
+                event
+                for event in (self._emotion_event_row(row) for row in rows)
+                if (
+                    self._emotion_event_in_delivery_domain(event, domain)
+                    and not self._emotion_event_is_expired(event)
+                )
+            ]
             cursor_value = clean_text(cursor, 400)
             if cursor_value:
                 positions = [self._emotion_delivery_cursor(item) for item in events]
@@ -6655,7 +6689,13 @@ class MemoryStore:
                         attempts=emotion_event_deliveries.attempts+1,
                         last_delivered_at=excluded.last_delivered_at
                     """,
-                    (event["event_id"], event["revision"], consumer, delivered_at, delivered_at),
+                    (
+                        event["event_id"],
+                        event["revision"],
+                        domain["consumer_id"],
+                        delivered_at,
+                        delivered_at,
+                    ),
                 )
             self._conn.commit()
         projection = [self._emotion_delivery_projection(event) for event in page]
@@ -6671,19 +6711,47 @@ class MemoryStore:
         *,
         consumer_id: str,
         event_refs: list[dict[str, Any]],
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool = False,
     ) -> dict[str, Any]:
         return await self._run_recoverable_database_operation(
-            self._ack_emotion_event_deliveries_sync, consumer_id, event_refs
+            self._ack_emotion_event_deliveries_sync,
+            consumer_id,
+            event_refs,
+            bot_id,
+            scope,
+            platform,
+            user_id,
+            session_id,
+            allow_cross_window,
         )
 
     def _ack_emotion_event_deliveries_sync(
         self,
         consumer_id: str,
         event_refs: list[dict[str, Any]],
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool,
     ) -> dict[str, Any]:
-        consumer = clean_text(consumer_id, 80)
-        if not consumer or not isinstance(event_refs, list):
-            return {"acked": 0, "consumer_id": consumer}
+        domain = self._emotion_delivery_domain(
+            consumer_id=consumer_id,
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+            allow_cross_window=allow_cross_window,
+        )
+        if domain is None or not isinstance(event_refs, list):
+            return {"acked": 0, "consumer_id": clean_text(consumer_id, 80), "error_code": "delivery_domain_required"}
         unique_refs: set[tuple[str, int]] = set()
         for item in event_refs[:100]:
             if not isinstance(item, dict):
@@ -6699,17 +6767,101 @@ class MemoryStore:
         acked = 0
         with self._lock:
             for event_id, revision in unique_refs:
+                row = self._conn.execute(
+                    "SELECT * FROM emotion_events WHERE event_id=? AND revision=?",
+                    (event_id, revision),
+                ).fetchone()
+                if row is None:
+                    continue
+                event = self._emotion_event_row(row)
+                if (
+                    not self._emotion_event_in_delivery_domain(event, domain)
+                    or self._emotion_event_is_expired(event)
+                ):
+                    continue
                 result = self._conn.execute(
                     """
                     UPDATE emotion_event_deliveries
                     SET acked_at=?
                     WHERE event_id=? AND revision=? AND consumer_id=? AND acked_at=''
                     """,
-                    (acked_at, event_id, revision, consumer),
+                    (acked_at, event_id, revision, domain["consumer_id"]),
                 )
                 acked += max(0, int(result.rowcount or 0))
             self._conn.commit()
-        return {"acked": acked, "consumer_id": consumer, "acked_at": acked_at}
+        return {"acked": acked, "consumer_id": domain["consumer_id"], "acked_at": acked_at}
+
+    @staticmethod
+    def _empty_emotion_delivery(error_code: str = "") -> dict[str, Any]:
+        result = {
+            "schema_version": "emotion_afterglow_delivery.v1",
+            "events": [],
+            "next_cursor": "",
+            "has_more": False,
+        }
+        if error_code:
+            result["error_code"] = error_code
+        return result
+
+    @staticmethod
+    def _emotion_delivery_domain(
+        *,
+        consumer_id: Any,
+        bot_id: Any,
+        scope: Any,
+        platform: Any,
+        user_id: Any,
+        session_id: Any,
+        allow_cross_window: Any,
+    ) -> dict[str, Any] | None:
+        domain = {
+            "consumer_id": clean_text(consumer_id, 80),
+            "bot_id": clean_text(bot_id, 160),
+            "scope": clean_text(scope, 24).lower(),
+            "platform": clean_text(platform, 80),
+            "user_id": clean_text(user_id, 160),
+            "session_id": clean_text(session_id, 220),
+            "allow_cross_window": allow_cross_window,
+        }
+        if (
+            not all(domain[key] for key in ("consumer_id", "bot_id", "platform", "user_id", "session_id"))
+            or domain["scope"] != "private"
+            or type(domain["allow_cross_window"]) is not bool
+        ):
+            return None
+        return domain
+
+    @staticmethod
+    def _emotion_event_in_delivery_domain(event: dict[str, Any], domain: dict[str, Any]) -> bool:
+        actor = event.get("actor_ref") if isinstance(event.get("actor_ref"), dict) else {}
+        target = event.get("target_ref") if isinstance(event.get("target_ref"), dict) else {}
+        return (
+            clean_text(event.get("origin_kind"), 40) == "memory_recall"
+            and clean_text(event.get("bot_id"), 160) == domain["bot_id"]
+            and clean_text(event.get("scope"), 24).lower() == domain["scope"]
+            and clean_text(event.get("platform"), 80) == domain["platform"]
+            and clean_text(actor.get("kind"), 24) == "user"
+            and clean_text(actor.get("id"), 160) == domain["user_id"]
+            and clean_text(target.get("kind"), 24) == "bot"
+            and clean_text(target.get("id"), 160) == domain["bot_id"]
+            and (
+                domain["allow_cross_window"]
+                or clean_text(event.get("session_id"), 220) == domain["session_id"]
+            )
+        )
+
+    @staticmethod
+    def _emotion_event_is_expired(event: dict[str, Any], *, now: datetime | None = None) -> bool:
+        expires_at = clean_text(event.get("expires_at"), 48)
+        if not expires_at:
+            return False
+        try:
+            parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return True
+            return parsed.astimezone(timezone.utc) <= (now or datetime.now(timezone.utc))
+        except (TypeError, ValueError, OverflowError):
+            return True
 
     @staticmethod
     def _emotion_delivery_cursor(event: dict[str, Any]) -> str:
@@ -6727,7 +6879,6 @@ class MemoryStore:
             "event_id": clean_text(event.get("event_id"), 96),
             "revision": max(1, int(event.get("revision") or 1)),
             "trace_id": clean_text(event.get("trace_id"), 96),
-            "session_id": clean_text(event.get("session_id"), 220),
             "event_type": clean_text(event.get("event_type"), 48),
             "intensity": float(event.get("intensity") or 0.0),
             "confidence": float(event.get("confidence") or 0.0),

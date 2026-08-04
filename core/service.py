@@ -1718,31 +1718,9 @@ class MemoryCompanionService:
         return injection
 
     def bridge_get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
-        """Return pending emotional drift events for the companion plugin to consume."""
-        if not session_id and not self.config.bool(
-            "private_companion_bridge.cross_window_emotional_continuity_enabled", False
-        ):
-            return []
-        now = time.time()
-        events: list[dict[str, Any]] = []
-        if session_id:
-            keys = [session_id]
-        else:
-            keys = list(self._emotional_event_queue.keys())
-        for key in keys:
-            queue = self._emotional_event_queue.get(key, [])
-            fresh = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
-            if len(fresh) != len(queue):
-                self._emotional_event_queue[key] = fresh
-            events.extend(fresh)
-        events.sort(key=lambda e: e.get("ts", 0), reverse=True)
-        result = events[:max(1, min(limit, 20))]
-        for key in keys:
-            queue = self._emotional_event_queue.get(key, [])
-            consumed_ids = {e.get("id", "") for e in result if e.get("session_id") == key}
-            if consumed_ids:
-                self._emotional_event_queue[key] = [e for e in queue if e.get("id", "") not in consumed_ids]
-        return result
+        """Deprecated unscoped read path; opaque delivery contexts own event consumption."""
+        _ = (session_id, limit)
+        return []
 
     async def bridge_search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
@@ -1898,6 +1876,27 @@ class MemoryCompanionService:
         if len(queue) > self._EMOTIONAL_EVENT_MAX_PER_SESSION:
             queue[:] = queue[-self._EMOTIONAL_EVENT_MAX_PER_SESSION:]
 
+    @staticmethod
+    def _same_private_emotion_domain(event: Any, ctx: SessionContext) -> bool:
+        if not isinstance(event, dict):
+            return False
+        actor = event.get("actor_ref") if isinstance(event.get("actor_ref"), dict) else {}
+        target = event.get("target_ref") if isinstance(event.get("target_ref"), dict) else {}
+        bot_id = clean_text(ctx.bot_id, 160)
+        platform = clean_text(ctx.platform, 80)
+        user_id = clean_text(ctx.user_id, 160)
+        return (
+            bool(bot_id and platform and user_id)
+            and clean_text(ctx.scope, 24).lower() == "private"
+            and clean_text(event.get("bot_id"), 160) == bot_id
+            and clean_text(event.get("scope"), 24).lower() == "private"
+            and clean_text(event.get("platform"), 80) == platform
+            and clean_text(actor.get("kind"), 24) == "user"
+            and clean_text(actor.get("id"), 160) == user_id
+            and clean_text(target.get("kind"), 24) == "bot"
+            and clean_text(target.get("id"), 160) == bot_id
+        )
+
     def _get_cross_window_emotional_hint(self, ctx: SessionContext) -> str:
         """Generate a subtle hint about emotional residue from other chat windows.
 
@@ -1908,7 +1907,9 @@ class MemoryCompanionService:
         if not self.config.bool("private_companion_bridge.cross_window_emotional_continuity_enabled", False):
             return ""
         now = time.time()
-        current_session = ctx.session_id
+        current_session = clean_text(ctx.session_id, 220)
+        if not current_session:
+            return ""
         # Collect recent events from OTHER sessions (within last 30 minutes)
         recent_window = 1800.0  # 30 minutes
         other_events: list[dict[str, Any]] = []
@@ -1916,8 +1917,14 @@ class MemoryCompanionService:
             if session_id == current_session:
                 continue
             for event in queue:
-                age = now - event.get("ts", 0)
-                if age < recent_window:
+                try:
+                    age = now - float(event.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    0.0 <= age < recent_window
+                    and self._same_private_emotion_domain(event, ctx)
+                ):
                     other_events.append(event)
         if not other_events:
             return ""
@@ -1948,42 +1955,14 @@ class MemoryCompanionService:
         window_seconds: float = 1800.0,
         limit: int = 5,
     ) -> dict[str, Any]:
-        """Return a summary of recent emotional events across all sessions for the companion plugin."""
-        if not self.config.bool("private_companion_bridge.cross_window_emotional_continuity_enabled", False):
-            return {
-                "enabled": False,
-                "total": 0,
-                "scar_count": 0,
-                "warm_count": 0,
-                "vulnerable_count": 0,
-            }
-        now = time.time()
-        recent_window = max(60.0, min(86400.0, float(window_seconds or 1800.0)))
-        excluded = clean_text(exclude_session_id, 220)
-        all_events: list[dict[str, Any]] = []
-        for session_id, queue in self._emotional_event_queue.items():
-            if excluded and session_id == excluded:
-                continue
-            for event in queue:
-                age = now - event.get("ts", 0)
-                if age < recent_window:
-                    all_events.append({
-                        "event_id": clean_text(event.get("event_id") or event.get("id"), 96),
-                        "session_id": clean_text(event.get("session_id"), 220),
-                        "event_type": clean_text(event.get("event_type"), 48),
-                        "energy_delta": max(-8.0, min(5.0, float(event.get("energy_delta") or 0.0))),
-                        "age_seconds": round(max(0.0, age), 0),
-                        "ts": float(event.get("ts") or 0.0),
-                    })
-        if not all_events:
-            return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
-        all_events.sort(key=lambda e: e.get("ts", 0), reverse=True)
+        """Deprecated unscoped aggregate; callers must use a delivery context."""
+        _ = (exclude_session_id, window_seconds, limit)
         return {
-            "total": len(all_events),
-            "scar_count": sum(1 for e in all_events if e.get("event_type") == "scar_touched"),
-            "warm_count": sum(1 for e in all_events if e.get("event_type") == "warm_memory"),
-            "vulnerable_count": sum(1 for e in all_events if e.get("event_type") == "vulnerable_resonance"),
-            "recent": all_events[: max(1, min(20, int(limit or 5)))],
+            "enabled": False,
+            "total": 0,
+            "scar_count": 0,
+            "warm_count": 0,
+            "vulnerable_count": 0,
         }
 
     async def _retrieval_cache_key(

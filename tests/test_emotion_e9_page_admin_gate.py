@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import sys
 import types
 import unittest
@@ -19,8 +21,20 @@ if "quart" not in sys.modules:
     quart_stub.send_file = AsyncMock()
     sys.modules["quart"] = quart_stub
 
-import astrbot_plugin_remember_you.page_api as page_api_module  # noqa: E402
-from astrbot_plugin_remember_you.page_api import PluginPageApi  # noqa: E402
+PACKAGE_NAME = "astrbot_plugin_remember_you"
+if PACKAGE_NAME not in sys.modules:
+    package_spec = importlib.util.spec_from_file_location(
+        PACKAGE_NAME,
+        ROOT / "__init__.py",
+        submodule_search_locations=[str(ROOT)],
+    )
+    assert package_spec and package_spec.loader
+    package = importlib.util.module_from_spec(package_spec)
+    sys.modules[PACKAGE_NAME] = package
+    package_spec.loader.exec_module(package)
+
+page_api_module = importlib.import_module(f"{PACKAGE_NAME}.page_api")
+PluginPageApi = page_api_module.PluginPageApi
 
 
 class _JsonResponse(dict):
