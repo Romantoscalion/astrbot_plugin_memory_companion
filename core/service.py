@@ -876,6 +876,12 @@ class MemoryCompanionService:
         ctx.companion_expression_safety_mode = clean_text(decision.get("safety_mode"), 60)
         ctx.companion_expression_blocker = clean_text(decision.get("blocker"), 60)
         ctx.companion_expression_reason_codes = tuple(decision.get("reason_codes") or ())
+        ctx.companion_expression_pacing = clean_text(decision.get("pacing"), 24)
+        ctx.companion_expression_directness = clean_text(decision.get("directness"), 24)
+        ctx.companion_expression_validation_style = clean_text(decision.get("validation_style"), 24)
+        ctx.companion_expression_self_disclosure = clean_text(decision.get("self_disclosure"), 24)
+        ctx.companion_expression_humor_mode = clean_text(decision.get("humor_mode"), 24)
+        ctx.companion_expression_topic_initiative = clean_text(decision.get("topic_initiative"), 24)
 
     def _sanitize_visible_timeline_text(self, text: Any) -> str:
         cleaned = clean_text(text, 1200)

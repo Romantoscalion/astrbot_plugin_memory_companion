@@ -95,6 +95,12 @@ class SessionContext:
     companion_expression_safety_mode: str = ""
     companion_expression_blocker: str = ""
     companion_expression_reason_codes: tuple[str, ...] = ()
+    companion_expression_pacing: str = ""
+    companion_expression_directness: str = ""
+    companion_expression_validation_style: str = ""
+    companion_expression_self_disclosure: str = ""
+    companion_expression_humor_mode: str = ""
+    companion_expression_topic_initiative: str = ""
 
     @property
     def current_target_id(self) -> str:

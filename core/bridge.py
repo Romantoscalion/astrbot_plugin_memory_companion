@@ -33,7 +33,13 @@ _COMPANION_INTERACTION_BANDS = {
     "close",
     "affectionate",
 }
-_COMPANION_EXPRESSION_CONTRACT = "companion_interaction_expression.v1"
+_COMPANION_EXPRESSION_CONTRACTS = {"companion_interaction_expression.v1", "companion_interaction_expression.v2"}
+_COMPANION_EXPRESSION_PACING = {"slow", "steady", "bright"}
+_COMPANION_EXPRESSION_DIRECTNESS = {"indirect", "natural", "direct"}
+_COMPANION_EXPRESSION_VALIDATION = {"none", "acknowledge", "support_first"}
+_COMPANION_EXPRESSION_DISCLOSURE = {"none", "light", "allowed"}
+_COMPANION_EXPRESSION_HUMOR = {"off", "light", "playful"}
+_COMPANION_EXPRESSION_TOPIC = {"reply_only", "followup", "shared_topic"}
 _COMPANION_EXPRESSION_BEHAVIORS = {
     "acknowledge",
     "brief_reply",
@@ -80,7 +86,7 @@ def sanitize_companion_expression_decision(value: Any) -> dict[str, Any]:
     """Accept only the bounded, request-scoped Companion expression contract."""
 
     fallback = {"status": "invalid", "read_only": True, "decision": {}}
-    if type(value) is not dict or value.get("contract") != _COMPANION_EXPRESSION_CONTRACT:
+    if type(value) is not dict or value.get("contract") not in _COMPANION_EXPRESSION_CONTRACTS:
         return fallback
     expression_band = value.get("expression_band")
     if type(expression_band) is not str or expression_band not in _COMPANION_INTERACTION_BANDS:
@@ -105,16 +111,33 @@ def sanitize_companion_expression_decision(value: Any) -> dict[str, Any]:
         return fallback
     if type(value.get("followup")) is not bool:
         return fallback
+    contract = value.get("contract")
+    dimensions: dict[str, str] = {}
+    if contract == "companion_interaction_expression.v2":
+        dimension_specs = {
+            "pacing": _COMPANION_EXPRESSION_PACING,
+            "directness": _COMPANION_EXPRESSION_DIRECTNESS,
+            "validation_style": _COMPANION_EXPRESSION_VALIDATION,
+            "self_disclosure": _COMPANION_EXPRESSION_DISCLOSURE,
+            "humor_mode": _COMPANION_EXPRESSION_HUMOR,
+            "topic_initiative": _COMPANION_EXPRESSION_TOPIC,
+        }
+        for key, allowed in dimension_specs.items():
+            item = value.get(key)
+            if type(item) is not str or item not in allowed:
+                return fallback
+            dimensions[key] = item
     return {
         "status": "accepted",
         "read_only": True,
         "decision": {
-            "contract": _COMPANION_EXPRESSION_CONTRACT,
+            "contract": contract,
             "expression_band": expression_band,
             "allowed_behaviors": list(allowed_behaviors),
             "safety_mode": safety_mode,
             "blocker": blocker,
             "reason_codes": list(reason_codes),
+            **dimensions,
         },
     }
 
