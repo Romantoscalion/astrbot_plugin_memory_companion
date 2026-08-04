@@ -1094,8 +1094,38 @@ class MemoryCompanionBridge:
         return await self._plugin.store.update_memory_visibility(memory_id, visibility)
 
     def get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
-        """Retrieve pending emotional drift events for the companion plugin."""
+        """Legacy read-and-remove compatibility path; new consumers use list/ack."""
         return self._plugin.bridge_get_emotional_events(session_id=session_id, limit=limit)
+
+    async def list_emotion_events(
+        self,
+        *,
+        consumer_id: str,
+        cursor: str = "",
+        session_id: str = "",
+        exclude_session_id: str = "",
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """List redacted pending afterglow events without consuming them."""
+        return await self._plugin.store.list_emotion_event_deliveries(
+            consumer_id=consumer_id,
+            cursor=cursor,
+            session_id=session_id,
+            exclude_session_id=exclude_session_id,
+            limit=limit,
+        )
+
+    async def ack_emotion_events(
+        self,
+        event_refs: list[dict[str, Any]],
+        *,
+        consumer_id: str,
+    ) -> dict[str, Any]:
+        """Acknowledge only events durably applied by the named consumer."""
+        return await self._plugin.store.ack_emotion_event_deliveries(
+            consumer_id=consumer_id,
+            event_refs=event_refs,
+        )
 
     async def record_emotion_event(self, event: dict[str, Any]) -> dict[str, Any]:
         """Persist one redacted event revision outside normal memory retrieval."""
@@ -1198,7 +1228,13 @@ class MemoryCompanionBridge:
             projection["touch_count"] = touch_count
         return projection
 
-    def get_recent_emotional_state(self) -> dict[str, Any]:
+    def get_recent_emotional_state(
+        self,
+        *,
+        exclude_session_id: str = "",
+        window_seconds: float = 1800.0,
+        limit: int = 5,
+    ) -> dict[str, Any]:
         """Return a summary of recent emotional events across ALL sessions.
 
         This provides cross-window emotional continuity for the companion plugin:
@@ -1208,7 +1244,11 @@ class MemoryCompanionBridge:
         getter = getattr(self._plugin, "_get_cross_window_emotional_state", None)
         if not callable(getter):
             return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
-        return getter()
+        return getter(
+            exclude_session_id=exclude_session_id,
+            window_seconds=window_seconds,
+            limit=limit,
+        )
 
     def _entity(self, payload: dict[str, Any]) -> EntityRef:
         return EntityRef(

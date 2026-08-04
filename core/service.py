@@ -1925,7 +1925,13 @@ class MemoryCompanionService:
             return ""
         return " ".join(hints)
 
-    def _get_cross_window_emotional_state(self) -> dict[str, Any]:
+    def _get_cross_window_emotional_state(
+        self,
+        *,
+        exclude_session_id: str = "",
+        window_seconds: float = 1800.0,
+        limit: int = 5,
+    ) -> dict[str, Any]:
         """Return a summary of recent emotional events across all sessions for the companion plugin."""
         if not self.config.bool("private_companion_bridge.cross_window_emotional_continuity_enabled", False):
             return {
@@ -1936,13 +1942,23 @@ class MemoryCompanionService:
                 "vulnerable_count": 0,
             }
         now = time.time()
-        recent_window = 1800.0
+        recent_window = max(60.0, min(86400.0, float(window_seconds or 1800.0)))
+        excluded = clean_text(exclude_session_id, 220)
         all_events: list[dict[str, Any]] = []
         for session_id, queue in self._emotional_event_queue.items():
+            if excluded and session_id == excluded:
+                continue
             for event in queue:
                 age = now - event.get("ts", 0)
                 if age < recent_window:
-                    all_events.append({**event, "age_seconds": round(age, 0)})
+                    all_events.append({
+                        "event_id": clean_text(event.get("event_id") or event.get("id"), 96),
+                        "session_id": clean_text(event.get("session_id"), 220),
+                        "event_type": clean_text(event.get("event_type"), 48),
+                        "energy_delta": max(-8.0, min(5.0, float(event.get("energy_delta") or 0.0))),
+                        "age_seconds": round(max(0.0, age), 0),
+                        "ts": float(event.get("ts") or 0.0),
+                    })
         if not all_events:
             return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
         all_events.sort(key=lambda e: e.get("ts", 0), reverse=True)
@@ -1951,7 +1967,7 @@ class MemoryCompanionService:
             "scar_count": sum(1 for e in all_events if e.get("event_type") == "scar_touched"),
             "warm_count": sum(1 for e in all_events if e.get("event_type") == "warm_memory"),
             "vulnerable_count": sum(1 for e in all_events if e.get("event_type") == "vulnerable_resonance"),
-            "recent": all_events[:5],
+            "recent": all_events[: max(1, min(20, int(limit or 5)))],
         }
 
     async def _retrieval_cache_key(
