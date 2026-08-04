@@ -60,7 +60,7 @@ const SECONDARY_NAV = {
     { id: "retrieval", label: "检索召回", sublabel: "候选、Embedding、Rerank", badge: "召回" },
     { id: "config:memory_injection", label: "记忆注入", sublabel: "注入数量、字数与日志", badge: "注入" },
     { id: "config:context_orchestration", label: "注入编排", sublabel: "分槽调度与当前状态保护", badge: "编排" },
-    { id: "config:private_companion_bridge", label: "陪伴协同", sublabel: "桥接、去重与提示清理", badge: "联动" },
+    { id: "config:private_companion_bridge", label: "记忆插件协同", sublabel: "与陪伴插件桥接、去重和清理提示", badge: "联动" },
     { id: "config:visibility", label: "可见性", sublabel: "跨窗口默认边界", badge: "权限" },
     { id: "topology", label: "权限拓扑", sublabel: "可视化记忆权限矩阵", badge: "拓扑" },
     { id: "config:knowledge_graph", label: "图谱关联", sublabel: "节点、边与检索扩展", badge: "图谱" },

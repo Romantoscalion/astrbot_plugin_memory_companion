@@ -14,6 +14,61 @@ from .person_projection import consume_person_projection
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
+_COMPANION_RELATIONSHIP_PHASES = {
+    "deeply_distant",
+    "strongly_distant",
+    "distant",
+    "acquaintance",
+    "familiar",
+    "close",
+    "intimate",
+    "deeply_bonded",
+}
+
+
+def sanitize_companion_relationship_projection(value: Any) -> dict[str, Any]:
+    fallback = {"status": "invalid", "read_only": True, "projection": {}}
+    if type(value) is not dict:
+        return fallback
+    if value.get("schema_version") != "chat.relationship_projection.v1":
+        return fallback
+    if value.get("authority") != "private_companion.relationship_score" or value.get("read_only") is not True:
+        return fallback
+    phase_key = value.get("phase_key")
+    if type(phase_key) is not str or phase_key not in _COMPANION_RELATIONSHIP_PHASES:
+        return fallback
+    score = value.get("score")
+    if type(score) is not int or not -1200 <= score <= 1200:
+        return fallback
+    soft = value.get("soft_behaviors")
+    if type(soft) is not dict or any(type(item) is not bool for item in soft.values()):
+        return fallback
+    try:
+        proactive_care_limit = int(value.get("proactive_care_limit") or 0)
+    except (TypeError, ValueError):
+        proactive_care_limit = 0
+    projection = {
+        "schema_version": "chat.relationship_projection.v1",
+        "authority": "private_companion.relationship_score",
+        "read_only": True,
+        "score": score,
+        "phase_key": phase_key,
+        "phase_label": clean_text(value.get("phase_label"), 40),
+        "tone": clean_text(value.get("tone"), 160),
+        "address_level": clean_text(value.get("address_level"), 120),
+        "proactive_care_limit": max(0, min(30, proactive_care_limit)),
+        "soft_behaviors": {
+            key: bool(soft.get(key, False))
+            for key in (
+                "allow_playful_jokes",
+                "allow_followup",
+                "allow_memory_mention",
+                "allow_daily_care",
+            )
+        },
+    }
+    return {"status": "accepted", "read_only": True, "projection": projection}
+
 
 def _local_time_label(value: Any) -> str:
     text = clean_text(value, 80)
@@ -39,6 +94,10 @@ class MemoryCompanionBridge:
     def __init__(self, plugin: Any):
         self._plugin = plugin
         self._capability_cache = CapabilityCache()
+
+    def consume_relationship_projection(self, projection: Any) -> dict[str, Any]:
+        """Validate a read-only Companion relationship projection without persisting it."""
+        return sanitize_companion_relationship_projection(projection)
 
     async def record_event(
         self,

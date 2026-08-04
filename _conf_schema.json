@@ -657,7 +657,7 @@
     }
   },
   "private_companion_bridge": {
-    "description": "陪伴插件协同",
+    "description": "记忆插件协同",
     "hint": "与主动陪伴插件协调记忆、连续对话和自我时间线，减少重复注入和提示词污染。",
     "type": "object",
     "items": {

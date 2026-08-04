@@ -24,7 +24,7 @@ from .astrbot_compat import (
     remove_temp_text,
     sanitize_request_history,
 )
-from .bridge import serialize_memory
+from .bridge import sanitize_companion_relationship_projection, serialize_memory
 from .bot_personal_dto import (
     BotPersonalArchiveDTO,
     BotPersonalValidationError,
@@ -469,6 +469,7 @@ class MemoryCompanionService:
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
+        self._apply_companion_relationship_projection(ctx, event=event, req=req)
         self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
@@ -783,6 +784,43 @@ class MemoryCompanionService:
             getattr(req, "_private_companion_preferred_address_locked", False)
             or getattr(event, "_private_companion_preferred_address_locked", False)
         )
+
+    @staticmethod
+    def _apply_companion_relationship_projection(
+        ctx: SessionContext,
+        *,
+        event: Any = None,
+        req: Any = None,
+    ) -> None:
+        """Consume a bounded Companion-owned relationship projection in private scope."""
+
+        if ctx.scope != "private":
+            return
+        raw_projection: Any = None
+        for target in (event, req):
+            if target is None:
+                continue
+            for attr in (
+                "private_companion_context",
+                "companion_context",
+                "memory_companion_context",
+            ):
+                payload = getattr(target, attr, None)
+                if isinstance(payload, dict) and isinstance(payload.get("relationship_projection"), dict):
+                    raw_projection = payload["relationship_projection"]
+                    break
+            if raw_projection is not None:
+                break
+        consumed = sanitize_companion_relationship_projection(raw_projection)
+        projection = consumed.get("projection") if isinstance(consumed, dict) else None
+        if not isinstance(projection, dict):
+            return
+        ctx.relationship_authority_source = "private_companion.relationship_score"
+        ctx.companion_relationship_score = int(projection.get("score") or 0)
+        ctx.companion_relationship_phase_key = clean_text(projection.get("phase_key"), 40)
+        ctx.companion_relationship_phase_label = clean_text(projection.get("phase_label"), 40)
+        ctx.companion_relationship_tone = clean_text(projection.get("tone"), 160)
+        ctx.companion_relationship_address_level = clean_text(projection.get("address_level"), 120)
 
     def _sanitize_visible_timeline_text(self, text: Any) -> str:
         cleaned = clean_text(text, 1200)
@@ -8876,7 +8914,12 @@ class MemoryCompanionService:
         recent_ids.append(message_id)
         state["recent_touch_message_ids"] = recent_ids[-self._RELATIONSHIP_TOUCH_HISTORY_LIMIT :]
         state["updated_at"] = utc_now()
-        self._maybe_transition_phase(ctx, state)
+        if ctx.relationship_authority_source == "private_companion.relationship_score":
+            state["companion_phase_key"] = clean_text(ctx.companion_relationship_phase_key, 40)
+            state["companion_phase_label"] = clean_text(ctx.companion_relationship_phase_label, 40)
+            state["phase_authority"] = "private_companion.relationship_score"
+        else:
+            self._maybe_transition_phase(ctx, state)
         self._save_relationship_phase_state()
         return True
 
@@ -8984,6 +9027,18 @@ class MemoryCompanionService:
                 f"当前对象已明确固定称呼为“{preferred_address}”。需要直接称呼时只使用这一项，"
                 "不必每句都带称呼；关系阶段建议、历史称呼、显示名和旧记忆只作识别资料，"
                 "不能另造或追加亲昵称呼。若对方本轮明确要求改称呼，以本轮最新要求为准。"
+            )
+        if ctx.relationship_authority_source == "private_companion.relationship_score":
+            label = clean_text(ctx.companion_relationship_phase_label, 40) or clean_text(
+                ctx.companion_relationship_phase_key,
+                40,
+            )
+            tone = clean_text(ctx.companion_relationship_tone, 160)
+            address = clean_text(ctx.companion_relationship_address_level, 120)
+            return (
+                f"陪伴插件是长期亲密度权威：当前阶段为“{label or '未标注'}”。"
+                f"基础语气按“{tone or '自然、尊重当前节奏'}”，称呼尺度按“{address or '沿用已确认称呼'}”。"
+                "Memory 仅提供记忆触动趋势和相关事实，不得用自身阶段另行升级称呼、语气或权限。"
             )
         state = self._get_relationship_phase(ctx)
         user_address_phase = state.get("current_address_phase", "")

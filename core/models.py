@@ -78,6 +78,12 @@ class SessionContext:
     strict_session_only: bool = False
     preferred_address: str = ""
     preferred_address_locked: bool = False
+    relationship_authority_source: str = ""
+    companion_relationship_score: int = 0
+    companion_relationship_phase_key: str = ""
+    companion_relationship_phase_label: str = ""
+    companion_relationship_tone: str = ""
+    companion_relationship_address_level: str = ""
 
     @property
     def current_target_id(self) -> str:
