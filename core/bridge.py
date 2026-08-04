@@ -932,12 +932,9 @@ class MemoryCompanionBridge:
         result["capability_schema_version"] = bot_personal_contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION
         result["payload_schema_version"] = bot_personal_contract.BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION
         result["capability_state"] = "available"
-        p5_status = getattr(self._plugin, "p5_capability_status", None)
-        if callable(p5_status):
-            try:
-                result["p5"] = dict(p5_status() or {})
-            except Exception:
-                result["p5"] = {"state": "degraded", "error_code": "p5_status_exception"}
+        # Capability discovery must remain static: callers use it before the
+        # plugin service is safe to query, and C1 guarantees no storage access.
+        result["p5"] = {"state": "unprobed", "error_code": "p5_status_not_probed"}
         self._capability_cache.mark_available(c4_snapshot)
         result.setdefault("warnings", [])
         return result

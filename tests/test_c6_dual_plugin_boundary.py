@@ -228,7 +228,7 @@ class C6DualPluginBoundaryTests(unittest.TestCase):
     def test_capability_probe_failure_keeps_degraded_contract_fields(self):
         with patch.object(bot_personal_contract, "capability_descriptor", side_effect=RuntimeError("boom")):
             result = MemoryCompanionBridge(object()).probe_capability_snapshot()
-        self.assertEqual("degraded", result["capability_state"])
+        self.assertEqual("negative", result["capability_state"])
         self.assertTrue(result["degraded"])
         self.assertFalse(result["available"])
         self.assertEqual("contract_descriptor_exception", result["error_code"])

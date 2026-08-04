@@ -44,13 +44,15 @@ class C1BridgeProbeTests(unittest.TestCase):
         self.assertEqual(list(bot_personal_contract.WINDOW_SLUGS), result["windows"])
         self.assertEqual(list(bot_personal_contract.BOT_PERSONAL_MEMORY_TYPES), result["memory_types"])
         self.assertEqual(bot_personal_contract.BOT_PERSONAL_MAX_PAYLOAD_BYTES, result["max_payload_bytes"])
+        self.assertEqual({"state": "unprobed", "error_code": "p5_status_not_probed"}, result["p5"])
 
     def test_probe_returns_stable_degraded_shape_when_contract_self_check_fails(self) -> None:
         with patch.object(bot_personal_contract, "contract_self_check", return_value=["contract_fingerprint_stale: hidden"]):
             result = MemoryCompanionBridge(_PluginMustNotBeTouched()).probe_bot_personal_memory_capabilities()
 
         self.assertFalse(result["available"])
-        self.assertEqual("degraded", result["state"])
+        self.assertEqual("negative", result["state"])
+        self.assertEqual("negative", result["capability_state"])
         self.assertTrue(result["degraded"])
         self.assertIn("contract_self_check_failed", result["warnings"])
         self.assertIn("contract_fingerprint_stale", result["warnings"])
@@ -65,7 +67,8 @@ class C1BridgeProbeTests(unittest.TestCase):
             result = MemoryCompanionBridge(_PluginMustNotBeTouched()).probe_bot_personal_memory_capabilities()
 
         self.assertFalse(result["available"])
-        self.assertEqual("degraded", result["state"])
+        self.assertEqual("negative", result["state"])
+        self.assertEqual("negative", result["capability_state"])
         self.assertTrue(result["degraded"])
         self.assertEqual(["contract_self_check_exception"], result["warnings"])
         for secret in ("raw prompt", "user identity", "database object"):
