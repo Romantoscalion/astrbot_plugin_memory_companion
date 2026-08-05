@@ -98,6 +98,83 @@ class EmotionE4AfterglowDeliveryTests(unittest.IsolatedAsyncioTestCase):
             {item["event_id"] for item in page["events"]},
         )
 
+    async def test_event_id_cannot_be_revised_from_another_identity_domain(self) -> None:
+        store = self.make_store()
+        original = await self.add_event(store, session_id="session-a", suffix="shared")
+        foreign_revision = normalize_emotion_event({
+            **original,
+            "revision": 2,
+            "session_id": "session-b",
+            "actor_ref": {"kind": "user", "id": "user-2", "role": "speaker"},
+            "status": "revised",
+        }, producer_plugin="memory_companion")
+
+        with self.assertRaisesRegex(ValueError, "another identity domain"):
+            await store.upsert_emotion_event(foreign_revision)
+
+        rows = store._conn.execute(
+            "SELECT revision, session_id FROM emotion_events WHERE event_id=?",
+            (original["event_id"],),
+        ).fetchall()
+        self.assertEqual([(1, "session-a")], [tuple(row) for row in rows])
+
+    async def test_legacy_cross_domain_high_revision_does_not_hide_original_event(self) -> None:
+        store = self.make_store()
+        original = await self.add_event(store, session_id="session-a", suffix="legacy-shared")
+        store._conn.execute(
+            """
+            INSERT INTO emotion_events(
+                event_id, revision, trace_id, producer_plugin, origin_kind, platform,
+                bot_id, scope, session_id, actor_ref, target_ref, quoted_target_ref,
+                event_type, intensity, confidence, valence_hint, arousal_hint,
+                vulnerability_hint, source_rule, occurred_at, expires_at, dedupe_key,
+                payload_hash, privacy_level, applied_interaction, applied_energy_delta,
+                correction_of, status, reason_codes, created_at
+            )
+            SELECT
+                event_id, 999, trace_id, producer_plugin, origin_kind, platform,
+                bot_id, scope, session_id, json_set(actor_ref, '$.id', 'user-2'),
+                target_ref, quoted_target_ref, event_type, intensity, confidence,
+                valence_hint, arousal_hint, vulnerability_hint, source_rule, occurred_at,
+                expires_at, dedupe_key, payload_hash, privacy_level, applied_interaction,
+                applied_energy_delta, event_id, 'revised', reason_codes, created_at
+            FROM emotion_events
+            WHERE event_id=? AND revision=1
+            """,
+            (original["event_id"],),
+        )
+        store._conn.commit()
+
+        original_page = await store.list_emotion_event_deliveries(
+            **self.delivery_domain(session_id="session-a"), limit=1
+        )
+        foreign_page = await store.list_emotion_event_deliveries(
+            consumer_id="private_companion.daily_state",
+            bot_id="bot-1",
+            scope="private",
+            platform="qq",
+            user_id="user-2",
+            session_id="session-a",
+            limit=1,
+        )
+        summary = await store.get_emotion_trace_summary(
+            bot_id="bot-1",
+            scope="private",
+            session_id="session-a",
+            limit=5,
+        )
+
+        self.assertEqual([(original["event_id"], 1)], [
+            (item["event_id"], item["revision"]) for item in original_page["events"]
+        ])
+        self.assertEqual([(original["event_id"], 999)], [
+            (item["event_id"], item["revision"]) for item in foreign_page["events"]
+        ])
+        self.assertIn(
+            (original["event_id"], 1),
+            [(item["event_id"], item["revision"]) for item in summary["items"]],
+        )
+
     async def test_expired_or_malformed_event_is_never_delivered_or_acknowledged(self) -> None:
         store = self.make_store()
         now = datetime.now(timezone.utc)

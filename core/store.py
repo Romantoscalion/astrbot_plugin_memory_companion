@@ -6347,30 +6347,40 @@ class MemoryStore:
 
         event = normalize_emotion_event(value, producer_plugin="memory_companion")
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT OR IGNORE INTO emotion_events(
-                    event_id, revision, trace_id, producer_plugin, origin_kind, platform,
-                    bot_id, scope, session_id, actor_ref, target_ref, quoted_target_ref,
-                    event_type, intensity, confidence, valence_hint, arousal_hint,
-                    vulnerability_hint, source_rule, occurred_at, expires_at, dedupe_key,
-                    payload_hash, privacy_level, applied_interaction, applied_energy_delta,
-                    correction_of, status, reason_codes, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    event["event_id"], event["revision"], event["trace_id"], event["producer_plugin"],
-                    event["origin_kind"], event["platform"], event["bot_id"], event["scope"],
-                    event["session_id"], json_dumps(event["actor_ref"]), json_dumps(event["target_ref"]),
-                    json_dumps(event["quoted_target_ref"]), event["event_type"], event["intensity"],
-                    event["confidence"], event["valence_hint"], event["arousal_hint"],
-                    event["vulnerability_hint"], event["source_rule"], event["occurred_at"],
-                    event["expires_at"], event["dedupe_key"], event["payload_hash"],
-                    event["privacy_level"], event["applied_interaction"], event["applied_energy_delta"],
-                    event["correction_of"], event["status"], json_dumps(event["reason_codes"]), utc_now(),
-                ),
-            )
-            self._conn.commit()
+            with self._transaction_sync():
+                existing_rows = self._conn.execute(
+                    "SELECT * FROM emotion_events WHERE event_id=?",
+                    (event["event_id"],),
+                ).fetchall()
+                event_domain = self._emotion_event_identity_domain(event)
+                if any(
+                    self._emotion_event_identity_domain(self._emotion_event_row(row)) != event_domain
+                    for row in existing_rows
+                ):
+                    raise ValueError("emotion event_id is already bound to another identity domain")
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO emotion_events(
+                        event_id, revision, trace_id, producer_plugin, origin_kind, platform,
+                        bot_id, scope, session_id, actor_ref, target_ref, quoted_target_ref,
+                        event_type, intensity, confidence, valence_hint, arousal_hint,
+                        vulnerability_hint, source_rule, occurred_at, expires_at, dedupe_key,
+                        payload_hash, privacy_level, applied_interaction, applied_energy_delta,
+                        correction_of, status, reason_codes, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event["event_id"], event["revision"], event["trace_id"], event["producer_plugin"],
+                        event["origin_kind"], event["platform"], event["bot_id"], event["scope"],
+                        event["session_id"], json_dumps(event["actor_ref"]), json_dumps(event["target_ref"]),
+                        json_dumps(event["quoted_target_ref"]), event["event_type"], event["intensity"],
+                        event["confidence"], event["valence_hint"], event["arousal_hint"],
+                        event["vulnerability_hint"], event["source_rule"], event["occurred_at"],
+                        event["expires_at"], event["dedupe_key"], event["payload_hash"],
+                        event["privacy_level"], event["applied_interaction"], event["applied_energy_delta"],
+                        event["correction_of"], event["status"], json_dumps(event["reason_codes"]), utc_now(),
+                    ),
+                )
         return event
 
     async def get_emotion_trace(self, trace_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -6427,7 +6437,7 @@ class MemoryStore:
             result: list[dict[str, Any]] = []
             for row in rows:
                 event = self._emotion_event_row(row)
-                deliveries = self._conn.execute(
+                delivery_rows = self._conn.execute(
                     """
                     SELECT consumer_id, attempts, first_delivered_at, last_delivered_at, acked_at
                     FROM emotion_event_deliveries
@@ -6436,6 +6446,13 @@ class MemoryStore:
                     """,
                     (event["event_id"], event["revision"]),
                 ).fetchall()
+                deliveries = []
+                for delivery in delivery_rows:
+                    values = dict(delivery)
+                    values["consumer_id"] = clean_text(
+                        values.get("consumer_id"), 120
+                    ).split("@", 1)[0]
+                    deliveries.append(values)
                 result.append(self._emotion_diagnostic_projection(event, deliveries))
         return result
 
@@ -6476,10 +6493,10 @@ class MemoryStore:
         with self._lock:
             rows = self._conn.execute(
                 f"""
-                SELECT e.* FROM emotion_events e
-                JOIN (SELECT event_id, MAX(revision) revision FROM emotion_events GROUP BY event_id) latest
-                  ON latest.event_id=e.event_id AND latest.revision=e.revision
+                SELECT e.*
+                FROM emotion_events e
                 WHERE {' AND '.join(clauses)}
+                  AND {self._emotion_latest_revision_clause('e', 'newer')}
                 ORDER BY e.occurred_at DESC, e.event_id DESC
                 LIMIT ? OFFSET ?
                 """,
@@ -6633,6 +6650,9 @@ class MemoryStore:
         cursor_position = self._parse_emotion_delivery_cursor(cursor_value)
         if cursor_value and cursor_position is None:
             return self._empty_emotion_delivery()
+        delivery_consumer_id = self._emotion_delivery_consumer_key(
+            domain["consumer_id"], domain
+        )
         clauses = [
             "e.origin_kind='memory_recall'",
             "e.status NOT IN ('ignored','expired')",
@@ -6656,7 +6676,7 @@ class MemoryStore:
             )""",
         ]
         params: list[Any] = [
-            domain["consumer_id"],
+            delivery_consumer_id,
             domain["bot_id"],
             domain["scope"],
             domain["platform"],
@@ -6689,14 +6709,10 @@ class MemoryStore:
                 f"""
                 SELECT e.*
                 FROM emotion_events e
-                JOIN (
-                    SELECT event_id, MAX(revision) AS revision
-                    FROM emotion_events
-                    GROUP BY event_id
-                ) latest ON latest.event_id=e.event_id AND latest.revision=e.revision
                 LEFT JOIN emotion_event_deliveries d
                   ON d.event_id=e.event_id AND d.revision=e.revision AND d.consumer_id=?
                 WHERE {' AND '.join(clauses)}
+                  AND {self._emotion_latest_revision_clause('e', 'newer')}
                 ORDER BY e.occurred_at DESC, e.event_id DESC, e.revision DESC
                 LIMIT ?
                 """,
@@ -6727,7 +6743,7 @@ class MemoryStore:
                     (
                         event["event_id"],
                         event["revision"],
-                        domain["consumer_id"],
+                        delivery_consumer_id,
                         delivered_at,
                         delivered_at,
                     ),
@@ -6800,6 +6816,9 @@ class MemoryStore:
                 unique_refs.add((event_id, revision))
         acked_at = utc_now()
         acked = 0
+        delivery_consumer_id = self._emotion_delivery_consumer_key(
+            domain["consumer_id"], domain
+        )
         with self._lock:
             for event_id, revision in unique_refs:
                 row = self._conn.execute(
@@ -6820,7 +6839,7 @@ class MemoryStore:
                     SET acked_at=?
                     WHERE event_id=? AND revision=? AND consumer_id=? AND acked_at=''
                     """,
-                    (acked_at, event_id, revision, domain["consumer_id"]),
+                    (acked_at, event_id, revision, delivery_consumer_id),
                 )
                 acked += max(0, int(result.rowcount or 0))
             self._conn.commit()
@@ -6884,6 +6903,62 @@ class MemoryStore:
                 or clean_text(event.get("session_id"), 220) == domain["session_id"]
             )
         )
+
+    @staticmethod
+    def _emotion_event_identity_domain(event: dict[str, Any]) -> tuple[str, ...]:
+        actor = event.get("actor_ref") if isinstance(event.get("actor_ref"), dict) else {}
+        target = event.get("target_ref") if isinstance(event.get("target_ref"), dict) else {}
+        return (
+            clean_text(event.get("producer_plugin"), 80),
+            clean_text(event.get("origin_kind"), 40),
+            clean_text(event.get("platform"), 80),
+            clean_text(event.get("bot_id"), 160),
+            clean_text(event.get("scope"), 24).lower(),
+            clean_text(event.get("session_id"), 220),
+            clean_text(actor.get("kind"), 24),
+            clean_text(actor.get("id"), 160),
+            clean_text(target.get("kind"), 24),
+            clean_text(target.get("id"), 160),
+        )
+
+    @staticmethod
+    def _emotion_delivery_consumer_key(consumer_id: str, domain: dict[str, Any]) -> str:
+        """Namespace delivery state so legacy duplicate event IDs cannot share acks."""
+
+        identity = json_dumps({
+            "consumer_id": clean_text(consumer_id, 80),
+            "bot_id": clean_text(domain.get("bot_id"), 160),
+            "scope": clean_text(domain.get("scope"), 24).lower(),
+            "platform": clean_text(domain.get("platform"), 80),
+            "user_id": clean_text(domain.get("user_id"), 160),
+            "session_id": clean_text(domain.get("session_id"), 220),
+        })
+        return f"{clean_text(consumer_id, 80)}@{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+
+    @staticmethod
+    def _emotion_latest_revision_clause(event_alias: str, newer_alias: str) -> str:
+        def ref_value(alias: str, column: str, key: str) -> str:
+            return (
+                f"COALESCE(CASE WHEN json_valid({alias}.{column}) "
+                f"THEN CAST(json_extract({alias}.{column}, '$.{key}') AS TEXT) END, '')"
+            )
+
+        return f"""NOT EXISTS (
+            SELECT 1
+            FROM emotion_events {newer_alias}
+            WHERE {newer_alias}.event_id={event_alias}.event_id
+              AND {newer_alias}.producer_plugin={event_alias}.producer_plugin
+              AND {newer_alias}.origin_kind={event_alias}.origin_kind
+              AND {newer_alias}.platform={event_alias}.platform
+              AND {newer_alias}.bot_id={event_alias}.bot_id
+              AND LOWER({newer_alias}.scope)=LOWER({event_alias}.scope)
+              AND {newer_alias}.session_id={event_alias}.session_id
+              AND {ref_value(newer_alias, 'actor_ref', 'kind')}={ref_value(event_alias, 'actor_ref', 'kind')}
+              AND {ref_value(newer_alias, 'actor_ref', 'id')}={ref_value(event_alias, 'actor_ref', 'id')}
+              AND {ref_value(newer_alias, 'target_ref', 'kind')}={ref_value(event_alias, 'target_ref', 'kind')}
+              AND {ref_value(newer_alias, 'target_ref', 'id')}={ref_value(event_alias, 'target_ref', 'id')}
+              AND {newer_alias}.revision>{event_alias}.revision
+        )"""
 
     @staticmethod
     def _emotion_event_is_expired(event: dict[str, Any], *, now: datetime | None = None) -> bool:

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.bridge import sanitize_companion_relationship_projection
+from core.bridge import MemoryCompanionBridge, sanitize_companion_relationship_projection
 from core.models import SessionContext
 from core.service import MemoryCompanionService
 
@@ -44,6 +44,35 @@ def valid_projection() -> dict:
 
 
 class Req027RelationshipAuthorityTests(unittest.TestCase):
+    @staticmethod
+    def attested_projection() -> dict:
+        companion = object()
+        plugin = SimpleNamespace(
+            context=SimpleNamespace(
+                get_all_stars=lambda: [
+                    SimpleNamespace(
+                        star_cls=companion,
+                        root_dir_name="astrbot_plugin_private_companion",
+                        name="PrivateCompanion",
+                        activated=True,
+                    )
+                ]
+            )
+        )
+        bridge = MemoryCompanionBridge(plugin)
+        capability = bridge.register_emotion_producer(companion)
+        result = bridge.consume_relationship_projection(
+            valid_projection(),
+            producer_capability=capability,
+            bot_id="bot-1",
+            platform="telegram",
+            user_id="u1",
+            scope="private",
+            session_id="telegram:FriendMessage:u1",
+        )
+        assert result["status"] == "accepted"
+        return result["projection"]
+
     def test_bridge_accepts_only_the_read_only_fixed_contract(self) -> None:
         projection = valid_projection()
         projection.update({"owner": True, "cross_user_query": True, "p4_bypass": True})
@@ -79,8 +108,16 @@ class Req027RelationshipAuthorityTests(unittest.TestCase):
         self.assertEqual(0, sanitized["projection"]["proactive_care_limit"])
 
     def test_private_context_consumes_projection_but_group_context_does_not(self) -> None:
-        event = SimpleNamespace(private_companion_context={"relationship_projection": valid_projection()})
-        private = SessionContext(session_id="telegram:FriendMessage:u1", scope="private", user_id="u1")
+        event = SimpleNamespace(
+            private_companion_context={"relationship_projection": self.attested_projection()}
+        )
+        private = SessionContext(
+            session_id="telegram:FriendMessage:u1",
+            scope="private",
+            platform="telegram",
+            bot_id="bot-1",
+            user_id="u1",
+        )
         MemoryCompanionService._apply_companion_relationship_projection(private, event=event)
         self.assertEqual("private_companion.relationship_score", private.relationship_authority_source)
         self.assertEqual(620, private.companion_relationship_score)
@@ -90,6 +127,39 @@ class Req027RelationshipAuthorityTests(unittest.TestCase):
         MemoryCompanionService._apply_companion_relationship_projection(group, event=event)
         self.assertEqual("", group.relationship_authority_source)
         self.assertEqual("", group.companion_relationship_phase_key)
+
+    def test_unattested_or_modified_projection_cannot_claim_relationship_authority(self) -> None:
+        raw_event = SimpleNamespace(
+            private_companion_context={"relationship_projection": valid_projection()}
+        )
+        raw_ctx = SessionContext(
+            session_id="telegram:FriendMessage:u1",
+            scope="private",
+            platform="telegram",
+            bot_id="bot-1",
+            user_id="u1",
+        )
+        MemoryCompanionService._apply_companion_relationship_projection(raw_ctx, event=raw_event)
+        self.assertEqual("", raw_ctx.relationship_authority_source)
+
+        sealed = self.attested_projection()
+        with self.assertRaises(TypeError):
+            sealed["score"] = 1200
+        dict.__setitem__(sealed, "score", 1200)
+        modified_event = SimpleNamespace(
+            private_companion_context={"relationship_projection": sealed}
+        )
+        modified_ctx = SessionContext(
+            session_id="telegram:FriendMessage:u1",
+            scope="private",
+            platform="telegram",
+            bot_id="bot-1",
+            user_id="u1",
+        )
+        MemoryCompanionService._apply_companion_relationship_projection(
+            modified_ctx, event=modified_event
+        )
+        self.assertEqual("", modified_ctx.relationship_authority_source)
 
     def test_companion_authority_stops_memory_phase_state_writes(self) -> None:
         service = MemoryCompanionService.__new__(MemoryCompanionService)

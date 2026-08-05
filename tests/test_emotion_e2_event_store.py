@@ -119,6 +119,13 @@ class EmotionE2EventStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, rendered)
         self.assertTrue(EMOTION_EVENT_CONTRACT_FINGERPRINT)
 
+    async def test_legacy_cross_window_read_reports_migration_requirement(self) -> None:
+        bridge = MemoryCompanionBridge(SimpleNamespace())
+        state = bridge.get_recent_emotional_state()
+        self.assertEqual("migration_required", state["state"])
+        self.assertEqual("delivery_context_required", state["error_code"])
+        self.assertEqual(0, state["total"])
+
 
 if __name__ == "__main__":
     unittest.main()

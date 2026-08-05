@@ -283,6 +283,28 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("番茄鸡蛋面", injection)
 
+    async def test_naming_another_member_never_opens_that_members_private_memory(self) -> None:
+        service = self.make_service()
+        other = self.private_memory("小李私聊里说过的保密餐点：松露披萨。")
+        other.subject = EntityRef(kind="user", id="u2", name="小李")
+        other.session_id = "qq:FriendMessage:u2"
+        await service.store.insert_memory(other)
+        await service.store.upsert_acl_rule(
+            owner_scope="private",
+            owner_id="u2",
+            reader_scope="group",
+            reader_id="g1",
+            effect="allow",
+        )
+
+        injection = await service._compose_memory_injection(
+            self.group_context(message_text="你还记得小李私聊里说过什么吗？"),
+            max_chars=3200,
+            write_log=False,
+        )
+
+        self.assertNotIn("松露披萨", injection)
+
     async def test_acl_revoke_removes_cached_private_group_result(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory())
@@ -607,18 +629,29 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             "我今天的安排是什么？": False,
             "你能查一下我的日程吗？": False,
             "你记得我今天的安排吗？": False,
+            "你知道我的下周计划吗？": False,
+            "你觉得我明天有空吗？": False,
             "小王的日程有哪些？": False,
+            "小王明天有安排吗？": False,
             "会议日程有哪些？": False,
+            "群活动安排是什么？": False,
+            "明天考试有什么安排？": False,
+            "课程安排有哪些？": False,
             "请规划一份日程": False,
             "行程规划算法": False,
             "my schedule": False,
             "project schedule": False,
+            "现在几点？": False,
+            "今天是什么日子？": False,
             "你知道今天几点了吗？": False,
             "你的日程有哪些？": True,
             "你今天的安排是什么？": True,
             "今晚你有空吗？": True,
             "明天有空吗？": True,
+            "明天有安排吗？": True,
             "你什么时候上班？": True,
+            "你什么时候有空？": True,
+            "你的任务安排是什么？": True,
             "b1 的日程": True,
             "your schedule": True,
         }
@@ -633,6 +666,96 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
                         bot_id="b1",
                     ),
                 )
+
+    async def test_calibrated_open_loop_records_obey_default_slot_cap(self) -> None:
+        service = self.make_service()
+        evaluator = ImportanceEvaluator()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            user_name="小王",
+            bot_id="b1",
+            message_text="开放事项召回锚点",
+        )
+        for index in range(8):
+            record = evaluator.calibrate(
+                MemoryRecord(
+                    id=f"calibrated-open-loop-{index}",
+                    memory_type="timeline_event",
+                    subject=EntityRef(kind="user", id="u1", name="小王"),
+                    object=EntityRef.bot_self("b1"),
+                    scope="private",
+                    session_id=ctx.session_id,
+                    platform="qq",
+                    visibility="private_pair",
+                    lifecycle="stable_memory",
+                    content=f"开放事项召回锚点：明天提醒处理记录 {index}",
+                    confidence=1.0,
+                    importance=1.0,
+                    metadata={"owner_bot_id": "b1"},
+                ),
+                source="schedule_test",
+            )
+            self.assertGreaterEqual(float(record.metadata.get("open_loop_weight") or 0.0), 0.35)
+            await service.store.insert_memory(record)
+
+        results, _blocked, slot_map = await service.search_context_slots(
+            "开放事项召回锚点",
+            ctx,
+            top_k=8,
+            admin_read_all=True,
+        )
+
+        self.assertEqual(1, len(slot_map.get("open_loop", [])))
+        self.assertEqual(1, len(results))
+
+    async def test_bot_schedule_identity_beats_calibrated_open_loop_weight(self) -> None:
+        service = self.make_service()
+        evaluator = ImportanceEvaluator()
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            user_name="小王",
+            bot_id="b1",
+            message_text="Bot日程召回锚点",
+        )
+        for index in range(5):
+            record = evaluator.calibrate(
+                MemoryRecord(
+                    id=f"bot-open-loop-schedule-{index}",
+                    memory_type="self_action",
+                    subject=EntityRef.bot_self("b1"),
+                    object=EntityRef(kind="user", id="u1", name="小王"),
+                    scope="private",
+                    session_id=ctx.session_id,
+                    platform="qq",
+                    visibility="bot_self",
+                    reality_level="bot_action",
+                    lifecycle="stable_memory",
+                    content=f"Bot日程召回锚点：明天提醒处理安排 {index}",
+                    confidence=1.0,
+                    importance=1.0,
+                    metadata={"owner_bot_id": "b1"},
+                ),
+                source="schedule_test",
+            )
+            self.assertGreaterEqual(float(record.metadata.get("open_loop_weight") or 0.0), 0.35)
+            await service.store.insert_memory(record)
+
+        results, _blocked, slot_map = await service.search_context_slots(
+            "Bot日程召回锚点",
+            ctx,
+            top_k=5,
+            admin_read_all=True,
+        )
+
+        self.assertEqual(5, len(results))
+        self.assertEqual(5, len(slot_map.get("self_timeline", [])))
+        self.assertEqual([], slot_map.get("open_loop", []))
 
     async def test_explicit_schedule_query_can_fill_self_timeline_slot(self) -> None:
         service = self.make_service()

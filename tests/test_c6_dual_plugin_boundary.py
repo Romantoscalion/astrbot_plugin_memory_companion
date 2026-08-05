@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from core import bot_personal_contract
@@ -73,6 +74,37 @@ class _ProfileProvider:
 
 
 class C6DualPluginBoundaryTests(unittest.TestCase):
+    def test_private_companion_registration_accepts_exact_class_and_instance_forms(self):
+        """AstrBot exposes both the live Star and its exact class in metadata."""
+
+        class Companion:
+            pass
+
+        live = Companion()
+        plugin = SimpleNamespace(
+            context=SimpleNamespace(
+                get_all_stars=lambda: [
+                    SimpleNamespace(
+                        star_cls=live,
+                        star_cls_type=Companion,
+                        root_dir_name="astrbot_plugin_private_companion",
+                        name="PrivateCompanion",
+                        activated=True,
+                    )
+                ]
+            )
+        )
+        bridge = MemoryCompanionBridge(plugin)
+
+        self.assertIsNotNone(bridge.register_emotion_producer(Companion))
+        self.assertIsNotNone(bridge.register_emotion_producer(live))
+
+        # A same-name class or another instance must not inherit the
+        # capability merely from metadata labels.
+        SameName = type("Companion", (), {})
+        self.assertIsNone(bridge.register_emotion_producer(SameName))
+        self.assertIsNone(bridge.register_emotion_producer(Companion()))
+
     def test_capability_probe_exposes_contract_domain_version_types_and_pending(self):
         bridge = MemoryCompanionBridge(object())
         pending = bridge.capability_status()
@@ -195,20 +227,45 @@ class C6DualPluginBoundaryTests(unittest.TestCase):
 
     def test_bridge_failure_states_are_identifiable_without_leaking_exception_text(self):
         missing = run(MemoryCompanionBridge(object()).record_bot_personal_archive(archive()))
-        self.assertEqual(("degraded", "bridge_method_unavailable"),
+        self.assertEqual(("forbidden", "producer_capability_required"),
                          (missing["state"], missing["error_code"]))
+
+        def attested(provider):
+            companion = object()
+            provider.context = SimpleNamespace(
+                get_all_stars=lambda: [
+                    SimpleNamespace(
+                        star_cls=companion,
+                        root_dir_name="astrbot_plugin_private_companion",
+                        name="PrivateCompanion",
+                        activated=True,
+                    )
+                ]
+            )
+            bridge = MemoryCompanionBridge(provider)
+            return bridge, bridge.register_emotion_producer(companion)
 
         class Broken:
             async def record_bot_personal_archive(self, _dto):
                 raise asyncio.TimeoutError()
 
-        timed_out = run(MemoryCompanionBridge(Broken()).record_bot_personal_archive(archive("timeout")))
+        timed_out_bridge, timed_out_capability = attested(Broken())
+        timed_out = run(
+            timed_out_bridge.record_bot_personal_archive(
+                archive("timeout"), producer_capability=timed_out_capability
+            )
+        )
         self.assertEqual(("degraded", "bridge_exception"),
                          (timed_out["state"], timed_out["error_code"]))
         self.assertNotIn("TimeoutError", str(timed_out))
 
         failed = _Recorder({"ok": False, "state": "failed", "error_code": "archive_failed"})
-        failed_result = run(MemoryCompanionBridge(failed).record_bot_personal_archive(archive("failed")))
+        failed_bridge, failed_capability = attested(failed)
+        failed_result = run(
+            failed_bridge.record_bot_personal_archive(
+                archive("failed"), producer_capability=failed_capability
+            )
+        )
         self.assertEqual(("failed", "archive_failed"),
                          (failed_result["state"], failed_result["error_code"]))
 

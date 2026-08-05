@@ -136,7 +136,7 @@ class EpistemicCalibrationTests(unittest.TestCase):
         self.assertFalse(decision.suppress_long_memory)
         self.assertFalse(decision.allow_contextual_expansion)
 
-    def test_group_actor_guard_is_private_by_default_but_allows_named_recall(self) -> None:
+    def test_group_actor_guard_keeps_private_memory_bound_to_current_speaker(self) -> None:
         service = self.make_service()
         ctx = SessionContext(
             session_id="qq:GroupMessage:g1",
@@ -223,8 +223,13 @@ class EpistemicCalibrationTests(unittest.TestCase):
             query_text="还记得小李之前说过的蛋糕吗？",
         )
         recalled_ids = {item.memory.id for items in recalled.values() for item in items}
-        self.assertEqual({"current-profile", "current-private", "other-profile", "other-private"}, recalled_ids)
-        self.assertEqual([], recalled_blocked)
+        # Naming another member is not permission to disclose that member's
+        # private conversation. Public group profile data remains eligible.
+        self.assertEqual({"current-profile", "current-private", "other-profile"}, recalled_ids)
+        self.assertEqual(
+            {"group_private_memory_actor_not_current_sender"},
+            {item["reason"] for item in recalled_blocked},
+        )
 
     def test_future_arrangement_route_keeps_association_soft(self) -> None:
         service = self.make_service()

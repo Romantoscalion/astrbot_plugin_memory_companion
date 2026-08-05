@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 from core.bridge import MemoryCompanionBridge
 from core.models import MemoryRecord
@@ -120,5 +121,38 @@ def test_bridge_profile_and_capability_compatibility(tmp_path):
         assert len(profile["items"]) == 1
         assert missing["state"] == "degraded"
         assert missing["error_code"] == "bridge_method_unavailable"
+    finally:
+        service.store.close()
+
+
+def test_bridge_locked_profile_ignores_caller_boolean_and_requires_capability(tmp_path):
+    service = make_service(tmp_path)
+    try:
+        run(service.record_bot_personal_archive(envelope("bot_creative_work", "locked")))
+        companion = object()
+        service.context = SimpleNamespace(
+            get_all_stars=lambda: [
+                SimpleNamespace(
+                    star_cls=companion,
+                    root_dir_name="astrbot_plugin_private_companion",
+                    name="PrivateCompanion",
+                    activated=True,
+                )
+            ]
+        )
+        bridge = MemoryCompanionBridge(service)
+        denied = run(bridge.read_bot_profile("locked_frame_personal", authorized=True))
+        capability = bridge.register_bot_personal_producer(companion)
+        allowed = run(
+            bridge.read_bot_profile(
+                "locked_frame_personal",
+                authorized=False,
+                producer_capability=capability,
+            )
+        )
+        assert denied["state"] == "forbidden"
+        assert denied["items"] == []
+        assert allowed["ok"] is True
+        assert allowed["items"]
     finally:
         service.store.close()

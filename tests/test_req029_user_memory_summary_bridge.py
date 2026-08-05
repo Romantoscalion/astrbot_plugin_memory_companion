@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -142,26 +143,85 @@ class Req029UserMemorySummaryBridgeTests(unittest.IsolatedAsyncioTestCase):
         service = MemoryCompanionService.__new__(MemoryCompanionService)
         service.config = _Config(True)
         service.store = store
+        companion = object()
+        service.context = SimpleNamespace(
+            get_all_stars=lambda: [
+                SimpleNamespace(
+                    star_cls=companion,
+                    root_dir_name="astrbot_plugin_private_companion",
+                    name="PrivateCompanion",
+                    activated=True,
+                )
+            ]
+        )
         bridge = MemoryCompanionBridge(service)
+        capability = bridge.register_emotion_producer(companion)
+        requester = bridge.create_user_memory_context(
+            capability,
+            bot_id="bot-1",
+            platform="qq",
+            scope="private",
+            user_id="u1",
+            session_id="qq:FriendMessage:u1",
+        )
 
-        ready = await bridge.read_user_memory_summary("u1", limit=99)
+        ready = await bridge.read_user_memory_summary(
+            "u1", limit=99, requester_context=requester
+        )
         self.assertTrue(ready["ok"])
         self.assertEqual(USER_MEMORY_SUMMARY_VERSION, ready["contract"])
         self.assertLessEqual(len(ready["summaries"]), 8)
         self.assertNotIn("PRIVATE_CONTEXT_MUST_NOT_LEAK", repr(ready))
         self.assertNotIn("content", ready["summaries"][0])
 
+        denied = await bridge.read_user_memory_summary("u1")
+        wrong_user = await bridge.read_user_memory_summary(
+            "u2", requester_context=requester
+        )
+        wrong_session = await bridge.read_user_memory_summary(
+            "u1",
+            session_id="qq:FriendMessage:other",
+            requester_context=requester,
+        )
+        for result in (denied, wrong_user, wrong_session):
+            self.assertFalse(result["ok"])
+            self.assertEqual("forbidden", result["state"])
+            self.assertEqual(0, result["counts"]["total"])
+
         service.config = _Config(False)
-        disabled = await bridge.read_user_memory_summary("u1")
+        disabled = await bridge.read_user_memory_summary("u1", requester_context=requester)
         self.assertFalse(disabled["ok"])
         self.assertEqual("bridge_disabled", disabled["error_code"])
         self.assertEqual(0, disabled["counts"]["total"])
 
         class _BrokenService:
+            context = SimpleNamespace(
+                get_all_stars=lambda: [
+                    SimpleNamespace(
+                        star_cls=companion,
+                        root_dir_name="astrbot_plugin_private_companion",
+                        name="PrivateCompanion",
+                        activated=True,
+                    )
+                ]
+            )
+
             async def read_user_memory_summary(self, *_args, **_kwargs):
                 raise RuntimeError("sensitive failure details")
 
-        broken = await MemoryCompanionBridge(_BrokenService()).read_user_memory_summary("u1")
+        broken_bridge = MemoryCompanionBridge(_BrokenService())
+        broken_capability = broken_bridge.register_emotion_producer(companion)
+        broken_requester = broken_bridge.create_user_memory_context(
+            broken_capability,
+            bot_id="bot-1",
+            platform="qq",
+            scope="private",
+            user_id="u1",
+            session_id="qq:FriendMessage:u1",
+        )
+        broken = await broken_bridge.read_user_memory_summary(
+            "u1", requester_context=broken_requester
+        )
         self.assertFalse(broken["ok"])
         self.assertEqual("bridge_exception", broken["error_code"])
         self.assertNotIn("sensitive failure details", repr(broken))

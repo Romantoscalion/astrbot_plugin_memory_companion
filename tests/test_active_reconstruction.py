@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT.parent) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
 
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SessionContext
+from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
 from astrbot_plugin_remember_you.core.service import MemoryCompanionService
 
 
@@ -227,6 +227,75 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("2026-08-01 12:30:00", event_time["evidence"][0]["occurred_at_local"])
         self.assertNotIn("evidence_preview", event_time["evidence"][0])
         self.assertIn("我喝拿铁不加糖", event_context["evidence"][0]["evidence_preview"])
+
+    async def test_direct_memory_id_keeps_acl_authorized_group_event_time(self) -> None:
+        service = self.make_service()
+        await self.insert_indexed(service, self.summary_memory())
+        await service.store.upsert_acl_rule(
+            owner_scope="private",
+            owner_id="u1",
+            reader_scope="group",
+            reader_id="g1",
+            effect="allow",
+        )
+        group_ctx = self.group_context(message_id="group-time-msg")
+        group_ctx.message_text = "昨天的咖啡是几点？"
+        service.identity.resolve_event_context = AsyncMock(return_value=group_ctx)
+
+        result = await service.tool_navigate(
+            SimpleNamespace(),
+            "event_time",
+            memory_ids=["summary-1"],
+        )
+
+        self.assertEqual("evidence_found", result["status"])
+        self.assertEqual(["summary-1"], [item["memory_id"] for item in result["evidence"]])
+
+    async def test_navigation_evidence_redacts_sensitive_content_and_graph_hints(self) -> None:
+        service = self.make_service()
+        record = self.summary_memory()
+        record.content = "密码是 super-secret-123456789。"
+        record.evidence = "password: super-secret-123456789"
+        record.metadata["canonical_summary"] = "token: abcdefghijklmnop"
+        record.metadata["associations"][0]["content"] = "api key: abcdefghijklmnop"
+        await self.insert_indexed(service, record)
+        service.identity.resolve_event_context = AsyncMock(return_value=self.private_context(message_id="redact-msg"))
+
+        result = await service.tool_navigate(
+            SimpleNamespace(),
+            "tag_events",
+            cue="午后咖啡",
+            tag="饮食偏好",
+        )
+
+        serialized = str(result)
+        for secret in ("super-secret-123456789", "abcdefghijklmnop"):
+            self.assertNotIn(secret, serialized)
+        self.assertIn("[已隐藏]", serialized)
+
+    async def test_navigation_output_keeps_hints_within_step_budget(self) -> None:
+        service = self.make_service()
+        record = self.summary_memory()
+        item = SearchResult(
+            memory=record,
+            score=1.0,
+        )
+        paths = [
+            {
+                "source_type": "cue",
+                "source_label": f"线索-{index}",
+                "target_type": "memory",
+                "target_label": "摘要",
+                "relation_type": "associated_with",
+                "evidence": f"证据-{index}",
+                "edge_metadata": {"associative_tag": "标签", "content_layer": "semantic"},
+            }
+            for index in range(8)
+        ]
+
+        payload = service._serialize_navigation_evidence(item, action="tag_events", paths=paths)
+
+        self.assertLessEqual(len(payload.get("associations", [])), 1)
 
     async def test_duplicate_and_step_budget_do_not_replay_evidence(self) -> None:
         service = self.make_service()

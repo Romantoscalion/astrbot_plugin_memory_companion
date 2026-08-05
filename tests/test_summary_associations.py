@@ -78,6 +78,32 @@ class SummaryAssociationTests(unittest.IsolatedAsyncioTestCase):
             result["associations"],
         )
 
+    async def test_complete_association_rich_json_is_not_truncated_before_parse(self) -> None:
+        payload = {
+            "summary": "我记得小王在这段对话里反复提到无糖拿铁。" * 20,
+            "canonical_summary": "小王偏好无糖拿铁。" * 20,
+            "associations": [
+                {
+                    "cue": f"线索 {index} " + "甲" * 70,
+                    "tag": "饮食偏好 " + "乙" * 70,
+                    "content": f"小王在对话中提到无糖拿铁 {index}。" + "丙" * 220,
+                    "layer": "semantic",
+                }
+                for index in range(12)
+            ],
+        }
+        provider = _CapturingProvider(payload)
+        summarizer = MemorySummarizer(provider_timeout_seconds=1)
+
+        result = await summarizer.summarize_with_provider(
+            provider,
+            rows=self.rows(),
+            session_label="私聊 小王",
+        )
+
+        self.assertEqual(MemorySummarizer.MAX_ASSOCIATIONS, len(result["associations"]))
+        self.assertGreater(len(json.dumps(payload, ensure_ascii=False)), 2400)
+
     def test_normalization_cleans_relative_time_and_deduplicates(self) -> None:
         summarizer = MemorySummarizer()
         payload = {

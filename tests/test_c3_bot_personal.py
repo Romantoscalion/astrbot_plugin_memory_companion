@@ -6,7 +6,11 @@ import tempfile
 
 from core.bot_personal_consumer import BotPersonalConsumer
 from core.bot_personal_contract import BOT_PERSONAL_MEMORY_DOMAIN, BOT_PERSONAL_MEMORY_TYPES, TYPE_CONTRACTS, WINDOW_SLUGS
-from core.bot_personal_dto import BotPersonalValidationError, build_bot_personal_archive
+from core.bot_personal_dto import (
+    BOT_PERSONAL_MAX_RECORD_VERSION,
+    BotPersonalValidationError,
+    build_bot_personal_archive,
+)
 from core.bridge import MemoryCompanionBridge
 from core.models import MemoryRecord
 from core.service import MemoryCompanionService
@@ -54,6 +58,19 @@ def test_contract_windows_and_types_are_imported_from_single_contract():
     assert dto.window in WINDOW_SLUGS
     assert dto.source_kind == TYPE_CONTRACTS[dto.memory_type][0]
     assert dto.evidence_level == TYPE_CONTRACTS[dto.memory_type][1]
+
+
+def test_archive_version_has_a_bounded_semantic_range():
+    at_limit = build_bot_personal_archive(envelope(version=BOT_PERSONAL_MAX_RECORD_VERSION))
+    assert at_limit.version == BOT_PERSONAL_MAX_RECORD_VERSION
+
+    try:
+        build_bot_personal_archive(envelope(version=BOT_PERSONAL_MAX_RECORD_VERSION + 1))
+    except BotPersonalValidationError as exc:
+        assert exc.error_code == "invalid"
+        assert exc.field == "version"
+    else:
+        raise AssertionError("out-of-range archive version was accepted")
 
 
 def test_privacy_rejects_raw_prompt_credentials_binary_path_and_unsafe_key():
@@ -108,8 +125,8 @@ def test_service_success_idempotency_version_conflict_and_stale(tmp_path):
 
 def test_bridge_missing_or_exception_degrades_and_consumer_dead_letters():
     missing = run(MemoryCompanionBridge(object()).record_bot_personal_archive(envelope()))
-    assert missing["state"] == "degraded"
-    assert missing["error_code"] == "bridge_method_unavailable"
+    assert missing["state"] == "forbidden"
+    assert missing["error_code"] == "producer_capability_required"
 
     class Broken:
         async def record_bot_personal_archive(self, _envelope):

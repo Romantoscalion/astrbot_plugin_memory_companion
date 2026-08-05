@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
+import secrets
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,113 +23,141 @@ _PRIVATE_COMPANION_ROOT = "astrbot_plugin_private_companion"
 _PRIVATE_COMPANION_NAMES = {"PrivateCompanion", "private_companion"}
 _EMOTION_INGRESS_ORIGINS = {"interaction", "system_condition"}
 _EMOTION_DELIVERY_CONSUMER = "private_companion.daily_state"
+_COMPANION_PROJECTION_SECRET = secrets.token_bytes(32)
 
 
-class _EmotionProducerCapability:
-    """Non-serializable capability bound to one live Companion plugin instance."""
-
-    __slots__ = ("_bridge", "_producer", "_token")
-
-    def __init__(self, bridge: Any, producer: Any, token: object) -> None:
-        self._bridge = bridge
-        self._producer = producer
-        self._token = token
-
-
-class _EmotionPageAdminCapability:
-    """Non-serializable capability bound to this bridge's Page API instance."""
-
-    __slots__ = ("_bridge", "_page_api", "_token")
-
-    def __init__(self, bridge: Any, page_api: Any, token: object) -> None:
-        self._bridge = bridge
-        self._page_api = page_api
-        self._token = token
-
-
-class _EmotionProducerContext:
-    """Opaque, scoped authorization context for Companion emotion ingress."""
-
-    __slots__ = ("_bridge", "_capability", "bot_id", "platform", "scope", "session_id", "user_id")
-
-    def __init__(
-        self,
-        bridge: Any,
-        capability: _EmotionProducerCapability,
-        *,
-        bot_id: str,
-        platform: str,
-        scope: str,
-        session_id: str,
-        user_id: str,
-    ) -> None:
-        self._bridge = bridge
-        self._capability = capability
-        self.bot_id = bot_id
-        self.platform = platform
-        self.scope = scope
-        self.session_id = session_id
-        self.user_id = user_id
-
-
-class _EmotionDeliveryContext:
-    """Opaque, scoped authorization context for afterglow delivery and ack."""
+class _AuthenticatedCompanionProjection(dict):
+    """Signed request-scoped dict accepted only after bridge attestation."""
 
     __slots__ = (
-        "_bridge",
-        "_capability",
-        "allow_cross_window",
-        "bot_id",
-        "consumer_id",
-        "platform",
-        "scope",
-        "session_id",
-        "user_id",
+        "_bot_id",
+        "_kind",
+        "_person_id",
+        "_platform",
+        "_scope",
+        "_session_id",
+        "_signature",
     )
 
     def __init__(
         self,
-        bridge: Any,
-        capability: _EmotionProducerCapability,
+        payload: dict[str, Any],
         *,
-        allow_cross_window: bool,
+        kind: str,
         bot_id: str,
-        consumer_id: str,
         platform: str,
+        person_id: str,
         scope: str,
         session_id: str,
-        user_id: str,
+        signature: str,
     ) -> None:
-        self._bridge = bridge
-        self._capability = capability
-        self.allow_cross_window = allow_cross_window
-        self.bot_id = bot_id
-        self.consumer_id = consumer_id
-        self.platform = platform
-        self.scope = scope
-        self.session_id = session_id
-        self.user_id = user_id
+        dict.__init__(self, payload)
+        object.__setattr__(self, "_kind", kind)
+        object.__setattr__(self, "_bot_id", bot_id)
+        object.__setattr__(self, "_platform", platform)
+        object.__setattr__(self, "_person_id", person_id)
+        object.__setattr__(self, "_scope", scope)
+        object.__setattr__(self, "_session_id", session_id)
+        object.__setattr__(self, "_signature", signature)
+
+    @staticmethod
+    def _immutable(*_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("authenticated Companion projections are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __setattr__ = _immutable
+    __delattr__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
 
 
+def _companion_projection_signature(
+    payload: dict[str, Any],
+    *,
+    kind: str,
+    bot_id: str,
+    platform: str,
+    person_id: str,
+    scope: str,
+    session_id: str,
+) -> str:
+    body = json.dumps(
+        {
+            "kind": kind,
+            "bot_id": bot_id,
+            "platform": platform,
+            "person_id": person_id,
+            "scope": scope,
+            "session_id": session_id,
+            "payload": payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(_COMPANION_PROJECTION_SECRET, body, hashlib.sha256).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class _EmotionProducerCapability:
+    """Non-serializable capability bound to one live Companion plugin instance."""
+
+    _bridge: Any
+    _producer: Any
+    _token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _EmotionPageAdminCapability:
+    """Non-serializable capability bound to this bridge's Page API instance."""
+
+    _bridge: Any
+    _page_api: Any
+    _token: object
+
+
+@dataclass(frozen=True, slots=True)
+class _EmotionProducerContext:
+    """Opaque, scoped authorization context for Companion emotion ingress."""
+
+    _bridge: Any
+    _capability: _EmotionProducerCapability
+    bot_id: str
+    platform: str
+    scope: str
+    session_id: str
+    user_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _EmotionDeliveryContext:
+    """Opaque, scoped authorization context for afterglow delivery and ack."""
+
+    _bridge: Any
+    _capability: _EmotionProducerCapability
+    allow_cross_window: bool
+    bot_id: str
+    consumer_id: str
+    platform: str
+    scope: str
+    session_id: str
+    user_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class _EmotionAdminContext:
     """Opaque, scoped authorization context for redacted admin diagnostics."""
 
-    __slots__ = ("_bridge", "_capability", "bot_id", "scope", "session_id")
-
-    def __init__(
-        self,
-        bridge: Any,
-        capability: _EmotionPageAdminCapability,
-        *,
-        bot_id: str,
-        scope: str,
-        session_id: str,
-    ) -> None:
-        self._bridge = bridge
-        self._capability = capability
-        self.bot_id = bot_id
-        self.scope = scope
-        self.session_id = session_id
+    _bridge: Any
+    _capability: _EmotionPageAdminCapability
+    bot_id: str
+    scope: str
+    session_id: str
 
 _COMPANION_RELATIONSHIP_PHASES = {
     "deeply_distant",
@@ -249,6 +282,7 @@ def sanitize_companion_expression_decision(value: Any) -> dict[str, Any]:
             "safety_mode": safety_mode,
             "blocker": blocker,
             "reason_codes": list(reason_codes),
+            "followup": value["followup"],
             **dimensions,
         },
     }
@@ -328,6 +362,69 @@ def sanitize_companion_relationship_projection(value: Any) -> dict[str, Any]:
     return {"status": "accepted", "read_only": True, "projection": projection}
 
 
+def consume_authenticated_companion_projection(
+    value: Any,
+    *,
+    kind: str,
+    expected_person_id: str = "",
+    expected_scope: str = "",
+    expected_session_id: str = "",
+    expected_platform: str = "",
+    expected_bot_id: str = "",
+) -> dict[str, Any]:
+    """Verify a bridge-sealed projection and then apply its schema sanitizer."""
+
+    fallback = {"status": "invalid", "read_only": True}
+    if type(value) is not _AuthenticatedCompanionProjection:
+        return {**fallback, "error_code": "projection_attestation_required"}
+    attrs = {
+        "person_id": value._person_id,
+        "scope": value._scope,
+        "session_id": value._session_id,
+        "platform": value._platform,
+        "bot_id": value._bot_id,
+    }
+    expected = {
+        "person_id": clean_text(expected_person_id, 160),
+        "scope": clean_text(expected_scope, 24).lower(),
+        "session_id": clean_text(expected_session_id, 220),
+        "platform": clean_text(expected_platform, 80),
+        "bot_id": clean_text(expected_bot_id, 160),
+    }
+    for key, expected_value in expected.items():
+        if expected_value and attrs[key] != expected_value:
+            return {**fallback, "error_code": f"projection_{key}_mismatch"}
+    if (
+        not attrs["person_id"]
+        or attrs["scope"] != "private"
+        or not attrs["session_id"]
+        or not attrs["platform"]
+        or not attrs["bot_id"]
+        or not attrs["session_id"].startswith(f"{attrs['platform']}:")
+        or value._kind != kind
+    ):
+        return {**fallback, "error_code": "projection_domain_invalid"}
+    try:
+        expected_signature = _companion_projection_signature(
+            dict(value),
+            kind=value._kind,
+            bot_id=attrs["bot_id"],
+            platform=attrs["platform"],
+            person_id=attrs["person_id"],
+            scope=attrs["scope"],
+            session_id=attrs["session_id"],
+        )
+    except (TypeError, ValueError, OverflowError):
+        return {**fallback, "error_code": "projection_signature_invalid"}
+    if not hmac.compare_digest(expected_signature, value._signature):
+        return {**fallback, "error_code": "projection_signature_invalid"}
+    if kind == "relationship":
+        return sanitize_companion_relationship_projection(dict(value))
+    if kind == "expression":
+        return sanitize_companion_expression_decision(dict(value))
+    return {**fallback, "error_code": "projection_kind_invalid"}
+
+
 def _local_time_label(value: Any) -> str:
     text = clean_text(value, 80)
     if not text:
@@ -361,6 +458,16 @@ class MemoryCompanionBridge:
         if not self._is_registered_private_companion(producer):
             return None
         return _EmotionProducerCapability(self, producer, self._emotion_producer_token)
+
+    def register_private_companion(self, producer: Any) -> Any | None:
+        """Issue the shared producer capability used by protected Companion APIs."""
+
+        return self.register_emotion_producer(producer)
+
+    def register_bot_personal_producer(self, producer: Any) -> Any | None:
+        """Compatibility name for the same scoped Private Companion capability."""
+
+        return self.register_emotion_producer(producer)
 
     def create_emotion_producer_context(
         self,
@@ -406,6 +513,8 @@ class MemoryCompanionBridge:
         if clean_text(consumer_id, 80) != _EMOTION_DELIVERY_CONSUMER:
             return None
         if type(allow_cross_window) is not bool:
+            return None
+        if allow_cross_window and not self._cross_window_emotion_enabled():
             return None
         normalized = self._normalize_emotion_domain(
             bot_id=bot_id,
@@ -469,7 +578,23 @@ class MemoryCompanionBridge:
         if not isinstance(stars, (list, tuple)):
             return False
         for metadata in stars:
-            if getattr(metadata, "star_cls", None) is not producer:
+            registered_instance = getattr(metadata, "star_cls", None)
+            registered_type = getattr(metadata, "star_cls_type", None)
+            # AstrBot's StarMetadata stores the live plugin object in
+            # ``star_cls`` and its class in ``star_cls_type``.  Companion's
+            # adapter registers ``type(self)``; accept that exact class only
+            # when it is paired with the exact live instance.  Keep the
+            # instance form for older adapters, but never fall back to names
+            # or ``isinstance`` checks.
+            producer_matches = producer is registered_instance
+            if producer is registered_type:
+                producer_matches = (
+                    registered_instance is not None
+                    and type(registered_instance) is registered_type
+                )
+            elif producer_matches and registered_type is not None:
+                producer_matches = type(registered_instance) is registered_type
+            if not producer_matches:
                 continue
             if getattr(metadata, "activated", True) is not True:
                 continue
@@ -486,6 +611,29 @@ class MemoryCompanionBridge:
             and capability._token is self._emotion_producer_token
             and self._is_registered_private_companion(capability._producer)
         )
+
+    def _producer_capability_from(self, value: Any) -> Any:
+        if type(value) in {_EmotionProducerContext, _EmotionDeliveryContext}:
+            return value._capability
+        return value
+
+    def _is_valid_private_companion_capability(self, value: Any) -> bool:
+        return self._is_valid_emotion_producer_capability(
+            self._producer_capability_from(value)
+        )
+
+    def _cross_window_emotion_enabled(self) -> bool:
+        config = getattr(self._plugin, "config", None)
+        getter = getattr(config, "bool", None)
+        if not callable(getter):
+            return False
+        try:
+            return getter(
+                "private_companion_bridge.cross_window_emotional_continuity_enabled",
+                False,
+            ) is True
+        except Exception:
+            return False
 
     def _is_valid_emotion_page_admin_capability(self, capability: Any) -> bool:
         return (
@@ -516,6 +664,8 @@ class MemoryCompanionBridge:
         }
         if not all(normalized.values()) or normalized["scope"] != "private":
             return None
+        if not normalized["session_id"].startswith(f"{normalized['platform']}:"):
+            return None
         return normalized
 
     def _is_valid_emotion_producer_context(self, context: Any) -> bool:
@@ -539,6 +689,7 @@ class MemoryCompanionBridge:
             and self._is_valid_emotion_producer_capability(context._capability)
             and context.consumer_id == _EMOTION_DELIVERY_CONSUMER
             and type(context.allow_cross_window) is bool
+            and (not context.allow_cross_window or self._cross_window_emotion_enabled())
             and self._normalize_emotion_domain(
                 bot_id=context.bot_id,
                 scope=context.scope,
@@ -558,9 +709,140 @@ class MemoryCompanionBridge:
             and bool(clean_text(context.session_id, 220))
         )
 
-    def consume_relationship_projection(self, projection: Any) -> dict[str, Any]:
-        """Validate a read-only Companion relationship projection without persisting it."""
-        return sanitize_companion_relationship_projection(projection)
+    def _seal_companion_projection(
+        self,
+        projection: Any,
+        *,
+        kind: str,
+        capability: Any,
+        bot_id: Any,
+        platform: Any,
+        user_id: Any,
+        scope: Any,
+        session_id: Any,
+    ) -> dict[str, Any]:
+        if not self._is_valid_private_companion_capability(capability):
+            return {"status": "invalid", "read_only": True, "error_code": "producer_capability_required"}
+        if type(capability) is _EmotionProducerContext:
+            bound = {
+                "bot_id": capability.bot_id,
+                "platform": capability.platform,
+                "user_id": capability.user_id,
+                "scope": capability.scope,
+                "session_id": capability.session_id,
+            }
+            supplied = {
+                "bot_id": clean_text(bot_id, 160),
+                "platform": clean_text(platform, 80),
+                "user_id": clean_text(user_id, 160),
+                "scope": clean_text(scope, 24).lower(),
+                "session_id": clean_text(session_id, 220),
+            }
+            if any(supplied[key] and supplied[key] != bound[key] for key in supplied):
+                return {"status": "invalid", "read_only": True, "error_code": "projection_context_mismatch"}
+            bot_id = bound["bot_id"]
+            platform = bound["platform"]
+            user_id = bound["user_id"]
+            scope = bound["scope"]
+            session_id = bound["session_id"]
+        domain = self._normalize_emotion_domain(
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if domain is None:
+            return {"status": "invalid", "read_only": True, "error_code": "projection_domain_invalid"}
+        sanitizer = (
+            sanitize_companion_relationship_projection
+            if kind == "relationship"
+            else sanitize_companion_expression_decision
+        )
+        consumed = sanitizer(projection)
+        if consumed.get("status") != "accepted":
+            return consumed
+        key = "projection" if kind == "relationship" else "decision"
+        payload = consumed.get(key)
+        if not isinstance(payload, dict):
+            return {"status": "invalid", "read_only": True, "error_code": "projection_payload_invalid"}
+        signature = _companion_projection_signature(
+            payload,
+            kind=kind,
+            bot_id=domain["bot_id"],
+            platform=domain["platform"],
+            person_id=domain["user_id"],
+            scope=domain["scope"],
+            session_id=domain["session_id"],
+        )
+        sealed = _AuthenticatedCompanionProjection(
+            payload,
+            kind=kind,
+            bot_id=domain["bot_id"],
+            platform=domain["platform"],
+            person_id=domain["user_id"],
+            scope=domain["scope"],
+            session_id=domain["session_id"],
+            signature=signature,
+        )
+        return {"status": "accepted", "read_only": True, key: sealed}
+
+    def consume_relationship_projection(
+        self,
+        projection: Any,
+        *,
+        producer_capability: Any = None,
+        producer_context: Any = None,
+        bot_id: str = "",
+        platform: str = "",
+        user_id: str = "",
+        scope: str = "private",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """Validate and seal a Companion relationship projection for one request."""
+
+        authority = producer_capability if producer_capability is not None else producer_context
+        return self._seal_companion_projection(
+            projection,
+            kind="relationship",
+            capability=authority,
+            bot_id=bot_id,
+            platform=platform,
+            user_id=user_id,
+            scope=scope,
+            session_id=session_id,
+        )
+
+    def consume_expression_decision(
+        self,
+        decision: Any,
+        *,
+        producer_capability: Any = None,
+        producer_context: Any = None,
+        bot_id: str = "",
+        platform: str = "",
+        user_id: str = "",
+        scope: str = "private",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """Validate and seal a Companion expression decision for one request."""
+
+        authority = producer_capability if producer_capability is not None else producer_context
+        return self._seal_companion_projection(
+            decision,
+            kind="expression",
+            capability=authority,
+            bot_id=bot_id,
+            platform=platform,
+            user_id=user_id,
+            scope=scope,
+            session_id=session_id,
+        )
+
+    def create_user_memory_context(self, capability: Any, **kwargs: Any) -> Any | None:
+        """Name the scoped context explicitly for user-summary consumers."""
+
+        return self.create_emotion_producer_context(capability, **kwargs)
 
     async def record_event(
         self,
@@ -754,7 +1036,13 @@ class MemoryCompanionBridge:
         kwargs.setdefault("importance", 0.45)
         return await self.record_event(content=content, **kwargs)
 
-    async def record_bot_personal_archive(self, envelope: BotPersonalArchiveDTO | dict[str, Any]) -> dict[str, Any]:
+    async def record_bot_personal_archive(
+        self,
+        envelope: BotPersonalArchiveDTO | dict[str, Any],
+        *,
+        producer_capability: Any = None,
+        producer_context: Any = None,
+    ) -> dict[str, Any]:
         """Send one validated Bot Personal archive envelope without leaking failures."""
         base = {
             "ok": False,
@@ -764,6 +1052,9 @@ class MemoryCompanionBridge:
             "error_code": None,
             "state": "degraded",
         }
+        authority = producer_capability if producer_capability is not None else producer_context
+        if not self._is_valid_private_companion_capability(authority):
+            return {**base, "state": "forbidden", "error_code": "producer_capability_required"}
         try:
             dto = build_bot_personal_archive(envelope)
         except Exception as exc:
@@ -793,7 +1084,15 @@ class MemoryCompanionBridge:
             normalized["state"] = "degraded"
         return normalized
 
-    async def record_bot_personal_memory(self, *, memory_type: str, payload: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+    async def record_bot_personal_memory(
+        self,
+        *,
+        memory_type: str,
+        payload: dict[str, Any] | None = None,
+        producer_capability: Any = None,
+        producer_context: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Compatibility alias that still crosses the structured archive boundary."""
         try:
             envelope = build_bot_personal_archive(memory_type=memory_type, payload=payload or {}, **kwargs)
@@ -802,7 +1101,11 @@ class MemoryCompanionBridge:
                 "ok": False, "record_id": "", "deduplicated": False, "version": 0,
                 "error_code": getattr(exc, "error_code", "invalid"), "state": "invalid",
             }
-        return await self.record_bot_personal_archive(envelope)
+        return await self.record_bot_personal_archive(
+            envelope,
+            producer_capability=producer_capability,
+            producer_context=producer_context,
+        )
 
     async def read_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
         """Read only safe Bot Personal summaries; never return archive payloads."""
@@ -842,6 +1145,7 @@ class MemoryCompanionBridge:
         *,
         session_id: str = "",
         limit: int = 6,
+        requester_context: Any = None,
     ) -> dict[str, Any]:
         """Read a strict, exact-user Memory summary without exposing memory text."""
 
@@ -862,6 +1166,32 @@ class MemoryCompanionBridge:
         }
         if not identity:
             return {**base, "error_code": "missing_user_id"}
+        if not self._is_valid_emotion_producer_context(requester_context):
+            return {
+                **base,
+                "state": "forbidden",
+                "degraded": False,
+                "pending": False,
+                "error_code": "requester_context_required",
+            }
+        if requester_context.user_id != identity:
+            return {
+                **base,
+                "state": "forbidden",
+                "degraded": False,
+                "pending": False,
+                "error_code": "requester_identity_mismatch",
+            }
+        if safe_session and requester_context.session_id != safe_session:
+            return {
+                **base,
+                "state": "forbidden",
+                "degraded": False,
+                "pending": False,
+                "error_code": "requester_session_mismatch",
+            }
+        safe_session = requester_context.session_id
+        base["session_id"] = safe_session
         try:
             getter = getattr(self._plugin, "read_user_memory_summary", None)
         except Exception:
@@ -928,6 +1258,8 @@ class MemoryCompanionBridge:
         current_date: str = "",
         current_window: str = "",
         authorized: bool = False,
+        producer_capability: Any = None,
+        producer_context: Any = None,
     ) -> dict[str, Any]:
         """Read a C4 Bot Profile through a privacy-limited bridge boundary."""
 
@@ -941,6 +1273,18 @@ class MemoryCompanionBridge:
             "items": [],
             "warnings": [],
         }
+        authority = producer_capability if producer_capability is not None else producer_context
+        locked_authorized = self._is_valid_private_companion_capability(authority)
+        if base["profile"] == "locked_frame_personal" and not locked_authorized:
+            return {
+                **base,
+                "state": "forbidden",
+                "degraded": False,
+                "pending": False,
+                "warnings": ["authorization_required"],
+                "error_code": "producer_capability_required",
+            }
+        _ = authorized
         try:
             getter = getattr(self._plugin, "read_bot_profile", None)
         except Exception:
@@ -954,7 +1298,7 @@ class MemoryCompanionBridge:
                 limit=limit,
                 current_date=current_date,
                 current_window=current_window,
-                authorized=authorized,
+                authorized=locked_authorized,
             )
         except Exception:
             return {**base, "error_code": "bridge_exception"}
@@ -1299,6 +1643,9 @@ class MemoryCompanionBridge:
             [
                 "record_event",
                 "record_visible_turn",
+                "register_private_companion",
+                "register_bot_personal_producer",
+                "create_user_memory_context",
                 "record_bot_personal_archive",
                 "record_bot_personal_memory",
                 "read_bot_personal_profile",
@@ -1310,6 +1657,8 @@ class MemoryCompanionBridge:
                 "recall",
                 "consume_person_projection",
                 "consume_context_projection",
+                "consume_relationship_projection",
+                "consume_expression_decision",
                 "read_bot_profile",
                 "read_profile",
                 "p5_capability_status",
@@ -1448,9 +1797,19 @@ class MemoryCompanionBridge:
         return await self._plugin.store.update_memory_visibility(memory_id, visibility)
 
     def get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
-        """Deprecated unscoped API; callers must migrate to a capability context."""
-        _ = (session_id, limit)
-        return []
+        """Temporary exact-window compatibility path for pre-capability callers."""
+
+        safe_session = clean_text(session_id, 220)
+        if not safe_session or ":" not in safe_session:
+            return []
+        getter = getattr(self._plugin, "bridge_get_emotional_events", None)
+        if not callable(getter):
+            return []
+        try:
+            events = getter(session_id=safe_session, limit=limit)
+        except Exception:
+            return []
+        return events if isinstance(events, list) else []
 
     async def list_emotion_events(
         self,
@@ -1727,9 +2086,17 @@ class MemoryCompanionBridge:
         window_seconds: float = 1800.0,
         limit: int = 5,
     ) -> dict[str, Any]:
-        """Deprecated unscoped aggregate; opaque delivery contexts are required."""
+        """Explain why the identity-free cross-window aggregate is unavailable."""
         _ = (exclude_session_id, window_seconds, limit)
-        return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
+        return {
+            "enabled": False,
+            "state": "migration_required",
+            "error_code": "delivery_context_required",
+            "total": 0,
+            "scar_count": 0,
+            "warm_count": 0,
+            "vulnerable_count": 0,
+        }
 
     def _entity(self, payload: dict[str, Any]) -> EntityRef:
         return EntityRef(

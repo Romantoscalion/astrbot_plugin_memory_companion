@@ -25,8 +25,7 @@ from .astrbot_compat import (
     sanitize_request_history,
 )
 from .bridge import (
-    sanitize_companion_expression_decision,
-    sanitize_companion_relationship_projection,
+    consume_authenticated_companion_projection,
     serialize_memory,
 )
 from .bot_personal_dto import (
@@ -825,7 +824,15 @@ class MemoryCompanionService:
                     break
             if raw_projection is not None:
                 break
-        consumed = sanitize_companion_relationship_projection(raw_projection)
+        consumed = consume_authenticated_companion_projection(
+            raw_projection,
+            kind="relationship",
+            expected_person_id=ctx.user_id,
+            expected_scope=ctx.scope,
+            expected_session_id=ctx.session_id,
+            expected_platform=ctx.platform,
+            expected_bot_id=ctx.bot_id,
+        )
         projection = consumed.get("projection") if isinstance(consumed, dict) else None
         if not isinstance(projection, dict):
             return
@@ -866,7 +873,15 @@ class MemoryCompanionService:
             if candidate is not None:
                 raw_decision = candidate
                 break
-        consumed = sanitize_companion_expression_decision(raw_decision)
+        consumed = consume_authenticated_companion_projection(
+            raw_decision,
+            kind="expression",
+            expected_person_id=ctx.user_id,
+            expected_scope=ctx.scope,
+            expected_session_id=ctx.session_id,
+            expected_platform=ctx.platform,
+            expected_bot_id=ctx.bot_id,
+        )
         decision = consumed.get("decision") if isinstance(consumed, dict) else None
         if not isinstance(decision, dict):
             return
@@ -1718,9 +1733,55 @@ class MemoryCompanionService:
         return injection
 
     def bridge_get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
-        """Deprecated unscoped read path; opaque delivery contexts own event consumption."""
-        _ = (session_id, limit)
-        return []
+        """Consume a redacted exact-window queue during the capability migration."""
+
+        try:
+            compatibility_enabled = self.config.bool(
+                "private_companion_bridge.legacy_emotion_compatibility_enabled",
+                True,
+            )
+        except Exception:
+            compatibility_enabled = False
+        if compatibility_enabled is not True:
+            return []
+        safe_session = clean_text(session_id, 220)
+        if not safe_session or ":" not in safe_session:
+            return []
+        try:
+            bounded_limit = max(1, min(20, int(limit or 5)))
+        except (TypeError, ValueError):
+            bounded_limit = 5
+        now = time.time()
+        queue = self._emotional_event_queue.get(safe_session, [])
+        fresh: list[dict[str, Any]] = []
+        for item in queue:
+            if not isinstance(item, dict):
+                continue
+            try:
+                age = now - float(item.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= age < self._EMOTIONAL_EVENT_TTL:
+                fresh.append(item)
+        self._emotional_event_queue[safe_session] = fresh
+        selected = sorted(fresh, key=lambda item: float(item.get("ts") or 0.0), reverse=True)[:bounded_limit]
+        consumed = {clean_text(item.get("id") or item.get("event_id"), 96) for item in selected}
+        if consumed:
+            self._emotional_event_queue[safe_session] = [
+                item
+                for item in fresh
+                if clean_text(item.get("id") or item.get("event_id"), 96) not in consumed
+            ]
+        return [
+            {
+                "id": clean_text(item.get("id") or item.get("event_id"), 96),
+                "event_type": clean_text(item.get("event_type"), 48),
+                "energy_delta": float(item.get("energy_delta") or item.get("applied_energy_delta") or 0.0),
+                "mood_hint": clean_text(item.get("mood_hint"), 40),
+                "ts": float(item.get("ts") or 0.0),
+            }
+            for item in selected
+        ]
 
     async def bridge_search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
@@ -1959,6 +2020,8 @@ class MemoryCompanionService:
         _ = (exclude_session_id, window_seconds, limit)
         return {
             "enabled": False,
+            "state": "migration_required",
+            "error_code": "delivery_context_required",
             "total": 0,
             "scar_count": 0,
             "warm_count": 0,
@@ -4454,7 +4517,15 @@ class MemoryCompanionService:
         if memory_ids:
             current = await self.store.get_memories_by_ids(memory_ids)
             candidates = [current[memory_id] for memory_id in memory_ids if memory_id in current]
-            visible = await self._filter_navigation_results(ctx, candidates)
+            # A caller-supplied ID is an explicit relevance signal. Keep the
+            # normal visibility/ACL check, but do not let the generic route
+            # reason make an otherwise visible second-hop record look
+            # unrelated and get discarded by the group actor guard.
+            visible = await self._filter_navigation_results(
+                ctx,
+                candidates,
+                relevance_reason="direct_memory_id;exact=1;hits=1",
+            )
         else:
             scan_limit = min(self._reconstruction_scan_limit(), max(per_step_limit * 4, per_step_limit))
             time_intent = parse_time_intent(query)
@@ -4542,9 +4613,9 @@ class MemoryCompanionService:
                 hint = self._navigation_hint(memory_id, path)
                 if hint and hint not in hints:
                     hints.append(hint)
-                if len(hints) >= per_step_limit * 3:
+                if len(hints) >= per_step_limit:
                     break
-            if len(hints) >= per_step_limit * 3:
+            if len(hints) >= per_step_limit:
                 break
         return evidence, hints
 
@@ -4617,7 +4688,7 @@ class MemoryCompanionService:
         payload: dict[str, Any] = {
             "memory_id": memory.id,
             "memory_type": memory.memory_type,
-            "content": clean_text(memory.content, 1200),
+            "content": self._navigation_safe_text(memory.content, 1200),
             "reality_level": memory.reality_level,
             "confidence": memory.confidence,
             "occurred_at": memory.occurred_at,
@@ -4631,26 +4702,35 @@ class MemoryCompanionService:
             },
             "subject": {
                 "id": clean_text(memory.subject.id, 120),
-                "name": clean_text(memory.subject.name, 80),
+                "name": self._navigation_safe_text(memory.subject.name, 80),
             },
             "object": {
                 "id": clean_text(memory.object.id, 120),
-                "name": clean_text(memory.object.name, 80),
+                "name": self._navigation_safe_text(memory.object.name, 80),
             },
         }
         if action == "event_context":
-            payload["evidence_preview"] = clean_text(memory.evidence, 1000)
-            payload["canonical_summary"] = clean_text(metadata.get("canonical_summary"), 600)
+            payload["evidence_preview"] = self._navigation_safe_text(memory.evidence, 1000)
+            payload["canonical_summary"] = self._navigation_safe_text(metadata.get("canonical_summary"), 600)
         association_hints: list[dict[str, str]] = []
         for path in paths or []:
             hint = self._navigation_hint(memory.id, path)
             if hint and hint not in association_hints:
                 association_hints.append(hint)
-            if len(association_hints) >= 4:
+            # Top-level hints already carry the next-hop choices. Keep one
+            # compact association on each evidence item so a step's output
+            # remains proportional to ``per_step_limit`` instead of repeating
+            # the whole graph on every candidate.
+            if len(association_hints) >= 1:
                 break
         if association_hints:
             payload["associations"] = association_hints
         return payload
+
+    def _navigation_safe_text(self, value: Any, limit: int) -> str:
+        """Reuse the injection redactor for every text-bearing navigation field."""
+        redacted = self.injection._redact_sensitive_text(value)
+        return clean_text(redacted, limit)
 
     @staticmethod
     def _navigation_hint(memory_id: str, path: dict[str, Any]) -> dict[str, str]:
@@ -4664,8 +4744,11 @@ class MemoryCompanionService:
             cue = clean_text(path.get("target_label"), 160)
         if not cue:
             cue = clean_text(path.get("source_label") or path.get("target_label"), 160)
-        tag = clean_text(metadata.get("associative_tag") or path.get("relation_type"), 80)
-        content = clean_text(path.get("evidence"), 240)
+        cue = InjectionComposer._redact_sensitive_text(cue)
+        tag = InjectionComposer._redact_sensitive_text(
+            clean_text(metadata.get("associative_tag") or path.get("relation_type"), 80)
+        )
+        content = InjectionComposer._redact_sensitive_text(clean_text(path.get("evidence"), 240))
         layer = clean_text(metadata.get("content_layer"), 24)
         if not (cue or tag or content):
             return {}
@@ -7352,18 +7435,26 @@ class MemoryCompanionService:
         return any(re.search(pattern, compact) for pattern in patterns)
 
     @staticmethod
-    def _message_targets_bot_personal_schedule(
+    def _schedule_query_owner(
         text: str,
         *,
         bot_id: str = "",
         allow_implicit_temporal: bool = False,
-    ) -> bool:
+    ) -> str:
+        """Return the structured owner of a personal-schedule question.
+
+        This is deliberately a positive grammar rather than a list of topics to
+        reject.  A schedule overflow is only useful when the query identifies a
+        Bot-owned plan, or is the short conversational form of a personal status
+        question (for example, ``明天有空吗``).  Generic schedule nouns remain
+        ordinary retrieval candidates.
+        """
         compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
         if not compact or len(compact) > 80:
-            return False
+            return ""
 
-        bot_tokens = ["你", "您", "bot"]
         normalized_bot_id = clean_text(bot_id, 120).lower()
+        bot_tokens = ["你", "您", "bot"]
         if normalized_bot_id and normalized_bot_id not in {"self", "bot"}:
             bot_tokens.append(normalized_bot_id)
         bot_pattern = "(?:" + "|".join(
@@ -7373,47 +7464,151 @@ class MemoryCompanionService:
             r"(?:今天|今日|昨天|昨日|前天|明天|后天|今晚|明早|明晚|现在|当前|目前|"
             r"最近|本周|这周|这一周|下周|周末|这周末|本月|下个月)"
         )
-        specific_noun = r"(?:日程|行程|待办|提醒事项|时间表)"
         schedule_noun = r"(?:日程|行程|安排|计划|待办|提醒事项|时间表)"
-        personal_action = r"(?:上班|上学|上课|出门|休息|起床|睡觉|睡|工作)"
+        # Modifiers accepted after an explicit Bot owner are themselves
+        # personal/time qualifiers.  An arbitrary domain noun (for example
+        # ``项目计划`` or ``会议安排``) must not turn a generic plan into Bot
+        # autobiography.
+        personal_modifier = r"(?:今天|今日|昨天|昨日|前天|明天|后天|今晚|明早|明晚|"
+        personal_modifier += r"现在|当前|目前|最近|本周|这周|这一周|下周|周末|这周末|"
+        personal_modifier += r"本月|下个月|工作|生活|休息|学习|任务)"
+        personal_action = r"(?:上班|下班|加班|上学|上课|出门|回家|回宿舍|休息|起床|睡觉|睡|工作)"
         personal_status = (
-            r"(?:有事|有安排|有计划|忙|(?:要|会|得|准备)?(?:上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|工作)|有空|有时间)"
+            r"(?:有事|有安排|有计划|忙|有空|有时间|"
+            r"(?:要|会|得|准备)?(?:上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|工作))"
         )
         status_suffix = r"(?:吗|呢|呀|嘛|不|了没|没有)?[?？]?$"
 
-        direct_patterns = (
-            rf"{bot_pattern}的(?:{temporal}(?:的)?)?{schedule_noun}",
-            rf"{bot_pattern}{temporal}(?:的)?{schedule_noun}",
-            rf"{bot_pattern}(?:的)?{specific_noun}",
-            rf"{bot_pattern}(?:{temporal})?(?:都)?(?:有|有没有|有什么|有哪些)(?:什么)?{schedule_noun}",
-            rf"{temporal}{bot_pattern}(?:的)?{schedule_noun}",
-            rf"{temporal}{bot_pattern}(?:都)?(?:有|有没有|有什么|有哪些)(?:什么)?{schedule_noun}",
+        bot_patterns = (
+            # Possessive forms: 你的日程、你明天的安排、bot 的待办。
+            rf"{bot_pattern}(?:{personal_modifier})?(?:的)?{schedule_noun}",
+            rf"{bot_pattern}的(?:{personal_modifier})?{schedule_noun}",
+            rf"{bot_pattern}的(?:schedule|calendar|itinerary|todo)",
+            # Subject forms: 你今天有什么安排、本周你有空吗、你什么时候上班。
+            rf"{bot_pattern}(?:知道|能不能|可以|能|会不会|想问|问(?:一下|下)?)?"
+            rf"(?:{temporal})?(?:的)?(?:都)?(?:有|有没有|有什么|有哪些){schedule_noun}",
+            rf"{temporal}{bot_pattern}(?:的)?(?:都)?(?:有|有没有|有什么|有哪些){schedule_noun}",
             rf"{bot_pattern}(?:{temporal})?(?:几点|什么时候|何时)(?:要|会|得|准备)?{personal_action}",
             rf"{temporal}{bot_pattern}(?:几点|什么时候|何时)?(?:要|会|得|准备)?{personal_action}",
+            rf"{bot_pattern}(?:{temporal})?(?:几点|什么时候|何时){personal_status}{status_suffix}",
+            rf"{temporal}{bot_pattern}(?:几点|什么时候|何时)?{personal_status}{status_suffix}",
             rf"{bot_pattern}(?:{temporal})?{personal_status}{status_suffix}",
             rf"{temporal}{bot_pattern}{personal_status}{status_suffix}",
-            rf"{bot_pattern}{temporal}(?:做了什么|做什么|要做什么|准备做什么|去了哪(?:里|儿)?)",
-            rf"{temporal}{bot_pattern}(?:做了什么|做什么|要做什么|准备做什么|去了哪(?:里|儿)?)",
+            rf"{bot_pattern}(?:{temporal})?(?:在)?(?:做了什么|做什么|要做什么|准备做什么|"
+            rf"去(?:了)?哪(?:里|儿)?|干什么|干嘛)",
+            rf"{temporal}{bot_pattern}(?:在)?(?:做了什么|做什么|要做什么|准备做什么|"
+            rf"去(?:了)?哪(?:里|儿)?|干什么|干嘛)",
         )
-        if any(re.search(pattern, compact) for pattern in direct_patterns):
-            return True
+
+        def last_match_end(patterns: tuple[str, ...]) -> int:
+            ends = [match.end() for pattern in patterns for match in re.finditer(pattern, compact)]
+            return max(ends, default=-1)
+
+        bot_end = last_match_end(bot_patterns)
 
         english_owner = r"(?:your|bot(?:'s)?"
         if normalized_bot_id and normalized_bot_id not in {"self", "bot"}:
             english_owner += rf"|{re.escape(normalized_bot_id)}(?:'s)?"
         english_owner += r")"
-        if re.search(rf"{english_owner}(?:schedule|calendar|itinerary|todo)", compact):
-            return True
+        english_bot_end = last_match_end((rf"{english_owner}(?:schedule|calendar|itinerary|todo)",))
+        bot_end = max(bot_end, english_bot_end)
+
+        # User-owned forms are checked separately so a polite prefix such as
+        # "你能查一下" cannot make ``我的日程`` look like a Bot request.
+        user_patterns = (
+            rf"(?:我|我的|咱们|我们|本人|自己)(?:{personal_modifier})?(?:的)?{schedule_noun}",
+            rf"(?:我|咱们|我们|本人|自己)(?:{temporal})?{personal_status}{status_suffix}",
+            rf"(?:我|咱们|我们|本人|自己)(?:{temporal})?(?:要|会|得|准备)?{personal_action}",
+            r"(?:my)(?:schedule|calendar|itinerary|todo)",
+        )
+        user_end = last_match_end(user_patterns)
+
+        # A named/group owner is any explicit possessive or subject that is not
+        # one of the pronouns above.  The owner is intentionally structural;
+        # no domain-specific blacklist is needed for ``小王的日程`` or
+        # ``会议的安排``.
+        generic_owner = r"(?:他|她|它|他们|她们|对方|群|群聊|会议|活动|课程|[\u4e00-\u9fff]{2,16}|[a-z][a-z0-9_.-]{1,40})"
+        other_patterns = (
+            rf"{generic_owner}的(?:{personal_modifier})?{schedule_noun}",
+            rf"{generic_owner}(?:{temporal})?{personal_status}{status_suffix}",
+            rf"{generic_owner}(?:{temporal})?(?:要|会|得|准备)?{personal_action}",
+            r"(?:my|project)(?:schedule|calendar|itinerary|todo)",
+        )
+        other_end = -1
+        temporal_words = {
+            "今天",
+            "今日",
+            "昨天",
+            "昨日",
+            "前天",
+            "明天",
+            "后天",
+            "今晚",
+            "明早",
+            "明晚",
+            "现在",
+            "当前",
+            "目前",
+            "最近",
+            "本周",
+            "这周",
+            "这一周",
+            "下周",
+            "周末",
+            "这周末",
+            "本月",
+            "下个月",
+        }
+        for pattern in other_patterns:
+            for match in re.finditer(pattern, compact):
+                owner = clean_text(match.group(0), 120).lower()
+                # The generic pattern may also see an ASCII Bot id.  Do not
+                # treat it as a third-party owner when it is the configured Bot.
+                if normalized_bot_id and owner.startswith(normalized_bot_id):
+                    continue
+                if owner.startswith(("你", "您", "bot", "我", "咱", "我们", "本人", "自己")):
+                    continue
+                if any(owner.startswith(word) for word in temporal_words):
+                    continue
+                other_end = max(other_end, match.end())
+
+        # The nearest explicit owner wins when a query mentions both parties
+        # (e.g. "我想问你的日程").
+        if bot_end >= 0 and bot_end >= max(user_end, other_end):
+            return "bot"
+        if user_end >= 0 and user_end >= other_end:
+            return "user"
+        if other_end >= 0:
+            return "other"
 
         if not allow_implicit_temporal:
-            return False
-        personal_state = (
-            r"(?:有事|有安排|有计划|忙|上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|"
-            r"有空|有时间|要做什么|准备做什么)"
+            return ""
+        # Short owner-omitted status questions are conventionally addressed to
+        # the Bot in a chat.  Keep this grammar anchored so "明天考试有什么
+        # 安排" and other group/event schedules remain ambiguous.
+        implicit_state = (
+            rf"(?:{personal_status}|(?:要|会|得|准备)?{personal_action}|"
+            r"(?:要|会|得|准备)?(?:做什么|干什么|干嘛)|"
+            r"(?:几点|什么时候|何时)(?:要|会|得|准备)?(?:上班|下班|加班|上学|上课|出门|回家|回宿舍|休息|睡觉|睡|工作))"
         )
         prefix = r"(?:请问|想问(?:一下|下)?|问(?:一下|下)?)?"
         suffix = r"(?:吗|呢|呀|嘛|不|了没|没有)?[?？]?"
-        return bool(re.fullmatch(rf"{prefix}{temporal}{personal_state}{suffix}", compact))
+        if re.fullmatch(rf"{prefix}{temporal}{implicit_state}{suffix}", compact):
+            return "implicit"
+        return ""
+
+    @staticmethod
+    def _message_targets_bot_personal_schedule(
+        text: str,
+        *,
+        bot_id: str = "",
+        allow_implicit_temporal: bool = False,
+    ) -> bool:
+        return MemoryCompanionService._schedule_query_owner(
+            text,
+            bot_id=bot_id,
+            allow_implicit_temporal=allow_implicit_temporal,
+        ) in {"bot", "implicit"}
 
     @staticmethod
     def _message_is_future_arrangement_question(text: str, *, bot_id: str = "") -> bool:
@@ -7560,11 +7755,15 @@ class MemoryCompanionService:
                 if is_private:
                     if not contextual_private_use and not acl_authorized_for_sender:
                         reason = "group_private_memory_requires_recall_or_personalization"
-                    elif not owner_id and not actor_mentioned:
+                    elif not owner_id:
                         reason = "group_private_memory_actor_unknown"
-                    elif current_user_id and owner_id and owner_id != current_user_id and not actor_mentioned:
+                    # Mentioning another member is not an authorization to
+                    # disclose that member's private conversation. Only the
+                    # current speaker's own private memory may cross into the
+                    # group, after visibility/ACL checks have allowed it.
+                    elif current_user_id and owner_id and owner_id != current_user_id:
                         reason = "group_private_memory_actor_not_current_sender"
-                    elif not current_user_id and not actor_mentioned:
+                    elif not current_user_id:
                         reason = "group_private_memory_sender_unknown"
                 elif is_user_profile and owner_id and current_user_id and owner_id != current_user_id and not actor_mentioned:
                     reason = "group_profile_actor_not_current_sender"
@@ -8510,9 +8709,36 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
         bot_id: str = "",
     ) -> set[str]:
+        # Both mutable personal timelines and unresolved commitments can be
+        # numerous.  Keep them inside their diversity budgets for ordinary
+        # questions; an explicit owner/focus may opt one of them into overflow.
+        capped = {"self_timeline", "open_loop"}
         if self._query_focuses_self_timeline(query, time_intent=time_intent, bot_id=bot_id):
-            return set()
-        return {"self_timeline"}
+            capped.discard("self_timeline")
+        if self._query_focuses_open_loop(query):
+            capped.discard("open_loop")
+        return capped
+
+    @staticmethod
+    def _query_focuses_open_loop(query: str) -> bool:
+        """Recognize an explicit unresolved-workflow request.
+
+        These are positive workflow forms, so ordinary schedule words such as
+        "明天" or "提醒" in a stored record cannot grant open-loop overflow by
+        themselves.
+        """
+        compact = re.sub(r"\s+", "", clean_text(query, 1000)).lower()
+        if not compact:
+            return False
+        if MemoryCompanionService._message_is_vague_recent_followup(compact):
+            return True
+        patterns = (
+            r"(?:未完成|没完成|没做完|没写完|待办|待续|未了事项|没聊完|还欠着)",
+            r"(?:承诺|答应|约定).{0,12}(?:还记得|完成|兑现|做到|没做)",
+            r"(?:提醒|下次|回头).{0,12}(?:什么|哪些|还有|没)",
+            r"(?:open[ _-]?loop|unfinished|todo|promise|commitment)",
+        )
+        return any(re.search(pattern, compact) for pattern in patterns)
 
     def _query_focuses_self_timeline(
         self,

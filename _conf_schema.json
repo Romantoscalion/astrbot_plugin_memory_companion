@@ -721,6 +721,12 @@
         "type": "bool",
         "default": false
       },
+      "legacy_emotion_compatibility_enabled": {
+        "description": "兼容旧版同窗口情绪读取",
+        "hint": "过渡期开启。仅允许旧版陪伴插件读取并消费当前精确私聊窗口的脱敏情绪事件；跨窗口读取仍需新版能力上下文。升级陪伴插件后可关闭。",
+        "type": "bool",
+        "default": true
+      },
       "clean_proactive_history": {
         "description": "清理主动消息历史提示",
         "hint": "注入前清理 AstrBot 原始上下文中残留的主动消息生成提示、send_message_to_user 工具说明、主动承接占位和 TTS/定时控制标签，只保留用户可见的干净聊天内容。",

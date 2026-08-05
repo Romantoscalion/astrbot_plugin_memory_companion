@@ -177,7 +177,11 @@ astrbot_plugin_memory_companion
 
 PrivateCompanion 读取日程连续性或每日穿搭时会协商使用 `schedule_fast` / `outfit_fast`：通过短生命周期只读连接，按 Bot 所有者和当前私聊对象隔离后均衡读取相关日程、行动、边界、历史穿搭与自拍，不调用 Embedding、Rerank 或全库候选。两个快速路径可在“陪伴插件协同”中分别关闭并回退完整检索；普通聊天召回始终使用完整检索链。
 
-`private_companion_bridge.cross_window_emotional_continuity_enabled` 默认关闭。只有明确开启后，其他会话的近期情绪余波才会进入当前窗口提示或被陪伴插件全局读取；当前会话自己的情绪事件不受影响。
+`private_companion_bridge.cross_window_emotional_continuity_enabled` 默认关闭。只有明确开启并由新版陪伴插件提交精确用户能力上下文后，其他会话的近期情绪余波才会进入当前窗口；不会提供无身份的全局读取。
+
+旧版陪伴插件可在过渡期通过 `private_companion_bridge.legacy_emotion_compatibility_enabled` 读取当前精确私聊窗口的脱敏情绪事件，默认开启；该路径不允许跨窗口聚合。陪伴插件升级到能力上下文接口后可关闭此项。
+
+本版本的 Bot Personal 档案、用户记忆摘要、关系投影和表达决策接口需要新版陪伴插件传入由 Memory 签发的能力/上下文；旧版调用会明确返回降级或禁止状态，不会静默写入或读取其它用户、窗口的数据。升级两侧后再启用对应功能即可。
 
 记忆被自然提及后，下一条用户回复会作为轻量反馈写回对应记忆：接受会提高 `mentionability_score` 和置信度；被安慰到会提高情绪权重；尴尬、否认或纠正会降低可提及性，并设置 `mention_policy=avoid_unless_asked` 或记录 `user_correction`。这样 Bot 会逐渐学习哪些旧事可以轻轻提，哪些只能当语气底色。
 

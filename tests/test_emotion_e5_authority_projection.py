@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.bridge import sanitize_companion_relationship_projection  # noqa: E402
+from core.bridge import MemoryCompanionBridge, sanitize_companion_relationship_projection  # noqa: E402
 from core.models import SessionContext  # noqa: E402
 from core.service import MemoryCompanionService  # noqa: E402
 
@@ -50,8 +50,38 @@ class EmotionE5AuthorityProjectionTests(unittest.TestCase):
     def test_memory_consumes_bounded_dynamics_without_becoming_authority(self) -> None:
         accepted = sanitize_companion_relationship_projection(projection())
         self.assertEqual("accepted", accepted["status"])
-        ctx = SessionContext(scope="private")
-        event = SimpleNamespace(private_companion_context={"relationship_projection": projection()})
+        companion = object()
+        plugin = SimpleNamespace(
+            context=SimpleNamespace(
+                get_all_stars=lambda: [
+                    SimpleNamespace(
+                        star_cls=companion,
+                        root_dir_name="astrbot_plugin_private_companion",
+                        name="PrivateCompanion",
+                        activated=True,
+                    )
+                ]
+            )
+        )
+        bridge = MemoryCompanionBridge(plugin)
+        capability = bridge.register_emotion_producer(companion)
+        sealed = bridge.consume_relationship_projection(
+            projection(),
+            producer_capability=capability,
+            bot_id="bot-1",
+            platform="qq",
+            user_id="u1",
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+        )["projection"]
+        ctx = SessionContext(
+            scope="private",
+            bot_id="bot-1",
+            platform="qq",
+            user_id="u1",
+            session_id="qq:FriendMessage:u1",
+        )
+        event = SimpleNamespace(private_companion_context={"relationship_projection": sealed})
         MemoryCompanionService._apply_companion_relationship_projection(ctx, event=event)
         self.assertEqual("private_companion.relationship_score", ctx.relationship_authority_source)
         self.assertEqual("interaction_dynamics.v1", ctx.companion_interaction_dynamics_version)

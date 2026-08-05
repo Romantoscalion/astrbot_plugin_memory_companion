@@ -122,6 +122,41 @@ class C2MemoryConsumerTests(unittest.TestCase):
         context = _context(scope="group:one")
         self.assertEqual("invalid", consume_context_projection(context, "person_abc", "group:two")["state"])
 
+    def test_context_rejects_missing_top_level_identity_binding(self) -> None:
+        missing_person = _context()
+        del missing_person["person_id"]
+        person_result = consume_context_projection(missing_person, "person_abc", "private")
+        self.assertEqual("invalid", person_result["state"])
+        self.assertIn("person_id_mismatch", person_result["errors"])
+
+        missing_scope = _context()
+        del missing_scope["scope"]
+        scope_result = consume_context_projection(missing_scope, "person_abc", "private")
+        self.assertEqual("invalid", scope_result["state"])
+        self.assertIn("scope_mismatch", scope_result["errors"])
+
+    def test_context_rejects_slots_without_exact_expected_identity_binding(self) -> None:
+        cases = (
+            ("runtime", "person_id", None, "person_id_mismatch"),
+            ("runtime", "person_id", "person_other", "person_id_mismatch"),
+            ("scene", "scope", None, "scope_mismatch"),
+            ("scene", "scope", "group:other", "scope_mismatch"),
+        )
+        for slot_name, field, value, error in cases:
+            with self.subTest(slot=slot_name, field=field, value=value):
+                context = _context()
+                payload = context["slots"][slot_name]["payload"]
+                if value is None:
+                    del payload[field]
+                else:
+                    payload[field] = value
+
+                result = consume_context_projection(context, "person_abc", "private")
+
+                self.assertEqual("ready", result["state"])
+                self.assertEqual([error], result["rejected_slots"][slot_name])
+                self.assertEqual({}, result["context_ref"]["slots"][slot_name]["payload"])
+
     def test_context_deduplicates_by_revision_and_handles_legacy_or_bridge_degraded(self) -> None:
         self.assertEqual("legacy_local", consume_context_projection(None)["state"])
         self.assertEqual("degraded", consume_context_projection({}, companion_available=False)["state"])

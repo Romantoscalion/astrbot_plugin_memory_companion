@@ -93,11 +93,11 @@ def consume_context_projection(
         errors.append("context_invalid_state")
     if expected_person_id:
         context_person_id = context.get("person_id")
-        if context_person_id and context_person_id != expected_person_id:
+        if context_person_id != expected_person_id:
             errors.append("person_id_mismatch")
     if expected_scope:
         context_scope = context.get("scope")
-        if context_scope and context_scope != expected_scope:
+        if context_scope != expected_scope:
             errors.append("scope_mismatch")
 
     incoming_slots = context.get("slots") if isinstance(context.get("slots"), dict) else {}
@@ -110,10 +110,10 @@ def consume_context_projection(
             rejected[name] = slot_errors
             continue
         payload = candidate.get("payload") if isinstance(candidate.get("payload"), dict) else {}
-        if expected_person_id and payload.get("person_id") and payload.get("person_id") != expected_person_id:
+        if expected_person_id and payload.get("person_id") != expected_person_id:
             rejected[name] = ["person_id_mismatch"]
             continue
-        if expected_scope and payload.get("scope") and payload.get("scope") != expected_scope:
+        if expected_scope and payload.get("scope") != expected_scope:
             rejected[name] = ["scope_mismatch"]
             continue
         if candidate.get("state") == "invalid":

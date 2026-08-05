@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.bridge import sanitize_companion_expression_decision  # noqa: E402
+from core.bridge import MemoryCompanionBridge, sanitize_companion_expression_decision  # noqa: E402
 from core.models import SessionContext  # noqa: E402
 from core.service import MemoryCompanionService  # noqa: E402
 
@@ -40,8 +40,38 @@ class EmotionE8ExpressionAuthorityTests(unittest.TestCase):
         accepted = sanitize_companion_expression_decision(v2_decision())
         self.assertEqual("accepted", accepted["status"])
         self.assertEqual("support_first", accepted["decision"]["validation_style"])
-        ctx = SessionContext(scope="private")
-        req = SimpleNamespace(_private_companion_expression_decision=v2_decision())
+        companion = object()
+        plugin = SimpleNamespace(
+            context=SimpleNamespace(
+                get_all_stars=lambda: [
+                    SimpleNamespace(
+                        star_cls=companion,
+                        root_dir_name="astrbot_plugin_private_companion",
+                        name="PrivateCompanion",
+                        activated=True,
+                    )
+                ]
+            )
+        )
+        bridge = MemoryCompanionBridge(plugin)
+        capability = bridge.register_emotion_producer(companion)
+        sealed = bridge.consume_expression_decision(
+            v2_decision(),
+            producer_capability=capability,
+            bot_id="bot-1",
+            platform="qq",
+            user_id="u1",
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+        )["decision"]
+        ctx = SessionContext(
+            scope="private",
+            bot_id="bot-1",
+            platform="qq",
+            user_id="u1",
+            session_id="qq:FriendMessage:u1",
+        )
+        req = SimpleNamespace(_private_companion_expression_decision=sealed)
         MemoryCompanionService._apply_companion_expression_decision(ctx, req=req)
         self.assertEqual("companion_interaction_expression.v2", ctx.companion_expression_contract)
         self.assertEqual("light", ctx.companion_expression_humor_mode)

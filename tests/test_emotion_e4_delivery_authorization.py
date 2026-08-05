@@ -29,6 +29,13 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         companion = object()
         plugin = SimpleNamespace(
             store=store,
+            config=SimpleNamespace(
+                bool=lambda key, default=False: (
+                    True
+                    if key == "private_companion_bridge.cross_window_emotional_continuity_enabled"
+                    else default
+                )
+            ),
             context=SimpleNamespace(
                 get_all_stars=lambda: [
                     SimpleNamespace(
@@ -54,7 +61,7 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         platform: str = "qq",
         scope: str = "private",
         user_id: str = "user-1",
-        session_id: str = "session-a",
+        session_id: str = "qq:session-a",
         allow_cross_window: bool = False,
     ) -> object | None:
         return bridge.create_emotion_delivery_context(
@@ -76,7 +83,7 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         platform: str = "qq",
         scope: str = "private",
         user_id: str = "user-1",
-        session_id: str = "session-a",
+        session_id: str = "qq:session-a",
     ) -> dict:
         event = normalize_emotion_event(
             {
@@ -100,11 +107,11 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         store = self.make_store()
         bridge, capability = self.make_bridge(store)
         same = await self.add_event(store, suffix="same")
-        cross_window = await self.add_event(store, suffix="same-user-window", session_id="session-b")
-        other_user = await self.add_event(store, suffix="other-user", user_id="user-2", session_id="session-c")
-        other_bot = await self.add_event(store, suffix="other-bot", bot_id="bot-2", session_id="session-d")
-        other_platform = await self.add_event(store, suffix="other-platform", platform="wechat", session_id="session-e")
-        group_scope = await self.add_event(store, suffix="group", scope="group", session_id="session-f")
+        cross_window = await self.add_event(store, suffix="same-user-window", session_id="qq:session-b")
+        other_user = await self.add_event(store, suffix="other-user", user_id="user-2", session_id="qq:session-c")
+        other_bot = await self.add_event(store, suffix="other-bot", bot_id="bot-2", session_id="qq:session-d")
+        other_platform = await self.add_event(store, suffix="other-platform", platform="wechat", session_id="wechat:session-e")
+        group_scope = await self.add_event(store, suffix="group", scope="group", session_id="qq:session-f")
 
         denied = await bridge.list_emotion_events(consumer_id="private_companion.daily_state")
         self.assertEqual("forbidden", denied["state"])
@@ -133,15 +140,15 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         for context, forbidden_event in (
             (
-                self.delivery_context(bridge, capability, user_id="user-2", session_id="session-c"),
+            self.delivery_context(bridge, capability, user_id="user-2", session_id="qq:session-c"),
                 same,
             ),
             (
-                self.delivery_context(bridge, capability, bot_id="bot-2", session_id="session-d"),
+                self.delivery_context(bridge, capability, bot_id="bot-2", session_id="qq:session-d"),
                 same,
             ),
             (
-                self.delivery_context(bridge, capability, platform="wechat", session_id="session-e"),
+                self.delivery_context(bridge, capability, platform="wechat", session_id="wechat:session-e"),
                 same,
             ),
         ):
@@ -151,7 +158,7 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(self.delivery_context(bridge, capability, scope="group"))
         self.assertNotIn(group_scope["event_id"], [item["event_id"] for item in cross_page["events"]])
-        foreign_context = self.delivery_context(bridge, capability, user_id="user-2", session_id="session-c")
+        foreign_context = self.delivery_context(bridge, capability, user_id="user-2", session_id="qq:session-c")
         foreign_ack = await bridge.ack_emotion_events(
             [{"event_id": same["event_id"], "revision": same["revision"]}],
             delivery_context=foreign_context,
@@ -162,6 +169,32 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             delivery_context=same_context,
         )
         self.assertEqual(1, own_ack["acked"])
+
+    async def test_contexts_are_immutable_and_domain_creation_fails_closed(self) -> None:
+        store = self.make_store()
+        bridge, capability = self.make_bridge(store)
+        context = self.delivery_context(bridge, capability)
+        self.assertIsNotNone(context)
+        with self.assertRaises(AttributeError):
+            context.user_id = "user-2"
+        with self.assertRaises(AttributeError):
+            context.allow_cross_window = True
+
+        self.assertIsNone(
+            self.delivery_context(
+                bridge,
+                capability,
+                session_id="session-without-platform-prefix",
+            )
+        )
+        bridge._plugin.config = SimpleNamespace(bool=lambda _key, default=False: default)
+        self.assertIsNone(
+            self.delivery_context(
+                bridge,
+                capability,
+                allow_cross_window=True,
+            )
+        )
 
     async def test_keyset_pagination_skips_foreign_flood_and_reaches_every_local_event(self) -> None:
         store = self.make_store()
@@ -176,7 +209,7 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                     "bot_id": "bot-1",
                     "scope": "private",
                     "platform": "qq",
-                    "session_id": "session-a",
+                    "session_id": "qq:session-a",
                     "actor_ref": {"kind": "user", "id": "user-1", "role": "speaker"},
                     "target_ref": {"kind": "bot", "id": "bot-1", "role": "bot_self"},
                     "event_type": "warm_memory",
@@ -196,7 +229,7 @@ class EmotionE4DeliveryAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                     "bot_id": "bot-1",
                     "scope": "private",
                     "platform": "qq",
-                    "session_id": "foreign-session",
+                    "session_id": "qq:foreign-session",
                     "actor_ref": {"kind": "user", "id": "user-2", "role": "speaker"},
                     "target_ref": {"kind": "bot", "id": "bot-1", "role": "bot_self"},
                     "event_type": "warm_memory",

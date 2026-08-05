@@ -23,6 +23,9 @@ from .bot_personal_contract import (
 )
 
 
+BOT_PERSONAL_MAX_RECORD_VERSION = 1_000_000
+
+
 class BotPersonalValidationError(ValueError):
     def __init__(self, error_code: str, field: str = "", message: str = "") -> None:
         self.error_code = str(error_code or "invalid").strip()[:80]
@@ -266,8 +269,12 @@ def build_bot_personal_archive(
         record_version = int(source.get("version", 1))
     except (TypeError, ValueError) as exc:
         raise BotPersonalValidationError("invalid", "version", "version must be a positive integer") from exc
-    if record_version < 1:
-        raise BotPersonalValidationError("invalid", "version", "version must be a positive integer")
+    if not 1 <= record_version <= BOT_PERSONAL_MAX_RECORD_VERSION:
+        raise BotPersonalValidationError(
+            "invalid",
+            "version",
+            f"version must be between 1 and {BOT_PERSONAL_MAX_RECORD_VERSION}",
+        )
     schema = _text(source.get("payload_schema_version"), 40) or BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION
     if schema != BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION:
         raise BotPersonalValidationError("invalid", "payload_schema_version", "unsupported payload schema")
@@ -314,6 +321,6 @@ def bot_personal_payload_fingerprint(dto: BotPersonalArchiveDTO) -> str:
 
 
 __all__ = [
-    "BotPersonalArchiveDTO", "BotPersonalValidationError", "build_bot_personal_archive",
+    "BOT_PERSONAL_MAX_RECORD_VERSION", "BotPersonalArchiveDTO", "BotPersonalValidationError", "build_bot_personal_archive",
     "bot_personal_payload_fingerprint", "sanitize_bot_personal_value", "validate_bot_personal_idempotency_key",
 ]

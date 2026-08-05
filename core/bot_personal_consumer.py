@@ -21,9 +21,16 @@ def _base(*, state: str = "retry", attempts: int = 0, error_code: str | None = N
 
 
 class BotPersonalConsumer:
-    def __init__(self, bridge: Any, *, max_attempts: int = 3) -> None:
+    def __init__(
+        self,
+        bridge: Any,
+        *,
+        max_attempts: int = 3,
+        producer_capability: Any = None,
+    ) -> None:
         self.bridge = bridge
         self.max_attempts = max(1, int(max_attempts or 3))
+        self.producer_capability = producer_capability
 
     async def consume_bot_personal_archive(
         self,
@@ -31,6 +38,7 @@ class BotPersonalConsumer:
         *,
         attempt: int = 1,
         max_attempts: int | None = None,
+        producer_capability: Any = None,
     ) -> dict[str, Any]:
         attempts = max(1, int(attempt or 1))
         ceiling = max(1, int(max_attempts or self.max_attempts))
@@ -45,7 +53,16 @@ class BotPersonalConsumer:
         if not callable(sender):
             return _base(state="dead_letter" if attempts >= ceiling else "retry", attempts=attempts, error_code="bridge_method_unavailable")
         try:
-            result = await sender(dto)
+            authority = (
+                producer_capability
+                if producer_capability is not None
+                else self.producer_capability
+            )
+            result = (
+                await sender(dto, producer_capability=authority)
+                if authority is not None
+                else await sender(dto)
+            )
         except Exception:
             return _base(state="dead_letter" if attempts >= ceiling else "retry", attempts=attempts, error_code="bridge_exception")
         if not isinstance(result, dict):
@@ -74,8 +91,13 @@ async def consume_bot_personal_archive(
     *,
     attempt: int = 1,
     max_attempts: int = 3,
+    producer_capability: Any = None,
 ) -> dict[str, Any]:
-    return await BotPersonalConsumer(bridge, max_attempts=max_attempts).consume_bot_personal_archive(
+    return await BotPersonalConsumer(
+        bridge,
+        max_attempts=max_attempts,
+        producer_capability=producer_capability,
+    ).consume_bot_personal_archive(
         deepcopy(envelope) if isinstance(envelope, dict) else envelope,
         attempt=attempt,
     )

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.bridge import sanitize_companion_expression_decision
+from core.bridge import MemoryCompanionBridge, sanitize_companion_expression_decision
 from core.models import MemoryRecord, SearchResult, SessionContext
 from core.service import MemoryCompanionService, MemoryRouteDecision
 from core.time_intent import TimeIntent
@@ -56,6 +56,35 @@ def memory_item() -> tuple[MemoryRecord, SearchResult]:
 
 
 class Req028ExpressionSyncTests(unittest.TestCase):
+    @staticmethod
+    def attested_decision() -> dict:
+        companion = object()
+        plugin = SimpleNamespace(
+            context=SimpleNamespace(
+                get_all_stars=lambda: [
+                    SimpleNamespace(
+                        star_cls=companion,
+                        root_dir_name="astrbot_plugin_private_companion",
+                        name="PrivateCompanion",
+                        activated=True,
+                    )
+                ]
+            )
+        )
+        bridge = MemoryCompanionBridge(plugin)
+        capability = bridge.register_emotion_producer(companion)
+        result = bridge.consume_expression_decision(
+            valid_expression_decision(),
+            producer_capability=capability,
+            bot_id="bot-1",
+            platform="qq",
+            user_id="u1",
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+        )
+        assert result["status"] == "accepted"
+        return result["decision"]
+
     def test_expression_contract_is_strict_and_redacted(self) -> None:
         accepted = sanitize_companion_expression_decision(valid_expression_decision(owner_id="secret"))
         self.assertEqual("accepted", accepted["status"])
@@ -76,8 +105,14 @@ class Req028ExpressionSyncTests(unittest.TestCase):
                 self.assertEqual("invalid", sanitize_companion_expression_decision(value)["status"])
 
     def test_private_context_consumes_request_scoped_decision_and_group_ignores_it(self) -> None:
-        req = SimpleNamespace(_private_companion_expression_decision=valid_expression_decision())
-        private = SessionContext(scope="private", session_id="qq:FriendMessage:u1", user_id="u1")
+        req = SimpleNamespace(_private_companion_expression_decision=self.attested_decision())
+        private = SessionContext(
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+            platform="qq",
+            bot_id="bot-1",
+            user_id="u1",
+        )
         MemoryCompanionService._apply_companion_expression_decision(private, req=req)
         self.assertEqual("companion_interaction_expression.v1", private.companion_expression_contract)
         self.assertEqual("warm", private.companion_expression_band)
@@ -87,6 +122,20 @@ class Req028ExpressionSyncTests(unittest.TestCase):
         MemoryCompanionService._apply_companion_expression_decision(group, req=req)
         self.assertEqual("", group.companion_expression_contract)
         self.assertEqual("", group.companion_expression_band)
+
+    def test_unattested_expression_decision_is_ignored(self) -> None:
+        req = SimpleNamespace(
+            _private_companion_expression_decision=valid_expression_decision()
+        )
+        ctx = SessionContext(
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+            platform="qq",
+            bot_id="bot-1",
+            user_id="u1",
+        )
+        MemoryCompanionService._apply_companion_expression_decision(ctx, req=req)
+        self.assertEqual("", ctx.companion_expression_contract)
 
     def test_companion_caps_unsolicited_mentions_but_explicit_recall_still_reads_fact(self) -> None:
         service = MemoryCompanionService.__new__(MemoryCompanionService)
