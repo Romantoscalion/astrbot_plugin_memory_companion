@@ -91,7 +91,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             effect="allow",
         )
 
-    async def test_acl_shared_explicit_memory_answers_natural_group_question(self) -> None:
+    async def test_acl_shared_explicit_memory_does_not_enter_group_prompt(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory())
         await self.allow_private_to_group(service)
@@ -103,13 +103,9 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             write_log=False,
         )
 
-        self.assertIn("番茄鸡蛋面", injection)
-        self.assertIn("acl_allowed", injection)
-        self.assertIn("权限只表示该记忆可作为候选", injection)
-        self.assertIn("普通陈述或意图不清时忽略", injection)
-        self.assertIn("当前发言者的核心意图", injection)
+        self.assertNotIn("番茄鸡蛋面", injection)
 
-    async def test_acl_shared_tool_memory_is_kept_by_recent_state_guard(self) -> None:
+    async def test_acl_shared_tool_memory_does_not_enter_group_prompt(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory(memory_type="tool_memory"))
         await self.allow_private_to_group(service)
@@ -120,10 +116,9 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             write_log=False,
         )
 
-        self.assertIn("番茄鸡蛋面", injection)
-        self.assertIn("普通陈述或意图不清时忽略", injection)
+        self.assertNotIn("番茄鸡蛋面", injection)
 
-    async def test_production_remember_tool_record_is_recalled_across_acl(self) -> None:
+    async def test_production_remember_tool_record_is_not_recalled_across_acl(self) -> None:
         service = self.make_service()
         private_ctx = SessionContext(
             session_id="qq:FriendMessage:u1",
@@ -149,11 +144,9 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             write_log=False,
         )
 
-        self.assertIn("云杉面馆", injection)
-        self.assertNotIn("只影响语气，禁止复述", injection)
-        self.assertIn("普通陈述或意图不清时忽略", injection)
+        self.assertNotIn("云杉面馆", injection)
 
-    async def test_acl_shared_preference_can_be_used_without_recall_keywords(self) -> None:
+    async def test_acl_shared_preference_does_not_enter_group_prompt(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(
             self.private_memory(
@@ -170,8 +163,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             write_log=False,
         )
 
-        self.assertIn("云杉面馆", injection)
-        self.assertIn("普通陈述或意图不清时忽略", injection)
+        self.assertNotIn("云杉面馆", injection)
 
     async def test_no_forward_acl_reverse_acl_and_unrelated_query_stay_private(self) -> None:
         service = self.make_service()
@@ -199,7 +191,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("番茄鸡蛋面", unrelated)
 
-    async def test_related_group_statement_is_prompt_guarded_instead_of_keyword_blocked(self) -> None:
+    async def test_related_group_statement_does_not_reopen_private_memory(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(
             self.private_memory(
@@ -215,10 +207,9 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             write_log=False,
         )
 
-        self.assertIn("小王喜欢的面馆", injection)
-        self.assertIn("否则不要主动公开或复述", injection)
+        self.assertNotIn("小王喜欢的面馆", injection)
 
-    async def test_natural_request_without_fixed_question_words_can_use_acl_candidate(self) -> None:
+    async def test_natural_request_without_fixed_question_words_does_not_reopen_private_memory(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(
             self.private_memory(
@@ -234,10 +225,9 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             write_log=False,
         )
 
-        self.assertIn("云杉面馆", injection)
-        self.assertIn("不要依赖固定疑问词判断用户意图", injection)
+        self.assertNotIn("云杉面馆", injection)
 
-    async def test_omitted_subject_recall_is_not_rejected_by_pronoun_rules(self) -> None:
+    async def test_omitted_subject_recall_does_not_reopen_private_memory(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory())
         await self.allow_private_to_group(service)
@@ -248,8 +238,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             write_log=False,
         )
 
-        self.assertIn("番茄鸡蛋面", injection)
-        self.assertIn("普通陈述或意图不清时忽略", injection)
+        self.assertNotIn("番茄鸡蛋面", injection)
 
     async def test_private_acl_does_not_cross_bot_or_platform(self) -> None:
         service = self.make_service()
@@ -283,7 +272,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("番茄鸡蛋面", injection)
 
-    async def test_acl_revoke_removes_cached_private_group_result(self) -> None:
+    async def test_acl_cannot_create_cached_private_group_result(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory())
         rule = await self.allow_private_to_group(service)
@@ -291,22 +280,21 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
 
         first = await service._compose_memory_injection(ctx, max_chars=3200, write_log=False)
         second = await service._compose_memory_injection(ctx, max_chars=3200, write_log=False)
-        self.assertIn("番茄鸡蛋面", first)
-        self.assertIn("番茄鸡蛋面", second)
+        self.assertNotIn("番茄鸡蛋面", first)
+        self.assertNotIn("番茄鸡蛋面", second)
 
         await service.store.delete_acl_rule(rule["id"])
         revoked = await service._compose_memory_injection(ctx, max_chars=3200, write_log=False)
         self.assertNotIn("番茄鸡蛋面", revoked)
 
-    async def test_recall_tool_uses_same_group_actor_guard(self) -> None:
+    async def test_recall_tool_blocks_private_memory_for_group_owner_and_others(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory())
         await self.allow_private_to_group(service)
 
         service.identity.resolve_event_context = AsyncMock(return_value=self.group_context())
         owner_result = await service.tool_recall(object(), "我中午吃了什么？")
-        self.assertEqual(["小王明确说过：中午吃了番茄鸡蛋面。"], [item["content"] for item in owner_result["memories"]])
-        self.assertIn("条件候选", owner_result["usage"])
+        self.assertEqual([], owner_result["memories"])
 
         service.identity.resolve_event_context = AsyncMock(
             return_value=self.group_context(user_id="u2", message_text="小王中午吃了什么？")
@@ -730,7 +718,7 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
             max_chars=3200,
             write_log=False,
         )
-        self.assertIn("番茄鸡蛋面", recalled)
+        self.assertNotIn("番茄鸡蛋面", recalled)
 
 
 if __name__ == "__main__":

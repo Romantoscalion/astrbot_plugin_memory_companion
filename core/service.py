@@ -72,6 +72,7 @@ from .operations import (
 )
 from .provenance import observed_from_companion_snapshot
 from .provenance_store import ProvenanceLedger
+from .portrait_service import PortraitService
 from .qq_history import QQHistoryReader
 from .reply_chain import ReplyChainResolver
 from .retrieval import RetrievalEngine
@@ -193,6 +194,7 @@ class MemoryCompanionService:
 
         self.store = MemoryStore(self.data_dir / "memory_companion.db")
         self.store.initialize()
+        self.portraits = PortraitService(self.store, self.config)
         normalized = self.store.normalize_legacy_manual_visibility()
         if normalized:
             logger.info("[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s", normalized)
@@ -219,6 +221,13 @@ class MemoryCompanionService:
         self._SUMMARY_LOCK_TTL: float = 600.0  # 10 minutes
         self._decay_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._portrait_dispatch_task: asyncio.Task[Any] | None = None
+        self._portrait_dispatch_status: dict[str, Any] = {
+            "state": "idle",
+            "last_run_day": "",
+            "last_result": "",
+            "last_completed_at": "",
+        }
         self._closing = False
         self._closed = False
         self._embedding_backfill_inflight: set[str] = set()
@@ -480,6 +489,10 @@ class MemoryCompanionService:
         return result
 
     async def handle_llm_request(self, event: Any, req: Any) -> None:
+        if bool(getattr(event, "private_companion_req036_denied", False)):
+            # Companion owns the fixed-reply branch. Do not resolve identity,
+            # read memory, write evidence, or enter any LLM path here.
+            return
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
@@ -572,6 +585,8 @@ class MemoryCompanionService:
                         source_memory_id=derived_id,
                         metadata={"source": "relationship_claim"},
                     )
+        await self.portraits.capture_user_message(ctx, event=event, req=req)
+        self._ensure_portrait_daily_dispatcher()
         if not self.config.bool("memory_capture.capture_bot_responses", True):
             self._schedule_session_summary(ctx, reason="after_user_message")
 
@@ -620,7 +635,99 @@ class MemoryCompanionService:
         )
         if self.config.bool("memory_capture.record_relationship_edges", True):
             await self.note_relationships(ctx)
+        await self.portraits.capture_user_message(ctx, event=event)
+        self._ensure_portrait_daily_dispatcher()
         self._schedule_session_summary(ctx, reason="group_conversation")
+
+    async def read_unified_profile_portrait(self, request: dict[str, Any], *, limit: int = 8) -> dict[str, Any]:
+        """Read a pre-authorized low-sensitivity summary through the Bridge."""
+        return await self.portraits.read_summary(request, limit=limit)
+
+    async def unified_profile_portrait_status(self, person_id: str) -> dict[str, Any]:
+        """Expose synchronization state without returning portrait facts."""
+        return await self.portraits.status(person_id)
+
+    async def run_unified_profile_portrait_batch(self, person_id: str, *, run_day: str = "") -> dict[str, Any]:
+        return await self.portraits.run_daily_batch(person_id, run_day=run_day)
+
+    def _portrait_window_hours(self) -> tuple[int, int]:
+        start = max(0, min(23, self.config.int("portrait.update_window_start_hour", 3)))
+        end = max(1, min(24, self.config.int("portrait.update_window_end_hour", 5)))
+        if end <= start:
+            start, end = 3, 5
+        return start, end
+
+    def _portrait_seconds_until_window(self, now: datetime | None = None) -> float:
+        local_now = (now or datetime.now(LOCAL_TZ)).astimezone(LOCAL_TZ)
+        start, end = self._portrait_window_hours()
+        if start <= local_now.hour < end:
+            return 0.0
+        candidate = local_now.replace(hour=start, minute=0, second=0, microsecond=0)
+        if local_now.hour >= end:
+            candidate += timedelta(days=1)
+        return max(1.0, (candidate - local_now).total_seconds())
+
+    def _ensure_portrait_daily_dispatcher(self) -> None:
+        """Start one retained scheduler after the first eligible observation."""
+        if self._closing or self._closed or not self.config.bool("portrait.daily_dispatch_enabled", True):
+            return
+        if self._portrait_dispatch_task is not None and not self._portrait_dispatch_task.done():
+            return
+        task = self._spawn_background(self._portrait_daily_dispatch_loop(), label="portrait-daily-dispatch")
+        self._portrait_dispatch_task = task
+        if task is not None:
+            self._portrait_dispatch_status["state"] = "scheduled"
+
+    async def _portrait_daily_dispatch_loop(self) -> None:
+        """Run only in the configured daily window, never on a message path."""
+        while not self._closing and not self._closed and self.config.bool("portrait.daily_dispatch_enabled", True):
+            try:
+                delay = self._portrait_seconds_until_window()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self._closing or self._closed:
+                    break
+                await self.run_due_portrait_batches(force_window=True)
+                # One bounded retry window supports the configured second
+                # attempt without turning evidence capture into LLM work.
+                await asyncio.sleep(15 * 60)
+                if self._portrait_seconds_until_window() == 0:
+                    await self.run_due_portrait_batches(force_window=True)
+                # Do not repeatedly re-enter the same window after the two
+                # bounded attempts.  The next pass begins on the next local
+                # calendar day.
+                next_start = (datetime.now(LOCAL_TZ) + timedelta(days=1)).replace(
+                    hour=self._portrait_window_hours()[0], minute=0, second=0, microsecond=0
+                )
+                await asyncio.sleep(max(60.0, (next_start - datetime.now(LOCAL_TZ)).total_seconds()))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._portrait_dispatch_status.update({
+                    "state": "degraded",
+                    "last_result": clean_text(exc, 160) or "bridge_degraded",
+                    "last_completed_at": utc_now(),
+                })
+                await asyncio.sleep(15 * 60)
+
+    async def run_due_portrait_batches(self, *, force_window: bool = False) -> dict[str, Any]:
+        now = datetime.now(LOCAL_TZ)
+        if not force_window and self._portrait_seconds_until_window(now) > 0:
+            return {"ok": True, "code": "portrait_window_closed", "processed": 0, "results": []}
+        run_day = now.date().isoformat()
+        people = await self.store.list_pending_portrait_people(limit=500)
+        results: list[dict[str, Any]] = []
+        for person_id in people:
+            result = await self.portraits.run_daily_batch(person_id, run_day=run_day)
+            results.append({"person_id": person_id, "code": clean_text(result.get("code"), 80), "ok": bool(result.get("ok"))})
+        code = "profile_exact" if any(item["ok"] for item in results) else "portrait_insufficient_evidence"
+        self._portrait_dispatch_status.update({
+            "state": "ready",
+            "last_run_day": run_day,
+            "last_result": code,
+            "last_completed_at": utc_now(),
+        })
+        return {"ok": True, "code": code, "processed": len(results), "results": results}
 
     async def handle_llm_response(self, event: Any, resp: Any) -> None:
         if self._private_companion_internal_generation_event(event):
@@ -7517,16 +7624,11 @@ class MemoryCompanionService:
         *,
         query_text: str = "",
     ) -> tuple[dict[str, list[Any]], list[dict[str, str]]]:
-        """Keep group injections tied to the current speaker without disabling explicit sharing."""
+        """Keep group injections scoped to the current speaker and group."""
         if ctx.scope != "group" or not slot_map:
             return slot_map, []
-        if not self._context_bool(ctx, "group_actor_relevance_guard_enabled", True):
-            return slot_map, []
 
-        query = clean_text(query_text or ctx.message_text, 1200)
-        explicit_recall = self._message_is_contextual_memory_request(query) or self._message_requests_temporal_aggregate(query)
-        personalized_context = self._message_requests_personalized_context(query)
-        contextual_private_use = explicit_recall or personalized_context
+        del query_text
         current_user_id = clean_text(ctx.user_id, 160)
         cleaned = {slot: list(items or []) for slot, items in (slot_map or {}).items()}
         blocked: list[dict[str, str]] = []
@@ -7538,16 +7640,10 @@ class MemoryCompanionService:
                 if memory is None:
                     kept.append(item)
                     continue
-                owner_id, owner_names = self._memory_user_actor(memory)
-                actor_mentioned = self._query_mentions_memory_actor(query, owner_id, owner_names)
+                owner_id, _owner_names = self._memory_user_actor(memory)
                 memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
                 visibility = clean_text(getattr(memory, "visibility", ""), 80).lower()
                 is_private = clean_text(getattr(memory, "scope", ""), 40).lower() == "private" or visibility == "private_pair"
-                acl_authorized_for_sender = self._acl_authorized_private_group_result(
-                    ctx,
-                    memory,
-                    item,
-                )
                 is_user_profile = slot == "user_profile" or memory_type in {
                     "user_profile",
                     "user_preference",
@@ -7557,17 +7653,19 @@ class MemoryCompanionService:
                 }
 
                 reason = ""
-                if is_private:
-                    if not contextual_private_use and not acl_authorized_for_sender:
-                        reason = "group_private_memory_requires_recall_or_personalization"
-                    elif not owner_id and not actor_mentioned:
-                        reason = "group_private_memory_actor_unknown"
-                    elif current_user_id and owner_id and owner_id != current_user_id and not actor_mentioned:
-                        reason = "group_private_memory_actor_not_current_sender"
-                    elif not current_user_id and not actor_mentioned:
-                        reason = "group_private_memory_sender_unknown"
-                elif is_user_profile and owner_id and current_user_id and owner_id != current_user_id and not actor_mentioned:
-                    reason = "group_profile_actor_not_current_sender"
+                if is_user_profile:
+                    # A group is a presentation scope, never an unbounded
+                    # profile lookup surface. Companion can add an exact-self,
+                    # low-sensitivity portrait summary after its own gate.
+                    reason = (
+                        "req036_group_third_party_profile_forbidden"
+                        if not current_user_id or not owner_id or owner_id != current_user_id
+                        else "req036_group_profile_requires_portrait_summary"
+                    )
+                elif is_private:
+                    # Private legacy memories never become group retrieval
+                    # material, even through an ACL or a named request.
+                    reason = "req036_group_private_memory_forbidden"
 
                 if reason:
                     blocked.append({

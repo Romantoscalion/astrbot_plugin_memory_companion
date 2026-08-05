@@ -13,6 +13,7 @@ from typing import Any
 
 from .identity import parse_scope_from_session
 from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads, new_id, stable_fingerprint, utc_now
+from .portrait import cross_scene_whitelisted_fact
 
 
 class MemoryStore:
@@ -537,11 +538,114 @@ class MemoryStore:
                         REFERENCES emotion_events(event_id, revision)
                         ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS portrait_people (
+                    person_id TEXT PRIMARY KEY,
+                    resolved_identity_key TEXT NOT NULL DEFAULT '',
+                    projection_revision INTEGER NOT NULL DEFAULT 0,
+                    identity_assurance TEXT NOT NULL DEFAULT '',
+                    profile_status TEXT NOT NULL DEFAULT '',
+                    capability_summary TEXT NOT NULL DEFAULT '{}',
+                    portrait_revision INTEGER NOT NULL DEFAULT 0,
+                    last_synced_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS portrait_evidence (
+                    evidence_hash TEXT PRIMARY KEY,
+                    person_id TEXT NOT NULL DEFAULT '',
+                    origin_identity_key TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    statement_fingerprint TEXT NOT NULL DEFAULT '',
+                    context_refs TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS portrait_facts (
+                    id TEXT PRIMARY KEY,
+                    person_id TEXT NOT NULL DEFAULT '',
+                    dimension TEXT NOT NULL DEFAULT '',
+                    normalized_claim_hash TEXT NOT NULL DEFAULT '',
+                    claim_summary TEXT NOT NULL DEFAULT '',
+                    portrait_tier TEXT NOT NULL DEFAULT '',
+                    producer_kind TEXT NOT NULL DEFAULT '',
+                    producer_version TEXT NOT NULL DEFAULT '',
+                    derivation_kind TEXT NOT NULL DEFAULT '',
+                    epistemic_status TEXT NOT NULL DEFAULT '',
+                    source_scope TEXT NOT NULL DEFAULT '',
+                    usable_scope TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    sensitivity TEXT NOT NULL DEFAULT 'high',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    evidence_hashes TEXT NOT NULL DEFAULT '[]',
+                    context_refs TEXT NOT NULL DEFAULT '[]',
+                    first_evidence_at TEXT NOT NULL DEFAULT '',
+                    last_evidence_at TEXT NOT NULL DEFAULT '',
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    supersedes_id TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    operation_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    UNIQUE(person_id, dimension, normalized_claim_hash, portrait_tier, source_scope)
+                );
+
+                CREATE TABLE IF NOT EXISTS portrait_suppressions (
+                    suppression_key TEXT PRIMARY KEY,
+                    person_id TEXT NOT NULL DEFAULT '',
+                    dimension TEXT NOT NULL DEFAULT '',
+                    normalized_claim_hash TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    actor TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    origin_identity_key TEXT NOT NULL DEFAULT '',
+                    operation_id TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    revoked_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS portrait_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    operation_kind TEXT NOT NULL DEFAULT '',
+                    payload_hash TEXT NOT NULL DEFAULT '',
+                    snapshot TEXT NOT NULL DEFAULT '{}',
+                    state TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS portrait_learning_queue (
+                    queue_id TEXT PRIMARY KEY,
+                    person_id TEXT NOT NULL DEFAULT '',
+                    fact_id TEXT NOT NULL DEFAULT '',
+                    evidence_hash TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    UNIQUE(person_id, fact_id, evidence_hash)
+                );
+
+                CREATE TABLE IF NOT EXISTS portrait_daily_runs (
+                    person_id TEXT NOT NULL DEFAULT '',
+                    run_day TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    successes INTEGER NOT NULL DEFAULT 0,
+                    last_code TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(person_id, run_day)
+                );
                 """
             )
             self._ensure_memory_columns_sync()
             self._ensure_timeline_columns_sync()
             self._ensure_acl_columns_sync()
+            self._ensure_portrait_columns_sync()
             self._ensure_memory_fts_sync()
             self._ensure_retrieval_revision_sync()
             self._conn.execute(
@@ -605,6 +709,18 @@ class MemoryStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_emotion_event_deliveries_pending "
                 "ON emotion_event_deliveries(consumer_id, acked_at, last_delivered_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portrait_evidence_person ON portrait_evidence(person_id, created_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portrait_facts_person ON portrait_facts(person_id, status, sensitivity, updated_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portrait_suppressions_person ON portrait_suppressions(person_id, status)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_person ON portrait_learning_queue(person_id, state, updated_at)"
             )
             self._conn.commit()
 
@@ -866,6 +982,795 @@ class MemoryStore:
         }
         if "effect" not in existing:
             self._conn.execute("ALTER TABLE memory_acl_rules ADD COLUMN effect TEXT NOT NULL DEFAULT 'allow'")
+
+    def _ensure_portrait_columns_sync(self) -> None:
+        existing = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(portrait_evidence)").fetchall()
+        }
+        if "statement_fingerprint" not in existing:
+            self._conn.execute("ALTER TABLE portrait_evidence ADD COLUMN statement_fingerprint TEXT NOT NULL DEFAULT ''")
+
+    async def upsert_portrait_person_projection(
+        self,
+        person_ref: dict[str, Any],
+        capability_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._upsert_portrait_person_projection_sync,
+            deepcopy(person_ref),
+            deepcopy(capability_summary),
+        )
+
+    def _upsert_portrait_person_projection_sync(
+        self,
+        person_ref: dict[str, Any],
+        capability_summary: dict[str, Any],
+    ) -> dict[str, Any]:
+        person_id = clean_text(person_ref.get("person_id"), 80)
+        identity_key = clean_text(person_ref.get("resolved_identity_key"), 96)
+        revision = int(person_ref.get("projection_revision") or 0)
+        assurance = clean_text(person_ref.get("identity_assurance"), 40)
+        status = clean_text(person_ref.get("profile_status"), 40)
+        if (
+            not person_id
+            or not identity_key
+            or revision < 1
+            or assurance not in {"observed", "verified", "explicit_linked"}
+            or status != "active"
+        ):
+            return {"ok": False, "code": "bridge_person_mismatch", "state": "invalid"}
+        now = utc_now()
+        with self._lock:
+            previous = self._conn.execute(
+                "SELECT * FROM portrait_people WHERE person_id=?", (person_id,)
+            ).fetchone()
+            if previous is not None:
+                old_revision = int(previous["projection_revision"] or 0)
+                if old_revision > revision:
+                    return {"ok": False, "code": "bridge_stale_revision", "state": "stale", "projection_revision": old_revision}
+                if old_revision == revision and previous["resolved_identity_key"] != identity_key:
+                    return {"ok": False, "code": "bridge_person_mismatch", "state": "invalid"}
+            portrait_revision = int(previous["portrait_revision"] or 0) if previous is not None else 0
+            self._conn.execute(
+                """
+                INSERT INTO portrait_people(
+                    person_id, resolved_identity_key, projection_revision, identity_assurance,
+                    profile_status, capability_summary, portrait_revision, last_synced_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(person_id) DO UPDATE SET
+                    resolved_identity_key=excluded.resolved_identity_key,
+                    projection_revision=excluded.projection_revision,
+                    identity_assurance=excluded.identity_assurance,
+                    profile_status=excluded.profile_status,
+                    capability_summary=excluded.capability_summary,
+                    last_synced_at=excluded.last_synced_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    person_id,
+                    identity_key,
+                    revision,
+                    clean_text(person_ref.get("identity_assurance"), 40),
+                    clean_text(person_ref.get("profile_status"), 40),
+                    json_dumps(capability_summary),
+                    portrait_revision,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return {"ok": True, "code": "profile_exact", "state": "ready", "portrait_revision": portrait_revision}
+
+    async def portrait_projection_decision(self, person_ref: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self._portrait_projection_decision_sync, deepcopy(person_ref))
+
+    def _portrait_projection_decision_sync(self, person_ref: dict[str, Any]) -> dict[str, Any]:
+        person_id = clean_text(person_ref.get("person_id"), 80)
+        identity_key = clean_text(person_ref.get("resolved_identity_key"), 96)
+        revision = int(person_ref.get("projection_revision") or 0)
+        assurance = clean_text(person_ref.get("identity_assurance"), 40)
+        if not person_id or not identity_key or revision < 1 or assurance not in {"observed", "verified", "explicit_linked"}:
+            return {"ok": False, "code": "bridge_person_mismatch"}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT resolved_identity_key, projection_revision, identity_assurance, profile_status FROM portrait_people WHERE person_id=?",
+                (person_id,),
+            ).fetchone()
+        if row is None:
+            return {"ok": False, "code": "bridge_unavailable"}
+        if clean_text(row["resolved_identity_key"], 96) != identity_key:
+            return {"ok": False, "code": "bridge_person_mismatch"}
+        if int(row["projection_revision"] or 0) != revision:
+            return {"ok": False, "code": "bridge_stale_revision"}
+        if clean_text(row["identity_assurance"], 40) not in {"observed", "verified", "explicit_linked"}:
+            return {"ok": False, "code": "bridge_person_mismatch"}
+        if clean_text(row["profile_status"], 40) != "active":
+            return {"ok": False, "code": "bridge_person_mismatch"}
+        return {"ok": True, "code": "profile_exact"}
+
+    async def add_portrait_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self._add_portrait_evidence_sync, deepcopy(evidence))
+
+    def _add_portrait_evidence_sync(self, evidence: dict[str, Any]) -> dict[str, Any]:
+        person_id = clean_text(evidence.get("person_id"), 80)
+        evidence_key = clean_text(evidence.get("evidence_hash"), 80)
+        if not person_id or not re.fullmatch(r"[0-9a-f]{64}", evidence_key):
+            return {"ok": False, "code": "portrait_evidence_invalid", "created": False}
+        statement_key = clean_text(evidence.get("statement_fingerprint"), 80)
+        if not re.fullmatch(r"[0-9a-f]{64}", statement_key):
+            statement_key = evidence_key
+        context_refs = evidence.get("context_refs") if isinstance(evidence.get("context_refs"), list) else []
+        now = utc_now()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO portrait_evidence(
+                    evidence_hash, person_id, origin_identity_key, scope, session_id, message_id, statement_fingerprint, context_refs, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    evidence_key,
+                    person_id,
+                    clean_text(evidence.get("origin_identity_key"), 96),
+                    clean_text(evidence.get("scope"), 80),
+                    clean_text(evidence.get("session_id"), 200),
+                    clean_text(evidence.get("message_id"), 120),
+                    statement_key,
+                    json_dumps([clean_text(item, 160) for item in context_refs if clean_text(item, 160)][:8]),
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return {"ok": True, "code": "portrait_evidence_recorded", "created": bool(cur.rowcount)}
+
+    def _portrait_suppressed_sync(self, person_id: str, dimension: str, claim_hash: str, scope: str) -> bool:
+        now = utc_now()
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM portrait_suppressions
+            WHERE person_id=? AND dimension=? AND normalized_claim_hash=?
+              AND status IN ('active', 'reconfirmation_pending')
+              AND (scope='' OR scope=?)
+              AND (expires_at='' OR expires_at>?)
+            LIMIT 1
+            """,
+            (person_id, dimension, claim_hash, scope, now),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _portrait_timestamp_is_fresh(value: Any, freshness_days: int) -> bool:
+        """Treat malformed or stale inferred timestamps as unusable."""
+        text = clean_text(value, 80)
+        if not text:
+            return False
+        try:
+            observed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        age = datetime.now(timezone.utc) - observed.astimezone(timezone.utc)
+        return age.total_seconds() <= max(1, freshness_days) * 86400
+
+    @staticmethod
+    def _portrait_scope_allows_row(row: sqlite3.Row, requested_scope: str) -> bool:
+        usable_scope = clean_text(row["usable_scope"], 80)
+        source_scope = clean_text(row["source_scope"], 80)
+        if usable_scope == "self_low_global":
+            return True
+        return usable_scope == "source_only" and bool(requested_scope) and source_scope == requested_scope
+
+    def _bump_portrait_revision_sync(self, person_id: str) -> int:
+        self._conn.execute(
+            "UPDATE portrait_people SET portrait_revision=portrait_revision+1, updated_at=? WHERE person_id=?",
+            (utc_now(), person_id),
+        )
+        row = self._conn.execute("SELECT portrait_revision FROM portrait_people WHERE person_id=?", (person_id,)).fetchone()
+        return int(row["portrait_revision"] or 0) if row is not None else 0
+
+    async def upsert_portrait_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self._upsert_portrait_fact_sync, deepcopy(fact))
+
+    def _upsert_portrait_fact_sync(self, fact: dict[str, Any]) -> dict[str, Any]:
+        person_id = clean_text(fact.get("person_id"), 80)
+        dimension = clean_text(fact.get("dimension"), 80)
+        claim_hash = clean_text(fact.get("normalized_claim_hash"), 80)
+        tier = clean_text(fact.get("portrait_tier"), 24)
+        source_scope = clean_text(fact.get("source_scope"), 80)
+        if not person_id or not dimension or not re.fullmatch(r"[0-9a-f]{64}", claim_hash) or tier not in {"base", "intelligent"}:
+            return {"ok": False, "code": "portrait_fact_invalid", "created": False}
+        if not source_scope:
+            source_scope = "private"
+        now = utc_now()
+        evidence_hashes = [
+            clean_text(item, 80) for item in (fact.get("evidence_hashes") or [])
+            if re.fullmatch(r"[0-9a-f]{64}", clean_text(item, 80))
+        ][:16]
+        with self._lock:
+            if self._portrait_suppressed_sync(person_id, dimension, claim_hash, source_scope):
+                return {"ok": False, "code": "portrait_suppressed", "created": False}
+            previous = self._conn.execute(
+                """
+                SELECT * FROM portrait_facts WHERE person_id=? AND dimension=?
+                  AND normalized_claim_hash=? AND portrait_tier=? AND source_scope=?
+                """,
+                (person_id, dimension, claim_hash, tier, source_scope),
+            ).fetchone()
+            previous_hashes = json_loads(previous["evidence_hashes"], []) if previous is not None else []
+            merged_hashes = list(dict.fromkeys([
+                clean_text(item, 80) for item in previous_hashes + evidence_hashes if clean_text(item, 80)
+            ]))[:16]
+            fact_id = clean_text(previous["id"], 120) if previous is not None else f"portrait_{stable_fingerprint(person_id, dimension, claim_hash, tier, source_scope)[:24]}"
+            revision = int(previous["revision"] or 0) + 1 if previous is not None else 1
+            first_at = clean_text(previous["first_evidence_at"], 80) if previous is not None else now
+            sensitivity = clean_text(fact.get("sensitivity"), 24)
+            if sensitivity not in {"low", "sensitive", "high"}:
+                sensitivity = "high"
+            usable_scope = clean_text(fact.get("usable_scope"), 80)
+            if usable_scope == "self_low_global" and cross_scene_whitelisted_fact(
+                dimension=dimension,
+                claim_summary=fact.get("claim_summary"),
+                sensitivity=sensitivity,
+                source_scope=source_scope,
+            ):
+                usable_scope = "self_low_global"
+            else:
+                usable_scope = "source_only"
+            self._conn.execute(
+                """
+                INSERT INTO portrait_facts(
+                    id, person_id, dimension, normalized_claim_hash, claim_summary, portrait_tier,
+                    producer_kind, producer_version, derivation_kind, epistemic_status, source_scope,
+                    usable_scope, confidence, sensitivity, status, evidence_hashes, context_refs,
+                    first_evidence_at, last_evidence_at, expires_at, supersedes_id, revision,
+                    operation_id, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(person_id, dimension, normalized_claim_hash, portrait_tier, source_scope) DO UPDATE SET
+                    claim_summary=excluded.claim_summary,
+                    producer_kind=excluded.producer_kind,
+                    producer_version=excluded.producer_version,
+                    derivation_kind=excluded.derivation_kind,
+                    epistemic_status=excluded.epistemic_status,
+                    usable_scope=excluded.usable_scope,
+                    confidence=max(portrait_facts.confidence, excluded.confidence),
+                    sensitivity=excluded.sensitivity,
+                    status=excluded.status,
+                    evidence_hashes=excluded.evidence_hashes,
+                    context_refs=excluded.context_refs,
+                    last_evidence_at=excluded.last_evidence_at,
+                    expires_at=excluded.expires_at,
+                    supersedes_id=excluded.supersedes_id,
+                    revision=excluded.revision,
+                    operation_id=excluded.operation_id,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    fact_id, person_id, dimension, claim_hash, clean_text(fact.get("claim_summary"), 180), tier,
+                    clean_text(fact.get("producer_kind"), 80), clean_text(fact.get("producer_version"), 80),
+                    clean_text(fact.get("derivation_kind"), 80), clean_text(fact.get("epistemic_status"), 80),
+                    source_scope, usable_scope, max(0.0, min(1.0, float(fact.get("confidence") or 0.0))),
+                    sensitivity, clean_text(fact.get("status"), 40) or "active", json_dumps(merged_hashes),
+                    json_dumps([clean_text(item, 160) for item in (fact.get("context_refs") or []) if clean_text(item, 160)][:8]),
+                    first_at, now, clean_text(fact.get("expires_at"), 80), clean_text(fact.get("supersedes_id"), 120),
+                    revision, clean_text(fact.get("operation_id"), 120),
+                    clean_text(previous["created_at"], 80) if previous is not None else now, now,
+                ),
+            )
+            portrait_revision = self._bump_portrait_revision_sync(person_id)
+            self._conn.commit()
+        return {"ok": True, "code": "portrait_fact_upserted", "created": previous is None, "fact_id": fact_id, "portrait_revision": portrait_revision}
+
+    async def list_portrait_evidence(self, person_id: str, *, limit: int = 64) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_portrait_evidence_sync, person_id, limit)
+
+    def _list_portrait_evidence_sync(self, person_id: str, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM portrait_evidence WHERE person_id=? ORDER BY created_at DESC LIMIT ?",
+                (clean_text(person_id, 80), max(1, min(512, int(limit)))),
+            ).fetchall()
+        return [
+            {
+                "evidence_hash": row["evidence_hash"], "scope": row["scope"], "session_id": row["session_id"],
+                "message_id": row["message_id"], "statement_fingerprint": row["statement_fingerprint"],
+                "context_refs": json_loads(row["context_refs"], []), "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    async def enqueue_portrait_learning(self, *, person_id: str, fact_id: str, evidence_hash: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._enqueue_portrait_learning_sync, person_id, fact_id, evidence_hash)
+
+    async def list_pending_portrait_people(self, *, limit: int = 500) -> list[str]:
+        return await asyncio.to_thread(self._list_pending_portrait_people_sync, limit)
+
+    def _list_pending_portrait_people_sync(self, limit: int) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT q.person_id
+                FROM portrait_learning_queue q
+                JOIN portrait_people p ON p.person_id=q.person_id
+                WHERE q.state='pending' AND p.profile_status='active'
+                ORDER BY q.updated_at ASC
+                LIMIT ?
+                """,
+                (max(1, min(2000, int(limit))),),
+            ).fetchall()
+        return [clean_text(row["person_id"], 80) for row in rows if clean_text(row["person_id"], 80)]
+
+    def _enqueue_portrait_learning_sync(self, person_id: str, fact_id: str, evidence_hash: str) -> dict[str, Any]:
+        person_id = clean_text(person_id, 80)
+        fact_id = clean_text(fact_id, 120)
+        evidence_hash = clean_text(evidence_hash, 80)
+        if not person_id or not fact_id or not re.fullmatch(r"[0-9a-f]{64}", evidence_hash):
+            return {"ok": False, "code": "portrait_queue_invalid"}
+        queue_id = f"portrait_queue_{stable_fingerprint(person_id, fact_id, evidence_hash)[:24]}"
+        now = utc_now()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT OR IGNORE INTO portrait_learning_queue(queue_id, person_id, fact_id, evidence_hash, state, created_at, updated_at)
+                VALUES(?,?,?,?, 'pending', ?, ?)
+                """,
+                (queue_id, person_id, fact_id, evidence_hash, now, now),
+            )
+            self._conn.commit()
+        return {"ok": True, "code": "portrait_queued", "created": bool(cur.rowcount), "queue_id": queue_id}
+
+    async def run_portrait_daily_batch(
+        self,
+        *,
+        person_id: str,
+        run_day: str,
+        min_independent_evidence: int = 3,
+        success_limit: int = 1,
+        attempt_limit: int = 2,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._run_portrait_daily_batch_sync,
+            person_id,
+            run_day,
+            min_independent_evidence,
+            success_limit,
+            attempt_limit,
+        )
+
+    def _portrait_distinct_statement_count_sync(self, evidence_hashes: list[Any]) -> int:
+        hashes = list(dict.fromkeys(
+            clean_text(item, 80)
+            for item in evidence_hashes
+            if re.fullmatch(r"[0-9a-f]{64}", clean_text(item, 80))
+        ))[:16]
+        if not hashes:
+            return 0
+        placeholders = ",".join("?" for _ in hashes)
+        rows = self._conn.execute(
+            f"SELECT evidence_hash, statement_fingerprint FROM portrait_evidence WHERE evidence_hash IN ({placeholders})",
+            hashes,
+        ).fetchall()
+        fingerprints = {
+            clean_text(row["statement_fingerprint"], 80) or clean_text(row["evidence_hash"], 80)
+            for row in rows
+            if clean_text(row["statement_fingerprint"], 80) or clean_text(row["evidence_hash"], 80)
+        }
+        return len(fingerprints)
+
+    def _run_portrait_daily_batch_sync(
+        self,
+        person_id: str,
+        run_day: str,
+        min_independent_evidence: int,
+        success_limit: int,
+        attempt_limit: int,
+    ) -> dict[str, Any]:
+        person_id = clean_text(person_id, 80)
+        run_day = clean_text(run_day, 16)
+        if not person_id or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run_day):
+            return {"ok": False, "code": "invalid_request"}
+        min_independent_evidence = max(1, min(16, int(min_independent_evidence)))
+        success_limit = max(1, min(4, int(success_limit)))
+        attempt_limit = max(success_limit, min(8, int(attempt_limit)))
+        now = utc_now()
+        with self._lock:
+            person = self._conn.execute("SELECT * FROM portrait_people WHERE person_id=?", (person_id,)).fetchone()
+            if person is None:
+                return {"ok": False, "code": "bridge_unavailable"}
+            capabilities = json_loads(person["capability_summary"], {})
+            if not bool(capabilities.get("portrait_learning_enabled")):
+                return {"ok": False, "code": "portrait_learning_disabled"}
+            run = self._conn.execute(
+                "SELECT * FROM portrait_daily_runs WHERE person_id=? AND run_day=?", (person_id, run_day)
+            ).fetchone()
+            attempts = int(run["attempts"] or 0) if run is not None else 0
+            successes = int(run["successes"] or 0) if run is not None else 0
+            if successes >= success_limit:
+                return {"ok": False, "code": "portrait_daily_limit", "attempts": attempts, "successes": successes}
+            if attempts >= attempt_limit:
+                return {"ok": False, "code": "portrait_daily_limit", "attempts": attempts, "successes": successes}
+            attempts += 1
+            self._conn.execute(
+                """
+                INSERT INTO portrait_daily_runs(person_id, run_day, attempts, successes, last_code, updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(person_id, run_day) DO UPDATE SET attempts=excluded.attempts, updated_at=excluded.updated_at
+                """,
+                (person_id, run_day, attempts, successes, "portrait_insufficient_evidence", now),
+            )
+            rows = self._conn.execute(
+                """
+                SELECT q.queue_id, q.fact_id, f.* FROM portrait_learning_queue q
+                JOIN portrait_facts f ON f.id=q.fact_id
+                WHERE q.person_id=? AND q.state='pending' AND f.status='active' AND f.portrait_tier='base'
+                ORDER BY q.created_at ASC
+                """,
+                (person_id,),
+            ).fetchall()
+            created = 0
+            for row in rows:
+                evidence_hashes = json_loads(row["evidence_hashes"], [])
+                if self._portrait_distinct_statement_count_sync(evidence_hashes) < min_independent_evidence:
+                    continue
+                if self._portrait_suppressed_sync(person_id, row["dimension"], row["normalized_claim_hash"], row["source_scope"]):
+                    self._conn.execute("UPDATE portrait_learning_queue SET state='suppressed', updated_at=? WHERE queue_id=?", (now, row["queue_id"]))
+                    continue
+                inferred = {
+                    "person_id": person_id,
+                    "dimension": row["dimension"],
+                    "normalized_claim_hash": row["normalized_claim_hash"],
+                    "claim_summary": clean_text(f"可能{row['claim_summary']}", 180),
+                    "portrait_tier": "intelligent",
+                    "producer_kind": "daily_evidence_batch",
+                    "producer_version": "req036.batch.v1",
+                    "derivation_kind": "independent_evidence_aggregate",
+                    "epistemic_status": "inferred",
+                    "source_scope": row["source_scope"],
+                    "usable_scope": "source_only" if row["source_scope"] != "private" else "self_low_global",
+                    "confidence": min(0.95, max(0.75, float(row["confidence"] or 0.0))),
+                    "sensitivity": row["sensitivity"],
+                    "evidence_hashes": evidence_hashes,
+                    "context_refs": json_loads(row["context_refs"], []),
+                    "operation_id": f"portrait.daily:{person_id[-12:]}:{run_day}",
+                }
+                result = self._upsert_portrait_fact_sync(inferred)
+                if result.get("ok"):
+                    self._conn.execute("UPDATE portrait_learning_queue SET state='processed', updated_at=? WHERE queue_id=?", (now, row["queue_id"]))
+                    created += 1
+                    break
+            successes += 1 if created else 0
+            code = "portrait_fact_upserted" if created else "portrait_insufficient_evidence"
+            self._conn.execute(
+                "UPDATE portrait_daily_runs SET successes=?, last_code=?, updated_at=? WHERE person_id=? AND run_day=?",
+                (successes, code, now, person_id, run_day),
+            )
+            self._conn.commit()
+        return {"ok": bool(created), "code": code, "attempts": attempts, "successes": successes, "created": created}
+
+    async def portrait_summary(
+        self,
+        person_id: str,
+        *,
+        scope: str = "",
+        limit: int = 8,
+        low_only: bool = True,
+        usage_min_confidence: float = 0.75,
+        inferred_freshness_days: int = 90,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._portrait_summary_sync,
+            person_id,
+            scope,
+            limit,
+            low_only,
+            usage_min_confidence,
+            inferred_freshness_days,
+        )
+
+    def _portrait_summary_sync(
+        self,
+        person_id: str,
+        scope: str,
+        limit: int,
+        low_only: bool,
+        usage_min_confidence: float,
+        inferred_freshness_days: int,
+    ) -> dict[str, Any]:
+        person_id = clean_text(person_id, 80)
+        scope = clean_text(scope, 80)
+        confidence_floor = max(0.0, min(1.0, float(usage_min_confidence or 0.75)))
+        freshness_days = max(1, min(3650, int(inferred_freshness_days or 90)))
+        with self._lock:
+            person = self._conn.execute("SELECT * FROM portrait_people WHERE person_id=?", (person_id,)).fetchone()
+            if person is None:
+                return {"ok": False, "code": "bridge_unavailable", "items": [], "portrait_revision": 0}
+            capabilities = json_loads(person["capability_summary"], {})
+            if not bool(capabilities.get("portrait_usage_enabled")):
+                return {"ok": False, "code": "portrait_usage_disabled", "items": [], "portrait_revision": int(person["portrait_revision"] or 0)}
+            query = "SELECT * FROM portrait_facts WHERE person_id=? AND status='active'"
+            params: list[Any] = [person_id]
+            if low_only:
+                query += " AND sensitivity='low'"
+            # Read a bounded superset before filtering scope, suppression,
+            # confidence and freshness.  The bridge never sees rejected rows.
+            query += " ORDER BY confidence DESC, updated_at DESC LIMIT ?"
+            params.append(max(16, min(128, int(limit) * 8)))
+            rows = self._conn.execute(query, params).fetchall()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                if not self._portrait_scope_allows_row(row, scope):
+                    continue
+                if self._portrait_suppressed_sync(person_id, row["dimension"], row["normalized_claim_hash"], row["source_scope"]):
+                    continue
+                confidence = float(row["confidence"] or 0)
+                if confidence < confidence_floor:
+                    continue
+                if row["portrait_tier"] == "intelligent" and not self._portrait_timestamp_is_fresh(row["updated_at"], freshness_days):
+                    continue
+                items.append(
+                    {
+                        "dimension": row["dimension"],
+                        "summary": row["claim_summary"],
+                        "portrait_tier": row["portrait_tier"],
+                        "epistemic_status": row["epistemic_status"],
+                        "confidence": confidence,
+                        "sensitivity": row["sensitivity"],
+                        "usable_scope": row["usable_scope"],
+                        "updated_at": row["updated_at"],
+                    }
+                )
+                if len(items) >= max(1, min(32, int(limit))):
+                    break
+        return {
+            "ok": True,
+            "code": "profile_exact",
+            "items": items,
+            "portrait_revision": int(person["portrait_revision"] or 0),
+            "last_synced_at": clean_text(person["last_synced_at"], 80),
+        }
+
+    async def upsert_portrait_suppression(self, marker: dict[str, Any]) -> dict[str, Any]:
+        return await asyncio.to_thread(self._upsert_portrait_suppression_sync, deepcopy(marker))
+
+    def _upsert_portrait_suppression_sync(self, marker: dict[str, Any]) -> dict[str, Any]:
+        key = clean_text(marker.get("suppression_key"), 80)
+        person_id = clean_text(marker.get("person_id"), 80)
+        status = clean_text(marker.get("status"), 40) or "active"
+        operation_id = clean_text(marker.get("operation_id"), 120)
+        if not key or not person_id or not operation_id or status not in {"active", "reconfirmation_pending", "revoked", "superseded", "expired"}:
+            return {"ok": False, "code": "suppression_invalid"}
+        now = utc_now()
+        with self._lock:
+            previous = self._conn.execute("SELECT * FROM portrait_suppressions WHERE suppression_key=?", (key,)).fetchone()
+            if previous is not None and clean_text(previous["operation_id"], 120) == operation_id:
+                return {"ok": True, "code": "suppression_idempotent_replay", "revision": int(previous["revision"] or 1)}
+            revision = int(previous["revision"] or 0) + 1 if previous is not None else 1
+            self._conn.execute(
+                """
+                INSERT INTO portrait_suppressions(
+                    suppression_key, person_id, dimension, normalized_claim_hash, scope, reason, actor, status,
+                    origin_identity_key, operation_id, revision, created_at, updated_at, expires_at, revoked_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(suppression_key) DO UPDATE SET
+                    reason=excluded.reason, actor=excluded.actor, status=excluded.status,
+                    operation_id=excluded.operation_id, revision=excluded.revision, updated_at=excluded.updated_at,
+                    expires_at=excluded.expires_at, revoked_at=excluded.revoked_at
+                """,
+                (
+                    key, person_id, clean_text(marker.get("dimension"), 80), clean_text(marker.get("normalized_claim_hash"), 80),
+                    clean_text(marker.get("scope"), 80), clean_text(marker.get("reason"), 80), clean_text(marker.get("actor"), 80), status,
+                    clean_text(marker.get("origin_identity_key"), 96), operation_id, revision,
+                    now if previous is None else clean_text(marker.get("created_at"), 80) or now, now,
+                    clean_text(marker.get("expires_at"), 80), clean_text(marker.get("revoked_at"), 80),
+                ),
+            )
+            self._bump_portrait_revision_sync(person_id)
+            self._conn.commit()
+        return {"ok": True, "code": "suppression_upserted", "revision": revision}
+
+    async def list_portrait_people(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_portrait_people_sync, limit)
+
+    async def portrait_status(self, person_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._portrait_status_sync, person_id)
+
+    def _portrait_status_sync(self, person_id: str) -> dict[str, Any]:
+        person_id = clean_text(person_id, 80)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT portrait_revision, last_synced_at, profile_status FROM portrait_people WHERE person_id=?",
+                (person_id,),
+            ).fetchone()
+        if row is None:
+            return {"ok": False, "code": "bridge_unavailable", "person_id": person_id, "last_synced_at": "", "portrait_revision": 0}
+        return {
+            "ok": clean_text(row["profile_status"], 40) == "active",
+            "code": "profile_exact" if clean_text(row["profile_status"], 40) == "active" else "bridge_person_mismatch",
+            "person_id": person_id,
+            "portrait_revision": int(row["portrait_revision"] or 0),
+            "last_synced_at": clean_text(row["last_synced_at"], 80),
+        }
+
+    def _list_portrait_people_sync(self, limit: int) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT p.*, COUNT(DISTINCT f.id) AS fact_count, COUNT(DISTINCT e.evidence_hash) AS evidence_count
+                FROM portrait_people p
+                LEFT JOIN portrait_facts f ON f.person_id=p.person_id
+                LEFT JOIN portrait_evidence e ON e.person_id=p.person_id
+                GROUP BY p.person_id
+                ORDER BY p.updated_at DESC
+                LIMIT ?
+                """,
+                (max(1, min(500, int(limit))),),
+            ).fetchall()
+        return [
+            {
+                "person_id": clean_text(row["person_id"], 80),
+                "identity_assurance": clean_text(row["identity_assurance"], 40),
+                "profile_status": clean_text(row["profile_status"], 40),
+                "projection_revision": int(row["projection_revision"] or 0),
+                "portrait_revision": int(row["portrait_revision"] or 0),
+                "last_synced_at": clean_text(row["last_synced_at"], 80),
+                "updated_at": clean_text(row["updated_at"], 80),
+                "capability_summary": json_loads(row["capability_summary"], {}),
+                "fact_count": int(row["fact_count"] or 0),
+                "evidence_count": int(row["evidence_count"] or 0),
+            }
+            for row in rows
+        ]
+
+    async def portrait_governance_detail(self, person_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._portrait_governance_detail_sync, person_id)
+
+    def _portrait_governance_detail_sync(self, person_id: str) -> dict[str, Any]:
+        person_id = clean_text(person_id, 80)
+        with self._lock:
+            person = self._conn.execute("SELECT * FROM portrait_people WHERE person_id=?", (person_id,)).fetchone()
+            if person is None:
+                return {"ok": False, "code": "bridge_unavailable", "person": {}, "facts": [], "suppressions": []}
+            facts = self._conn.execute(
+                """
+                SELECT id, dimension, normalized_claim_hash, claim_summary, portrait_tier, producer_kind,
+                       derivation_kind, epistemic_status, source_scope, usable_scope, confidence,
+                       sensitivity, status, first_evidence_at, last_evidence_at, expires_at, revision
+                FROM portrait_facts WHERE person_id=? ORDER BY updated_at DESC LIMIT 200
+                """,
+                (person_id,),
+            ).fetchall()
+            suppressions = self._conn.execute(
+                """
+                SELECT suppression_key, dimension, normalized_claim_hash, scope, reason, actor, status,
+                       operation_id, revision, created_at, updated_at, expires_at
+                FROM portrait_suppressions WHERE person_id=? ORDER BY updated_at DESC LIMIT 200
+                """,
+                (person_id,),
+            ).fetchall()
+        return {
+            "ok": True,
+            "code": "profile_exact",
+            "person": {
+                "person_id": person_id,
+                "identity_assurance": clean_text(person["identity_assurance"], 40),
+                "profile_status": clean_text(person["profile_status"], 40),
+                "portrait_revision": int(person["portrait_revision"] or 0),
+                "last_synced_at": clean_text(person["last_synced_at"], 80),
+                "capability_summary": json_loads(person["capability_summary"], {}),
+            },
+            "facts": [dict(row) for row in facts],
+            "suppressions": [dict(row) for row in suppressions],
+        }
+
+    async def govern_portrait_fact(
+        self,
+        *,
+        person_id: str,
+        fact_id: str,
+        action: str,
+        actor: str,
+        operation_id: str,
+        expires_at: str = "",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._govern_portrait_fact_sync,
+            person_id,
+            fact_id,
+            action,
+            actor,
+            operation_id,
+            expires_at,
+        )
+
+    def _govern_portrait_fact_sync(
+        self,
+        person_id: str,
+        fact_id: str,
+        action: str,
+        actor: str,
+        operation_id: str,
+        expires_at: str,
+    ) -> dict[str, Any]:
+        person_id = clean_text(person_id, 80)
+        fact_id = clean_text(fact_id, 120)
+        action = clean_text(action, 40)
+        actor = clean_text(actor, 80) or "administrator"
+        operation_id = clean_text(operation_id, 120)
+        expires_at = clean_text(expires_at, 80)
+        if not person_id or not fact_id or not operation_id or action not in {"suppress", "freeze", "reconfirmation_pending"}:
+            return {"ok": False, "code": "invalid_request"}
+        if action == "freeze" and not expires_at:
+            return {"ok": False, "code": "suppression_expiry_required"}
+        with self._lock:
+            fact = self._conn.execute(
+                "SELECT * FROM portrait_facts WHERE id=? AND person_id=?", (fact_id, person_id)
+            ).fetchone()
+            if fact is None:
+                return {"ok": False, "code": "portrait_fact_not_found"}
+        reason = {
+            "suppress": "administrator_delete_or_forget",
+            "freeze": "administrator_temporary_freeze",
+            "reconfirmation_pending": "reconfirmation_requested",
+        }[action]
+        status = "reconfirmation_pending" if action == "reconfirmation_pending" else "active"
+        marker = {
+            "suppression_key": stable_fingerprint(
+                "portrait_suppression", person_id, fact["dimension"], fact["normalized_claim_hash"], fact["source_scope"]
+            ),
+            "person_id": person_id,
+            "dimension": clean_text(fact["dimension"], 80),
+            "normalized_claim_hash": clean_text(fact["normalized_claim_hash"], 80),
+            "scope": clean_text(fact["source_scope"], 80),
+            "reason": reason,
+            "actor": actor,
+            "status": status,
+            "operation_id": operation_id,
+            "expires_at": expires_at if action == "freeze" else "",
+        }
+        result = self._upsert_portrait_suppression_sync(marker)
+        return {**result, "fact_id": fact_id, "action": action}
+
+    async def portrait_migration(self, *, operation_id: str, dry_run: bool = True) -> dict[str, Any]:
+        return await asyncio.to_thread(self._portrait_migration_sync, operation_id, dry_run)
+
+    def _portrait_migration_sync(self, operation_id: str, dry_run: bool) -> dict[str, Any]:
+        operation_id = clean_text(operation_id, 120)
+        if not operation_id:
+            return {"ok": False, "code": "invalid_request"}
+        with self._lock:
+            count = int(self._conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE memory_type IN ('user_profile', 'user_preference', 'user_habit')"
+            ).fetchone()[0] or 0)
+            if dry_run:
+                return {"ok": True, "code": "migration_dry_run", "write_count": 0, "legacy_candidate_count": count}
+            prior = self._conn.execute("SELECT * FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if prior is not None:
+                return {"ok": True, "code": "migration_idempotent_replay", "operation_id": operation_id}
+            now = utc_now()
+            self._conn.execute(
+                "INSERT INTO portrait_operations(operation_id, operation_kind, payload_hash, snapshot, state, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                (operation_id, "legacy_portrait_projection", stable_fingerprint("portrait", operation_id, count), json_dumps({"fact_ids": []}), "applied", now, now),
+            )
+            self._conn.commit()
+        return {"ok": True, "code": "migration_applied", "operation_id": operation_id, "legacy_candidate_count": count}
+
+    async def rollback_portrait_migration(self, *, operation_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._rollback_portrait_migration_sync, operation_id)
+
+    def _rollback_portrait_migration_sync(self, operation_id: str) -> dict[str, Any]:
+        operation_id = clean_text(operation_id, 120)
+        with self._lock:
+            row = self._conn.execute("SELECT snapshot FROM portrait_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if row is None:
+                return {"ok": False, "code": "migration_not_found"}
+            snapshot = json_loads(row["snapshot"], {})
+            fact_ids = snapshot.get("fact_ids") if isinstance(snapshot, dict) and isinstance(snapshot.get("fact_ids"), list) else []
+            if fact_ids:
+                self._conn.executemany("DELETE FROM portrait_facts WHERE id=?", [(clean_text(item, 120),) for item in fact_ids if clean_text(item, 120)])
+            self._conn.execute("UPDATE portrait_operations SET state='rolled_back', updated_at=? WHERE operation_id=?", (utc_now(), operation_id))
+            self._conn.commit()
+        return {"ok": True, "code": "migration_rolled_back", "operation_id": operation_id}
 
     def normalize_legacy_manual_visibility(self) -> int:
         """收回早期版本中过宽的手动记忆默认可见性。"""

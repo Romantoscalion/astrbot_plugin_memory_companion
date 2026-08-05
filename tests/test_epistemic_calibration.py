@@ -136,7 +136,7 @@ class EpistemicCalibrationTests(unittest.TestCase):
         self.assertFalse(decision.suppress_long_memory)
         self.assertFalse(decision.allow_contextual_expansion)
 
-    def test_group_actor_guard_is_private_by_default_but_allows_named_recall(self) -> None:
+    def test_group_actor_guard_blocks_profile_and_private_recall_even_when_named(self) -> None:
         service = self.make_service()
         ctx = SessionContext(
             session_id="qq:GroupMessage:g1",
@@ -199,9 +199,13 @@ class EpistemicCalibrationTests(unittest.TestCase):
 
         filtered, blocked = service._filter_group_actor_memory_slots(ctx, slots)
         selected_ids = {item.memory.id for items in filtered.values() for item in items}
-        self.assertEqual({"current-profile"}, selected_ids)
+        self.assertEqual(set(), selected_ids)
         self.assertEqual(
-            {"group_profile_actor_not_current_sender", "group_private_memory_requires_recall_or_personalization"},
+            {
+                "req036_group_profile_requires_portrait_summary",
+                "req036_group_third_party_profile_forbidden",
+                "req036_group_private_memory_forbidden",
+            },
             {item["reason"] for item in blocked},
         )
 
@@ -211,9 +215,13 @@ class EpistemicCalibrationTests(unittest.TestCase):
             query_text="给我讲个符合我性格的故事",
         )
         personalized_ids = {item.memory.id for items in personalized.values() for item in items}
-        self.assertEqual({"current-profile", "current-private"}, personalized_ids)
+        self.assertEqual(set(), personalized_ids)
         self.assertEqual(
-            {"group_profile_actor_not_current_sender", "group_private_memory_actor_not_current_sender"},
+            {
+                "req036_group_profile_requires_portrait_summary",
+                "req036_group_third_party_profile_forbidden",
+                "req036_group_private_memory_forbidden",
+            },
             {item["reason"] for item in personalized_blocked},
         )
 
@@ -223,8 +231,15 @@ class EpistemicCalibrationTests(unittest.TestCase):
             query_text="还记得小李之前说过的蛋糕吗？",
         )
         recalled_ids = {item.memory.id for items in recalled.values() for item in items}
-        self.assertEqual({"current-profile", "current-private", "other-profile", "other-private"}, recalled_ids)
-        self.assertEqual([], recalled_blocked)
+        self.assertEqual(set(), recalled_ids)
+        self.assertEqual(
+            {
+                "req036_group_profile_requires_portrait_summary",
+                "req036_group_third_party_profile_forbidden",
+                "req036_group_private_memory_forbidden",
+            },
+            {item["reason"] for item in recalled_blocked},
+        )
 
     def test_future_arrangement_route_keeps_association_soft(self) -> None:
         service = self.make_service()

@@ -71,6 +71,85 @@
       }
     }
   },
+  "portrait": {
+    "description": "统一用户画像",
+    "hint": "画像事实、证据、敏感等级和检索前隐私裁决由 Memory 维护；人物身份、关系和私聊权限仍由 Companion 维护。",
+    "type": "object",
+    "items": {
+      "min_independent_evidence": {
+        "description": "智能画像独立证据阈值",
+        "type": "int",
+        "default": 3,
+        "hint": "同一人物、同一候选至少三条去重后的本人消息证据；不要求与 Bot 互动或跨会话。"
+      },
+      "daily_success_limit_per_person": {
+        "description": "单用户每日成功更新上限",
+        "type": "int",
+        "default": 1,
+        "hint": "智能画像每天最多成功更新一次。"
+      },
+      "daily_attempt_limit_per_person": {
+        "description": "单用户每日尝试上限",
+        "type": "int",
+        "default": 2,
+        "hint": "允许一次失败退避重试；达到上限后当天不再生成。"
+      },
+      "daily_dispatch_enabled": {
+        "description": "启用每日画像批处理",
+        "type": "bool",
+        "default": true,
+        "hint": "只在设定窗口扫描已有证据队列；不会在每条消息后调用画像模型。"
+      },
+      "update_window_start_hour": {
+        "description": "画像更新窗口开始小时",
+        "type": "int",
+        "default": 3,
+        "hint": "按 Asia/Shanghai 时区执行每日批处理。"
+      },
+      "update_window_end_hour": {
+        "description": "画像更新窗口结束小时",
+        "type": "int",
+        "default": 5,
+        "hint": "窗口外只收集哈希化证据，不整理智能画像。"
+      },
+      "token_budget_per_person_day": {
+        "description": "单用户每日画像 Token 预算",
+        "type": "int",
+        "default": 4000,
+        "hint": "预留给后续经批准的批量推断；当前确定性证据聚合不调用画像 LLM。"
+      },
+      "token_budget_global_day": {
+        "description": "全局每日画像 Token 预算",
+        "type": "int",
+        "default": 40000,
+        "hint": "预留给后续经批准的批量推断；预算不足时必须跳过而不是降级为逐消息调用。"
+      },
+      "usage_min_confidence": {
+        "description": "智能画像使用置信度",
+        "type": "float",
+        "default": 0.75,
+        "hint": "低于此值的智能推断不会进入表达适配。"
+      },
+      "inferred_freshness_days": {
+        "description": "智能推断新鲜期",
+        "type": "int",
+        "default": 90,
+        "hint": "超过期限的智能推断停止使用，等待新的独立证据。"
+      },
+      "context_message_limit": {
+        "description": "画像上下文消息上限",
+        "type": "int",
+        "default": 8,
+        "hint": "后续需要语义消歧时只允许使用同场景最小窗口；第三方消息不能作为事实证据。"
+      },
+      "context_char_limit": {
+        "description": "画像上下文字符上限",
+        "type": "int",
+        "default": 6000,
+        "hint": "上下文仅作当场解释，不写入画像表，也不跨场景拼接。"
+      }
+    }
+  },
   "memory_summary": {
     "description": "长期记忆总结",
     "hint": "把时间线整理为可长期保存、可召回的阶段性记忆。模型、触发阈值和证据长度都在这里配置。",

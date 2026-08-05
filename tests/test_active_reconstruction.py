@@ -272,7 +272,7 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], result["navigation_hints"])
         self.assertNotIn("blocked", result)
 
-    async def test_acl_owner_can_navigate_but_other_speaker_cannot(self) -> None:
+    async def test_acl_cannot_navigate_private_memory_from_group_for_any_speaker(self) -> None:
         service = self.make_service()
         await self.insert_indexed(service, self.summary_memory())
         await service.store.upsert_acl_rule(
@@ -298,11 +298,13 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
             tag="饮食偏好",
         )
 
-        self.assertEqual("evidence_found", owner["status"])
+        self.assertEqual("no_visible_evidence", owner["status"])
+        self.assertEqual([], owner["evidence"])
+        self.assertEqual([], owner["navigation_hints"])
         self.assertEqual("no_visible_evidence", other["status"])
         self.assertEqual([], other["evidence"])
 
-    async def test_acl_revocation_is_rechecked_on_later_step(self) -> None:
+    async def test_acl_rule_cannot_create_group_navigation_state(self) -> None:
         service = self.make_service()
         await self.insert_indexed(service, self.summary_memory())
         rule = await service.store.upsert_acl_rule(
@@ -324,7 +326,9 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         await service.store.delete_acl_rule(rule["id"])
         revoked = await service.tool_navigate(event, "reverse_cues", memory_ids=["summary-1"])
 
-        self.assertEqual("evidence_found", first["status"])
+        self.assertEqual("no_visible_evidence", first["status"])
+        self.assertEqual([], first["evidence"])
+        self.assertEqual([], first["navigation_hints"])
         self.assertEqual("no_visible_evidence", revoked["status"])
         self.assertEqual([], revoked["evidence"])
         self.assertEqual([], revoked["navigation_hints"])

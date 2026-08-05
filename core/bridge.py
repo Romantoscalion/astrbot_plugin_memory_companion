@@ -916,6 +916,76 @@ class MemoryCompanionBridge:
             **({"error_code": clean_text(result.get("error_code"), 80)} if state != "ready" and clean_text(result.get("error_code"), 80) else {}),
         }
 
+    async def read_unified_profile_portrait(self, request: dict[str, Any], *, limit: int = 8) -> dict[str, Any]:
+        """Return only a pre-authorized low-sensitivity portrait summary."""
+        base = {
+            "ok": False,
+            "read_only": True,
+            "code": "bridge_unavailable",
+            "items": [],
+        }
+        getter = getattr(self._plugin, "read_unified_profile_portrait", None)
+        if not callable(getter):
+            return base
+        try:
+            result = await getter(request if isinstance(request, dict) else {}, limit=max(1, min(16, int(limit))))
+        except Exception:
+            return {**base, "code": "bridge_degraded"}
+        if not isinstance(result, dict):
+            return {**base, "code": "bridge_degraded"}
+        items: list[dict[str, Any]] = []
+        for item in result.get("items", []) if isinstance(result.get("items"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            if clean_text(item.get("sensitivity"), 24) != "low":
+                continue
+            items.append(
+                {
+                    "dimension": clean_text(item.get("dimension"), 80),
+                    "summary": clean_text(item.get("summary"), 180),
+                    "portrait_tier": clean_text(item.get("portrait_tier"), 24),
+                    "epistemic_status": clean_text(item.get("epistemic_status"), 40),
+                    "confidence": float(item.get("confidence") or 0),
+                    "updated_at": clean_text(item.get("updated_at"), 80),
+                }
+            )
+        return {
+            "ok": bool(result.get("ok")),
+            "read_only": True,
+            "code": clean_text(result.get("code"), 80) or "bridge_degraded",
+            "items": items,
+            "portrait_revision": int(result.get("portrait_revision") or 0),
+        }
+
+    async def unified_profile_portrait_status(self, person_id: str) -> dict[str, Any]:
+        """Return only bridge synchronization metadata, never portrait text."""
+        getter = getattr(self._plugin, "unified_profile_portrait_status", None)
+        if not callable(getter):
+            return {"ok": False, "read_only": True, "code": "bridge_unavailable", "last_synced_at": "", "portrait_revision": 0}
+        try:
+            result = await getter(clean_text(person_id, 80))
+        except Exception:
+            return {"ok": False, "read_only": True, "code": "bridge_degraded", "last_synced_at": "", "portrait_revision": 0}
+        if not isinstance(result, dict):
+            return {"ok": False, "read_only": True, "code": "bridge_degraded", "last_synced_at": "", "portrait_revision": 0}
+        return {
+            "ok": bool(result.get("ok")),
+            "read_only": True,
+            "code": clean_text(result.get("code"), 80) or "bridge_degraded",
+            "last_synced_at": clean_text(result.get("last_synced_at"), 80),
+            "portrait_revision": int(result.get("portrait_revision") or 0),
+        }
+
+    async def run_unified_profile_portrait_batch(self, person_id: str, *, run_day: str = "") -> dict[str, Any]:
+        getter = getattr(self._plugin, "run_unified_profile_portrait_batch", None)
+        if not callable(getter):
+            return {"ok": False, "code": "bridge_unavailable"}
+        try:
+            result = await getter(clean_text(person_id, 80), run_day=clean_text(run_day, 16))
+        except Exception:
+            return {"ok": False, "code": "bridge_degraded"}
+        return dict(result) if isinstance(result, dict) else {"ok": False, "code": "bridge_degraded"}
+
     async def search_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
         return await self.read_bot_personal_profile(query=query, limit=limit)
 
@@ -1312,6 +1382,9 @@ class MemoryCompanionBridge:
                 "consume_context_projection",
                 "read_bot_profile",
                 "read_profile",
+                "read_unified_profile_portrait",
+                "unified_profile_portrait_status",
+                "run_unified_profile_portrait_batch",
                 "p5_capability_status",
                 "provenance_snapshot",
                 "provenance_preview",

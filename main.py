@@ -100,8 +100,9 @@ class MemoryCompanionPlugin(Star):
     async def memory_companion_recall_tool(self, event: AstrMessageEvent, **kwargs: Any) -> str:
         """从 MemoryCompanion 中主动回忆当前会话可见的长期记忆。
 
-        返回内容只是与当前问题相关的候选，不代表必须在回复中提及。群聊中标记为 acl_allowed 的私聊候选，
-        仅在当前发言者的核心意图确实需要其本人事实时使用；普通陈述、转述、反问或意图不清时忽略，禁止主动公开。
+        返回内容只是与当前问题相关的候选，不代表必须在回复中提及。REQ-036 下，私聊原始记忆、
+        个人档案和 ACL 标记都不能作为群聊回忆候选；群聊中的低敏本人画像仅能经 Companion 的
+        精确身份和专用画像 Bridge 在检索前裁决后提供。
 
         Args:
             query(string): 要回忆的关键词或自然语言问题。
