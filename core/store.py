@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from contextlib import closing, contextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 import re
 import sqlite3
 import threading
@@ -14,6 +16,8 @@ from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads,
 
 
 class MemoryStore:
+    EMBEDDING_CANDIDATE_CACHE_MAX = 64
+
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -485,6 +489,54 @@ class MemoryStore:
                     updated_at TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(memory_id, provider_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS emotion_events (
+                    event_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    trace_id TEXT NOT NULL DEFAULT '',
+                    producer_plugin TEXT NOT NULL DEFAULT '',
+                    origin_kind TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL DEFAULT '',
+                    bot_id TEXT NOT NULL DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    actor_ref TEXT NOT NULL DEFAULT '{}',
+                    target_ref TEXT NOT NULL DEFAULT '{}',
+                    quoted_target_ref TEXT NOT NULL DEFAULT '{}',
+                    event_type TEXT NOT NULL DEFAULT 'neutral',
+                    intensity REAL NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0,
+                    valence_hint REAL NOT NULL DEFAULT 0,
+                    arousal_hint REAL NOT NULL DEFAULT 0,
+                    vulnerability_hint REAL NOT NULL DEFAULT 0,
+                    source_rule TEXT NOT NULL DEFAULT '',
+                    occurred_at TEXT NOT NULL DEFAULT '',
+                    expires_at TEXT NOT NULL DEFAULT '',
+                    dedupe_key TEXT NOT NULL DEFAULT '',
+                    payload_hash TEXT NOT NULL DEFAULT '',
+                    privacy_level TEXT NOT NULL DEFAULT 'redacted',
+                    applied_interaction TEXT NOT NULL DEFAULT '',
+                    applied_energy_delta REAL NOT NULL DEFAULT 0,
+                    correction_of TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'observed',
+                    reason_codes TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(event_id, revision)
+                );
+
+                CREATE TABLE IF NOT EXISTS emotion_event_deliveries (
+                    event_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    consumer_id TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    first_delivered_at TEXT NOT NULL DEFAULT '',
+                    last_delivered_at TEXT NOT NULL DEFAULT '',
+                    acked_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(event_id, revision, consumer_id),
+                    FOREIGN KEY(event_id, revision)
+                        REFERENCES emotion_events(event_id, revision)
+                        ON DELETE CASCADE
+                );
                 """
             )
             self._ensure_memory_columns_sync()
@@ -536,6 +588,23 @@ class MemoryStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_embeddings_provider ON memory_embeddings(provider_id, updated_at)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_trace ON emotion_events(trace_id, revision)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_session ON emotion_events(bot_id, scope, session_id, occurred_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_delivery_domain "
+                "ON emotion_events(bot_id, scope, platform, occurred_at DESC, event_id DESC, revision DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_events_dedupe ON emotion_events(dedupe_key, event_type)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emotion_event_deliveries_pending "
+                "ON emotion_event_deliveries(consumer_id, acked_at, last_delivered_at)"
             )
             self._conn.commit()
 
@@ -1421,14 +1490,14 @@ class MemoryStore:
             self._conn.commit()
         return row_id
 
-    async def list_identities(self, limit: int = 1000) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._list_identities_sync, limit)
+    async def list_identities(self, limit: int = 1000, *, offset: int = 0) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._list_identities_sync, limit, offset)
 
-    def _list_identities_sync(self, limit: int) -> list[dict[str, Any]]:
+    def _list_identities_sync(self, limit: int, offset: int) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM identities ORDER BY updated_at DESC LIMIT ?",
-                (max(1, int(limit)),),
+                "SELECT * FROM identities ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (max(1, int(limit)), max(0, int(offset))),
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
@@ -1563,6 +1632,8 @@ class MemoryStore:
         scope: str = "",
         session_id: str = "",
         group_id: str = "",
+        *,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
             self._list_relationships_sync,
@@ -1571,6 +1642,7 @@ class MemoryStore:
             scope,
             session_id,
             group_id,
+            offset,
         )
 
     def _list_relationships_sync(
@@ -1580,6 +1652,7 @@ class MemoryStore:
         scope: str,
         session_id: str,
         group_id: str,
+        offset: int,
     ) -> list[dict[str, Any]]:
         params: list[Any] = []
         where = "1=1"
@@ -1601,9 +1674,9 @@ class MemoryStore:
                 SELECT * FROM relationship_edges
                 WHERE {where}
                 ORDER BY updated_at DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                params + [max(1, int(limit))],
+                params + [max(1, int(limit)), max(0, int(offset))],
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1814,8 +1887,8 @@ class MemoryStore:
             params.append(clean_text(group_id, 120))
         node = clean_text(node, 160)
         if node:
-            where += " AND (s.label LIKE ? OR t.label LIKE ?)"
-            like = f"%{node}%"
+            where += " AND (s.label LIKE ? ESCAPE '\\' OR t.label LIKE ? ESCAPE '\\')"
+            like = self._like_pattern(node)
             params.extend([like, like])
         with self._lock:
             rows = self._conn.execute(
@@ -2067,8 +2140,8 @@ class MemoryStore:
         if group_id:
             scope_filter += " AND (n.group_id='' OR n.group_id=?)"
             params.append(group_id)
-        like_sql = " OR ".join(["lower(n.label) LIKE ?" for _ in cleaned_terms])
-        like_params = [f"%{term}%" for term in cleaned_terms]
+        like_sql = " OR ".join(["lower(n.label) LIKE ? ESCAPE '\\'" for _ in cleaned_terms])
+        like_params = [self._like_pattern(term) for term in cleaned_terms]
         with self._lock:
             matched = self._conn.execute(
                 f"""
@@ -3409,8 +3482,17 @@ class MemoryStore:
         scope: str = "",
         session_id: str = "",
         entity_id: str = "",
+        *,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._recent_timeline_sync, limit, scope, session_id, entity_id)
+        return await asyncio.to_thread(
+            self._recent_timeline_sync,
+            limit,
+            scope,
+            session_id,
+            entity_id,
+            offset,
+        )
 
     def _recent_timeline_sync(
         self,
@@ -3418,6 +3500,7 @@ class MemoryStore:
         scope: str,
         session_id: str,
         entity_id: str,
+        offset: int,
     ) -> list[dict[str, Any]]:
         params: list[Any] = []
         where = "1=1"
@@ -3436,9 +3519,9 @@ class MemoryStore:
                 SELECT * FROM timeline
                 WHERE {where}
                 ORDER BY occurred_at DESC, created_at DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                params + [max(1, int(limit))],
+                params + [max(1, int(limit)), max(0, int(offset))],
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -4385,6 +4468,7 @@ class MemoryStore:
         self,
         *,
         limit: int = 50,
+        offset: int = 0,
         include_pending: bool = True,
         query: str = "",
         memory_type: str = "",
@@ -4399,6 +4483,7 @@ class MemoryStore:
         return await self._run_recoverable_database_operation(
             self._list_memories_sync,
             limit,
+            offset,
             include_pending,
             query,
             memory_type,
@@ -4414,6 +4499,7 @@ class MemoryStore:
     def _list_memories_sync(
         self,
         limit: int,
+        offset: int,
         include_pending: bool,
         query: str,
         memory_type: str,
@@ -4430,11 +4516,11 @@ class MemoryStore:
         if not include_pending:
             where += " AND review_status != 'pending'"
         if query:
-            like = f"%{clean_text(query, 500)}%"
+            like = self._like_pattern(query)
             where += (
-                " AND (id LIKE ? OR content LIKE ? OR evidence LIKE ? OR subject_id LIKE ?"
-                " OR subject_name LIKE ? OR object_id LIKE ? OR object_name LIKE ?"
-                " OR session_id LIKE ? OR group_id LIKE ?)"
+                " AND (id LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR evidence LIKE ? ESCAPE '\\' OR subject_id LIKE ? ESCAPE '\\'"
+                " OR subject_name LIKE ? ESCAPE '\\' OR object_id LIKE ? ESCAPE '\\' OR object_name LIKE ? ESCAPE '\\'"
+                " OR session_id LIKE ? ESCAPE '\\' OR group_id LIKE ? ESCAPE '\\')"
             )
             params.extend([like] * 9)
         if memory_type:
@@ -4460,8 +4546,80 @@ class MemoryStore:
             params.append(clean_text(group_id, 120))
         if entity_id:
             entity = clean_text(entity_id, 120)
-            where += " AND (subject_id=? OR object_id=? OR group_id=? OR session_id LIKE ?)"
-            params.extend([entity, entity, entity, f"%{entity}%"])
+            where += " AND (subject_id=? OR object_id=? OR group_id=? OR session_id LIKE ? ESCAPE '\\')"
+            params.extend([entity, entity, entity, self._like_pattern(entity)])
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM memories
+                WHERE {where}
+                ORDER BY occurred_at DESC, created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                params + [max(1, int(limit)), max(0, int(offset))],
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    async def read_user_memory_summary_records(
+        self,
+        user_id: str,
+        *,
+        session_id: str = "",
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        """Read a bounded exact-identity private-memory set for a bridge DTO.
+
+        This is deliberately not a general search: it accepts no display name,
+        has no cross-window expansion, and never reads group rows. A supplied
+        session must itself resolve to the same private user identity.
+        """
+
+        return await self._run_recoverable_database_operation(
+            self._read_user_memory_summary_records_sync,
+            user_id,
+            session_id,
+            limit,
+        )
+
+    def _read_user_memory_summary_records_sync(
+        self,
+        user_id: str,
+        session_id: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        identity = clean_text(user_id, 120)
+        requested_session = clean_text(session_id, 200)
+        empty = {"records": [], "total": 0, "type_counts": {}}
+        if not identity:
+            return empty
+        if requested_session:
+            scope, target_id = parse_scope_from_session(requested_session)
+            if scope != "private" or clean_text(target_id, 120) != identity:
+                return empty
+
+        try:
+            safe_limit = max(1, min(12, int(limit or 8)))
+        except (TypeError, ValueError, OverflowError):
+            safe_limit = 8
+        session_filters = [
+            "%:friendmessage:" + self._escape_like_suffix(identity),
+            "%:privatemessage:" + self._escape_like_suffix(identity),
+            "%:friend:" + self._escape_like_suffix(identity),
+            "%:private:" + self._escape_like_suffix(identity),
+        ]
+        identity_clause = " OR ".join(
+            ["subject_id=?", "object_id=?", *("LOWER(session_id) LIKE ? ESCAPE '\\'" for _ in session_filters)]
+        )
+        params: list[Any] = [identity, identity, *session_filters]
+        session_clause = ""
+        if requested_session:
+            session_clause = " AND session_id=?"
+            params.append(requested_session)
+        where = (
+            "scope='private' AND review_status!='pending' "
+            "AND visibility IN ('private_pair', 'shareable') "
+            f"AND ({identity_clause}){session_clause}"
+        )
         with self._lock:
             rows = self._conn.execute(
                 f"""
@@ -4470,9 +4628,41 @@ class MemoryStore:
                 ORDER BY occurred_at DESC, created_at DESC
                 LIMIT ?
                 """,
-                params + [max(1, int(limit))],
+                [*params, safe_limit],
             ).fetchall()
-        return [MemoryRecord.from_row(row) for row in rows]
+            total_row = self._conn.execute(
+                f"SELECT COUNT(*) AS count FROM memories WHERE {where}",
+                params,
+            ).fetchone()
+            type_rows = self._conn.execute(
+                f"SELECT memory_type, COUNT(*) AS count FROM memories WHERE {where} GROUP BY memory_type",
+                params,
+            ).fetchall()
+
+        records: list[MemoryRecord] = []
+        for row in rows:
+            record = MemoryRecord.from_row(row)
+            parsed_scope, parsed_target = parse_scope_from_session(clean_text(record.session_id, 200))
+            direct_identity = identity in {clean_text(record.subject.id, 120), clean_text(record.object.id, 120)}
+            session_identity = parsed_scope == "private" and clean_text(parsed_target, 120) == identity
+            if requested_session and record.session_id != requested_session:
+                continue
+            if direct_identity or session_identity:
+                records.append(record)
+        type_counts = {
+            clean_text(row["memory_type"], 80): max(0, int(row["count"] or 0))
+            for row in type_rows
+            if clean_text(row["memory_type"], 80)
+        }
+        return {
+            "records": records,
+            "total": max(0, int(total_row["count"] or 0)) if total_row else 0,
+            "type_counts": type_counts,
+        }
+
+    @staticmethod
+    def _escape_like_suffix(value: str) -> str:
+        return clean_text(value, 120).lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     async def list_memory_buckets(
         self,
@@ -4495,7 +4685,7 @@ class MemoryStore:
         if not user_id:
             return ""
         bot_clause = ""
-        params: list[Any] = [user_id, user_id, f"%{user_id}%"]
+        params: list[Any] = [user_id, user_id, self._like_pattern(user_id)]
         if bot_id:
             bot_clause = """
                   AND (
@@ -4519,7 +4709,7 @@ class MemoryStore:
                     MAX(COALESCE(NULLIF(occurred_at, ''), created_at)) AS latest_at
                 FROM memories
                 WHERE scope='private' AND session_id!=''
-                  AND (subject_id=? OR object_id=? OR session_id LIKE ?)
+                  AND (subject_id=? OR object_id=? OR session_id LIKE ? ESCAPE '\\')
                   {bot_clause}
                 GROUP BY session_id
                 ORDER BY native_count DESC, total_count DESC, latest_at DESC
@@ -5986,6 +6176,8 @@ class MemoryStore:
             result.append((MemoryRecord.from_row(row), vector, clean_text(row["embedding_text_hash"], 80)))
         with self._lock:
             self._embedding_candidate_cache[cache_key] = result
+            while len(self._embedding_candidate_cache) > self.EMBEDDING_CANDIDATE_CACHE_MAX:
+                self._embedding_candidate_cache.pop(next(iter(self._embedding_candidate_cache)), None)
         return deepcopy(result)
 
     async def list_memories_missing_embeddings(
@@ -6146,3 +6338,709 @@ class MemoryStore:
             )
             self._conn.commit()
         return row_id
+
+    async def upsert_emotion_event(self, value: Any) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(self._upsert_emotion_event_sync, value)
+
+    def _upsert_emotion_event_sync(self, value: Any) -> dict[str, Any]:
+        from .emotion_event_contract import normalize_emotion_event
+
+        event = normalize_emotion_event(value, producer_plugin="memory_companion")
+        with self._lock:
+            with self._transaction_sync():
+                existing_rows = self._conn.execute(
+                    "SELECT * FROM emotion_events WHERE event_id=?",
+                    (event["event_id"],),
+                ).fetchall()
+                event_domain = self._emotion_event_identity_domain(event)
+                if any(
+                    self._emotion_event_identity_domain(self._emotion_event_row(row)) != event_domain
+                    for row in existing_rows
+                ):
+                    raise ValueError("emotion event_id is already bound to another identity domain")
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO emotion_events(
+                        event_id, revision, trace_id, producer_plugin, origin_kind, platform,
+                        bot_id, scope, session_id, actor_ref, target_ref, quoted_target_ref,
+                        event_type, intensity, confidence, valence_hint, arousal_hint,
+                        vulnerability_hint, source_rule, occurred_at, expires_at, dedupe_key,
+                        payload_hash, privacy_level, applied_interaction, applied_energy_delta,
+                        correction_of, status, reason_codes, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event["event_id"], event["revision"], event["trace_id"], event["producer_plugin"],
+                        event["origin_kind"], event["platform"], event["bot_id"], event["scope"],
+                        event["session_id"], json_dumps(event["actor_ref"]), json_dumps(event["target_ref"]),
+                        json_dumps(event["quoted_target_ref"]), event["event_type"], event["intensity"],
+                        event["confidence"], event["valence_hint"], event["arousal_hint"],
+                        event["vulnerability_hint"], event["source_rule"], event["occurred_at"],
+                        event["expires_at"], event["dedupe_key"], event["payload_hash"],
+                        event["privacy_level"], event["applied_interaction"], event["applied_energy_delta"],
+                        event["correction_of"], event["status"], json_dumps(event["reason_codes"]), utc_now(),
+                    ),
+                )
+        return event
+
+    async def get_emotion_trace(self, trace_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
+        return await self._run_recoverable_database_operation(self._get_emotion_trace_sync, trace_id, limit)
+
+    def _get_emotion_trace_sync(self, trace_id: str, limit: int) -> list[dict[str, Any]]:
+        trace = clean_text(trace_id, 96)
+        if not trace:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM emotion_events WHERE trace_id=? ORDER BY revision ASC LIMIT ?",
+                (trace, max(1, min(500, int(limit or 100)))),
+            ).fetchall()
+        return [self._emotion_event_row(row) for row in rows]
+
+    async def get_emotion_trace_diagnostic(
+        self,
+        trace_id: str,
+        *,
+        bot_id: str = "",
+        scope: str = "",
+        session_id: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return await self._run_recoverable_database_operation(
+            self._get_emotion_trace_diagnostic_sync, trace_id, bot_id, scope, session_id, limit
+        )
+
+    def _get_emotion_trace_diagnostic_sync(
+        self,
+        trace_id: str,
+        bot_id: str,
+        scope: str,
+        session_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        trace = clean_text(trace_id, 96)
+        if not trace:
+            return []
+        clauses = ["e.trace_id=?"]
+        params: list[Any] = [trace]
+        for column, value, size in (("bot_id", bot_id, 160), ("scope", scope, 24), ("session_id", session_id, 220)):
+            cleaned = clean_text(value, size)
+            if cleaned:
+                clauses.append(f"e.{column}=?")
+                params.append(cleaned)
+        params.append(max(1, min(100, int(limit or 100))))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT e.* FROM emotion_events e WHERE {' AND '.join(clauses)} ORDER BY e.revision ASC LIMIT ?",
+                params,
+            ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                event = self._emotion_event_row(row)
+                delivery_rows = self._conn.execute(
+                    """
+                    SELECT consumer_id, attempts, first_delivered_at, last_delivered_at, acked_at
+                    FROM emotion_event_deliveries
+                    WHERE event_id=? AND revision=?
+                    ORDER BY consumer_id ASC LIMIT 20
+                    """,
+                    (event["event_id"], event["revision"]),
+                ).fetchall()
+                deliveries = []
+                for delivery in delivery_rows:
+                    values = dict(delivery)
+                    values["consumer_id"] = clean_text(
+                        values.get("consumer_id"), 120
+                    ).split("@", 1)[0]
+                    deliveries.append(values)
+                result.append(self._emotion_diagnostic_projection(event, deliveries))
+        return result
+
+    async def get_emotion_trace_summary(
+        self,
+        *,
+        bot_id: str = "",
+        scope: str = "",
+        session_id: str = "",
+        cursor: str = "",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._get_emotion_trace_summary_sync, bot_id, scope, session_id, cursor, limit
+        )
+
+    def _get_emotion_trace_summary_sync(
+        self,
+        bot_id: str,
+        scope: str,
+        session_id: str,
+        cursor: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        for column, value, size in (("bot_id", bot_id, 160), ("scope", scope, 24), ("session_id", session_id, 220)):
+            cleaned = clean_text(value, size)
+            if cleaned:
+                clauses.append(f"e.{column}=?")
+                params.append(cleaned)
+        try:
+            offset = max(0, min(100000, int(cursor or 0)))
+        except (TypeError, ValueError):
+            offset = 0
+        bounded = max(1, min(100, int(limit or 20)))
+        params.extend((bounded + 1, offset))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT e.*
+                FROM emotion_events e
+                WHERE {' AND '.join(clauses)}
+                  AND {self._emotion_latest_revision_clause('e', 'newer')}
+                ORDER BY e.occurred_at DESC, e.event_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+        page = [self._emotion_event_row(row) for row in rows[:bounded]]
+        return {
+            "items": [{
+                "trace_id": clean_text(item.get("trace_id"), 96),
+                "event_id": clean_text(item.get("event_id"), 96),
+                "revision": int(item.get("revision") or 1),
+                "event_type": clean_text(item.get("event_type"), 48),
+                "status": clean_text(item.get("status"), 24),
+                "occurred_at": clean_text(item.get("occurred_at"), 48),
+                "session_hash": self._diagnostic_hash(item.get("session_id")),
+            } for item in page],
+            "next_cursor": str(offset + bounded) if len(rows) > bounded else "",
+            "has_more": len(rows) > bounded,
+        }
+
+    @classmethod
+    def _emotion_diagnostic_projection(cls, event: dict[str, Any], deliveries: list[sqlite3.Row]) -> dict[str, Any]:
+        return {
+            "schema_version": "emotion_trace_diagnostic.v1",
+            "event_id": clean_text(event.get("event_id"), 96),
+            "trace_id": clean_text(event.get("trace_id"), 96),
+            "revision": int(event.get("revision") or 1),
+            "producer_plugin": clean_text(event.get("producer_plugin"), 80),
+            "origin_kind": clean_text(event.get("origin_kind"), 40),
+            "event_type": clean_text(event.get("event_type"), 48),
+            "intensity": float(event.get("intensity") or 0.0),
+            "confidence": float(event.get("confidence") or 0.0),
+            "status": clean_text(event.get("status"), 24),
+            "source_rule": clean_text(event.get("source_rule"), 80),
+            "occurred_at": clean_text(event.get("occurred_at"), 48),
+            "applied_interaction": clean_text(event.get("applied_interaction"), 32),
+            "applied_energy_delta": float(event.get("applied_energy_delta") or 0.0),
+            "correction_of": clean_text(event.get("correction_of"), 96),
+            "actor": cls._diagnostic_ref(event.get("actor_ref")),
+            "target": cls._diagnostic_ref(event.get("target_ref")),
+            "quoted_target": cls._diagnostic_ref(event.get("quoted_target_ref")),
+            "scope": clean_text(event.get("scope"), 24),
+            "session_hash": cls._diagnostic_hash(event.get("session_id")),
+            "deliveries": [{
+                "consumer_id": clean_text(row["consumer_id"], 80),
+                "attempts": max(0, int(row["attempts"] or 0)),
+                "first_delivered_at": clean_text(row["first_delivered_at"], 48),
+                "last_delivered_at": clean_text(row["last_delivered_at"], 48),
+                "acked": bool(row["acked_at"]),
+                "acked_at": clean_text(row["acked_at"], 48),
+            } for row in deliveries],
+        }
+
+    @classmethod
+    def _diagnostic_ref(cls, value: Any) -> dict[str, str]:
+        source = value if isinstance(value, dict) else {}
+        return {
+            "kind": clean_text(source.get("kind"), 24),
+            "role": clean_text(source.get("role"), 40),
+            "id_hash": cls._diagnostic_hash(source.get("id")),
+        }
+
+    @staticmethod
+    def _diagnostic_hash(value: Any) -> str:
+        cleaned = clean_text(value, 220)
+        return hashlib.sha256(cleaned.encode("utf-8", errors="ignore")).hexdigest()[:12] if cleaned else ""
+
+    async def list_emotion_events(
+        self,
+        *,
+        bot_id: str = "",
+        session_id: str = "",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        return await self._run_recoverable_database_operation(
+            self._list_emotion_events_sync, bot_id, session_id, limit
+        )
+
+    def _list_emotion_events_sync(self, bot_id: str, session_id: str, limit: int) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if clean_text(bot_id, 160):
+            clauses.append("bot_id=?")
+            params.append(clean_text(bot_id, 160))
+        if clean_text(session_id, 220):
+            clauses.append("session_id=?")
+            params.append(clean_text(session_id, 220))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(500, int(limit or 50))))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM emotion_events{where} ORDER BY occurred_at DESC, revision DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return [self._emotion_event_row(row) for row in rows]
+
+    async def list_emotion_event_deliveries(
+        self,
+        *,
+        consumer_id: str,
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool = False,
+        cursor: str = "",
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._list_emotion_event_deliveries_sync,
+            consumer_id,
+            bot_id,
+            scope,
+            platform,
+            user_id,
+            session_id,
+            allow_cross_window,
+            cursor,
+            limit,
+        )
+
+    def _list_emotion_event_deliveries_sync(
+        self,
+        consumer_id: str,
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool,
+        cursor: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        domain = self._emotion_delivery_domain(
+            consumer_id=consumer_id,
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+            allow_cross_window=allow_cross_window,
+        )
+        if domain is None:
+            return self._empty_emotion_delivery("delivery_domain_required")
+        try:
+            bounded_limit = max(1, min(20, int(limit or 10)))
+        except (TypeError, ValueError):
+            bounded_limit = 10
+        cursor_value = clean_text(cursor, 400)
+        cursor_position = self._parse_emotion_delivery_cursor(cursor_value)
+        if cursor_value and cursor_position is None:
+            return self._empty_emotion_delivery()
+        delivery_consumer_id = self._emotion_delivery_consumer_key(
+            domain["consumer_id"], domain
+        )
+        clauses = [
+            "e.origin_kind='memory_recall'",
+            "e.status NOT IN ('ignored','expired')",
+            "COALESCE(d.acked_at, '')=''",
+            "e.bot_id=?",
+            "LOWER(e.scope)=?",
+            "e.platform=?",
+            "json_valid(e.actor_ref)",
+            "json_extract(e.actor_ref, '$.kind')='user'",
+            "CAST(json_extract(e.actor_ref, '$.id') AS TEXT)=?",
+            "json_valid(e.target_ref)",
+            "json_extract(e.target_ref, '$.kind')='bot'",
+            "CAST(json_extract(e.target_ref, '$.id') AS TEXT)=?",
+            """(
+                e.expires_at=''
+                OR (
+                    (instr(e.expires_at, 'Z') > 0 OR substr(e.expires_at, -6, 1) IN ('+', '-'))
+                    AND julianday(e.expires_at) IS NOT NULL
+                    AND julianday(e.expires_at) > julianday('now')
+                )
+            )""",
+        ]
+        params: list[Any] = [
+            delivery_consumer_id,
+            domain["bot_id"],
+            domain["scope"],
+            domain["platform"],
+            domain["user_id"],
+            domain["bot_id"],
+        ]
+        if not domain["allow_cross_window"]:
+            clauses.append("e.session_id=?")
+            params.append(domain["session_id"])
+        if cursor_position is not None:
+            occurred_at, event_id, revision = cursor_position
+            clauses.append(
+                """(
+                    e.occurred_at < ?
+                    OR (e.occurred_at=? AND e.event_id < ?)
+                    OR (e.occurred_at=? AND e.event_id=? AND e.revision < ?)
+                )"""
+            )
+            params.extend((
+                occurred_at,
+                occurred_at,
+                event_id,
+                occurred_at,
+                event_id,
+                revision,
+            ))
+        params.append(bounded_limit + 1)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT e.*
+                FROM emotion_events e
+                LEFT JOIN emotion_event_deliveries d
+                  ON d.event_id=e.event_id AND d.revision=e.revision AND d.consumer_id=?
+                WHERE {' AND '.join(clauses)}
+                  AND {self._emotion_latest_revision_clause('e', 'newer')}
+                ORDER BY e.occurred_at DESC, e.event_id DESC, e.revision DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            events = [
+                event
+                for event in (self._emotion_event_row(row) for row in rows)
+                if (
+                    self._emotion_event_in_delivery_domain(event, domain)
+                    and not self._emotion_event_is_expired(event)
+                )
+            ]
+            page = events[:bounded_limit]
+            has_more = len(events) > bounded_limit
+            delivered_at = utc_now()
+            for event in page:
+                self._conn.execute(
+                    """
+                    INSERT INTO emotion_event_deliveries(
+                        event_id, revision, consumer_id, attempts,
+                        first_delivered_at, last_delivered_at, acked_at
+                    ) VALUES(?,?,?,1,?,?,'')
+                    ON CONFLICT(event_id, revision, consumer_id) DO UPDATE SET
+                        attempts=emotion_event_deliveries.attempts+1,
+                        last_delivered_at=excluded.last_delivered_at
+                    """,
+                    (
+                        event["event_id"],
+                        event["revision"],
+                        delivery_consumer_id,
+                        delivered_at,
+                        delivered_at,
+                    ),
+                )
+            self._conn.commit()
+        projection = [self._emotion_delivery_projection(event) for event in page]
+        return {
+            "schema_version": "emotion_afterglow_delivery.v1",
+            "events": projection,
+            "next_cursor": self._emotion_delivery_cursor(page[-1]) if page and has_more else "",
+            "has_more": has_more,
+        }
+
+    async def ack_emotion_event_deliveries(
+        self,
+        *,
+        consumer_id: str,
+        event_refs: list[dict[str, Any]],
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool = False,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._ack_emotion_event_deliveries_sync,
+            consumer_id,
+            event_refs,
+            bot_id,
+            scope,
+            platform,
+            user_id,
+            session_id,
+            allow_cross_window,
+        )
+
+    def _ack_emotion_event_deliveries_sync(
+        self,
+        consumer_id: str,
+        event_refs: list[dict[str, Any]],
+        bot_id: str,
+        scope: str,
+        platform: str,
+        user_id: str,
+        session_id: str,
+        allow_cross_window: bool,
+    ) -> dict[str, Any]:
+        domain = self._emotion_delivery_domain(
+            consumer_id=consumer_id,
+            bot_id=bot_id,
+            scope=scope,
+            platform=platform,
+            user_id=user_id,
+            session_id=session_id,
+            allow_cross_window=allow_cross_window,
+        )
+        if domain is None or not isinstance(event_refs, list):
+            return {"acked": 0, "consumer_id": clean_text(consumer_id, 80), "error_code": "delivery_domain_required"}
+        unique_refs: set[tuple[str, int]] = set()
+        for item in event_refs[:100]:
+            if not isinstance(item, dict):
+                continue
+            event_id = clean_text(item.get("event_id"), 96)
+            try:
+                revision = max(1, min(1000000, int(item.get("revision") or 1)))
+            except (TypeError, ValueError):
+                continue
+            if event_id:
+                unique_refs.add((event_id, revision))
+        acked_at = utc_now()
+        acked = 0
+        delivery_consumer_id = self._emotion_delivery_consumer_key(
+            domain["consumer_id"], domain
+        )
+        with self._lock:
+            for event_id, revision in unique_refs:
+                row = self._conn.execute(
+                    "SELECT * FROM emotion_events WHERE event_id=? AND revision=?",
+                    (event_id, revision),
+                ).fetchone()
+                if row is None:
+                    continue
+                event = self._emotion_event_row(row)
+                if (
+                    not self._emotion_event_in_delivery_domain(event, domain)
+                    or self._emotion_event_is_expired(event)
+                ):
+                    continue
+                result = self._conn.execute(
+                    """
+                    UPDATE emotion_event_deliveries
+                    SET acked_at=?
+                    WHERE event_id=? AND revision=? AND consumer_id=? AND acked_at=''
+                    """,
+                    (acked_at, event_id, revision, delivery_consumer_id),
+                )
+                acked += max(0, int(result.rowcount or 0))
+            self._conn.commit()
+        return {"acked": acked, "consumer_id": domain["consumer_id"], "acked_at": acked_at}
+
+    @staticmethod
+    def _empty_emotion_delivery(error_code: str = "") -> dict[str, Any]:
+        result = {
+            "schema_version": "emotion_afterglow_delivery.v1",
+            "events": [],
+            "next_cursor": "",
+            "has_more": False,
+        }
+        if error_code:
+            result["error_code"] = error_code
+        return result
+
+    @staticmethod
+    def _emotion_delivery_domain(
+        *,
+        consumer_id: Any,
+        bot_id: Any,
+        scope: Any,
+        platform: Any,
+        user_id: Any,
+        session_id: Any,
+        allow_cross_window: Any,
+    ) -> dict[str, Any] | None:
+        domain = {
+            "consumer_id": clean_text(consumer_id, 80),
+            "bot_id": clean_text(bot_id, 160),
+            "scope": clean_text(scope, 24).lower(),
+            "platform": clean_text(platform, 80),
+            "user_id": clean_text(user_id, 160),
+            "session_id": clean_text(session_id, 220),
+            "allow_cross_window": allow_cross_window,
+        }
+        if (
+            not all(domain[key] for key in ("consumer_id", "bot_id", "platform", "user_id", "session_id"))
+            or domain["scope"] != "private"
+            or type(domain["allow_cross_window"]) is not bool
+        ):
+            return None
+        return domain
+
+    @staticmethod
+    def _emotion_event_in_delivery_domain(event: dict[str, Any], domain: dict[str, Any]) -> bool:
+        actor = event.get("actor_ref") if isinstance(event.get("actor_ref"), dict) else {}
+        target = event.get("target_ref") if isinstance(event.get("target_ref"), dict) else {}
+        return (
+            clean_text(event.get("origin_kind"), 40) == "memory_recall"
+            and clean_text(event.get("bot_id"), 160) == domain["bot_id"]
+            and clean_text(event.get("scope"), 24).lower() == domain["scope"]
+            and clean_text(event.get("platform"), 80) == domain["platform"]
+            and clean_text(actor.get("kind"), 24) == "user"
+            and clean_text(actor.get("id"), 160) == domain["user_id"]
+            and clean_text(target.get("kind"), 24) == "bot"
+            and clean_text(target.get("id"), 160) == domain["bot_id"]
+            and (
+                domain["allow_cross_window"]
+                or clean_text(event.get("session_id"), 220) == domain["session_id"]
+            )
+        )
+
+    @staticmethod
+    def _emotion_event_identity_domain(event: dict[str, Any]) -> tuple[str, ...]:
+        actor = event.get("actor_ref") if isinstance(event.get("actor_ref"), dict) else {}
+        target = event.get("target_ref") if isinstance(event.get("target_ref"), dict) else {}
+        return (
+            clean_text(event.get("producer_plugin"), 80),
+            clean_text(event.get("origin_kind"), 40),
+            clean_text(event.get("platform"), 80),
+            clean_text(event.get("bot_id"), 160),
+            clean_text(event.get("scope"), 24).lower(),
+            clean_text(event.get("session_id"), 220),
+            clean_text(actor.get("kind"), 24),
+            clean_text(actor.get("id"), 160),
+            clean_text(target.get("kind"), 24),
+            clean_text(target.get("id"), 160),
+        )
+
+    @staticmethod
+    def _emotion_delivery_consumer_key(consumer_id: str, domain: dict[str, Any]) -> str:
+        """Namespace delivery state so legacy duplicate event IDs cannot share acks."""
+
+        identity = json_dumps({
+            "consumer_id": clean_text(consumer_id, 80),
+            "bot_id": clean_text(domain.get("bot_id"), 160),
+            "scope": clean_text(domain.get("scope"), 24).lower(),
+            "platform": clean_text(domain.get("platform"), 80),
+            "user_id": clean_text(domain.get("user_id"), 160),
+            "session_id": clean_text(domain.get("session_id"), 220),
+        })
+        return f"{clean_text(consumer_id, 80)}@{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+
+    @staticmethod
+    def _emotion_latest_revision_clause(event_alias: str, newer_alias: str) -> str:
+        def ref_value(alias: str, column: str, key: str) -> str:
+            return (
+                f"COALESCE(CASE WHEN json_valid({alias}.{column}) "
+                f"THEN CAST(json_extract({alias}.{column}, '$.{key}') AS TEXT) END, '')"
+            )
+
+        return f"""NOT EXISTS (
+            SELECT 1
+            FROM emotion_events {newer_alias}
+            WHERE {newer_alias}.event_id={event_alias}.event_id
+              AND {newer_alias}.producer_plugin={event_alias}.producer_plugin
+              AND {newer_alias}.origin_kind={event_alias}.origin_kind
+              AND {newer_alias}.platform={event_alias}.platform
+              AND {newer_alias}.bot_id={event_alias}.bot_id
+              AND LOWER({newer_alias}.scope)=LOWER({event_alias}.scope)
+              AND {newer_alias}.session_id={event_alias}.session_id
+              AND {ref_value(newer_alias, 'actor_ref', 'kind')}={ref_value(event_alias, 'actor_ref', 'kind')}
+              AND {ref_value(newer_alias, 'actor_ref', 'id')}={ref_value(event_alias, 'actor_ref', 'id')}
+              AND {ref_value(newer_alias, 'target_ref', 'kind')}={ref_value(event_alias, 'target_ref', 'kind')}
+              AND {ref_value(newer_alias, 'target_ref', 'id')}={ref_value(event_alias, 'target_ref', 'id')}
+              AND {newer_alias}.revision>{event_alias}.revision
+        )"""
+
+    @staticmethod
+    def _emotion_event_is_expired(event: dict[str, Any], *, now: datetime | None = None) -> bool:
+        expires_at = clean_text(event.get("expires_at"), 48)
+        if not expires_at:
+            return False
+        try:
+            parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return True
+            return parsed.astimezone(timezone.utc) <= (now or datetime.now(timezone.utc))
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    @staticmethod
+    def _emotion_delivery_cursor(event: dict[str, Any]) -> str:
+        return json_dumps({
+            "occurred_at": clean_text(event.get("occurred_at"), 48),
+            "event_id": clean_text(event.get("event_id"), 96),
+            "revision": max(1, int(event.get("revision") or 1)),
+        })
+
+    @staticmethod
+    def _parse_emotion_delivery_cursor(value: Any) -> tuple[str, str, int] | None:
+        cursor = clean_text(value, 400)
+        if not cursor:
+            return None
+        payload = json_loads(cursor, {})
+        if isinstance(payload, dict):
+            occurred_at = clean_text(payload.get("occurred_at"), 48)
+            event_id = clean_text(payload.get("event_id"), 96)
+            revision = payload.get("revision")
+            try:
+                normalized_revision = max(1, min(1_000_000, int(revision)))
+            except (TypeError, ValueError):
+                normalized_revision = 0
+            if occurred_at and event_id and normalized_revision:
+                return occurred_at, event_id, normalized_revision
+        legacy = cursor.rsplit("|", 2)
+        if len(legacy) != 3:
+            return None
+        occurred_at = clean_text(legacy[0], 48)
+        event_id = clean_text(legacy[1], 96)
+        try:
+            revision = max(1, min(1_000_000, int(legacy[2])))
+        except (TypeError, ValueError):
+            return None
+        return (occurred_at, event_id, revision) if occurred_at and event_id else None
+
+    @staticmethod
+    def _emotion_delivery_projection(event: dict[str, Any]) -> dict[str, Any]:
+        from .affect_modulation import normalize_affect_modulation
+
+        projection = {
+            "event_id": clean_text(event.get("event_id"), 96),
+            "revision": max(1, int(event.get("revision") or 1)),
+            "trace_id": clean_text(event.get("trace_id"), 96),
+            "event_type": clean_text(event.get("event_type"), 48),
+            "intensity": float(event.get("intensity") or 0.0),
+            "confidence": float(event.get("confidence") or 0.0),
+            "energy_delta": float(event.get("applied_energy_delta") or 0.0),
+            "valence": float(event.get("valence_hint") or 0.0),
+            "arousal": float(event.get("arousal_hint") or 0.0),
+            "vulnerability": float(event.get("vulnerability_hint") or 0.0),
+            "occurred_at": clean_text(event.get("occurred_at"), 48),
+            "expires_at": clean_text(event.get("expires_at"), 48),
+        }
+        projection["affect_modulation"] = normalize_affect_modulation({
+            "valence": projection["valence"],
+            "arousal": projection["arousal"],
+            "vulnerability": projection["vulnerability"],
+            "confidence": projection["confidence"],
+            "source_event_ids": [projection["event_id"]],
+        })
+        return projection
+
+    @staticmethod
+    def _emotion_event_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        for key in ("actor_ref", "target_ref", "quoted_target_ref"):
+            result[key] = json_loads(result.get(key), {})
+        result["reason_codes"] = json_loads(result.get("reason_codes"), [])
+        result.pop("created_at", None)
+        result["schema_version"] = "companion_emotion_event.v1"
+        return result

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -11,7 +12,7 @@ import inspect
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from .astrbot_compat import (
@@ -23,11 +24,24 @@ from .astrbot_compat import (
     remove_temp_text,
     sanitize_request_history,
 )
-from .bridge import serialize_memory
+from .bridge import (
+    consume_authenticated_companion_projection,
+    serialize_memory,
+)
+from .bot_personal_dto import (
+    BotPersonalArchiveDTO,
+    BotPersonalValidationError,
+    bot_personal_payload_fingerprint,
+    build_bot_personal_archive,
+    sanitize_bot_personal_value,
+)
+from .profile_api import build_profile_result
 from .chat_import import HistoricalChatImporter
 from .classifier import MemoryClassifier
 from .config import ConfigView
 from .context_orchestrator import RetrievalIntent, RetrievalIntentBuilder
+from .emotion_event_contract import normalize_emotion_event
+from .emotion_targeting import memory_emotion_refs
 from .identity import IdentityResolver, looks_like_command, maybe_await, normalize_session_context_fields, session_target_id
 from .importance import ImportanceEvaluator
 from .injection import (
@@ -55,6 +69,8 @@ from .operations import (
     detect_preset,
     persist_runtime_config,
 )
+from .provenance import observed_from_companion_snapshot
+from .provenance_store import ProvenanceLedger
 from .qq_history import QQHistoryReader
 from .reply_chain import ReplyChainResolver
 from .retrieval import RetrievalEngine
@@ -63,6 +79,17 @@ from .summarizer import MemorySummarizer
 from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
 from .visibility import VisibilityPolicy
+
+
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+USER_MEMORY_SUMMARY_VERSION = "memory.user_memory_summary.v1"
+_USER_MEMORY_PROFILE_TYPES = frozenset({"user_profile", "user_habit", "manual_memory"})
+_USER_MEMORY_PREFERENCE_TYPES = frozenset({"user_preference"})
+_USER_MEMORY_RELATIONSHIP_TYPES = frozenset({"relationship_claim", "relationship_phase_summary"})
+_USER_MEMORY_CONVERSATION_TYPES = frozenset(
+    {"conversation_event", "conversation_summary", "important_event", "memory_decay_summary", "self_action"}
+)
 
 
 _RECENT_FACT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -224,6 +251,148 @@ class MemoryCompanionService:
         self._relationship_phase_state: dict[str, dict[str, Any]] = {}
         self._RELATIONSHIP_PHASE_FILE = self.data_dir / "memory_companion_relationship_phase.json"
         self._load_relationship_phase_state()
+        self.provenance_ledger = ProvenanceLedger(self.data_dir / "provenance_ledger.json")
+        self._last_p5_gate_status: dict[str, Any] = {"state": "disabled", "enabled": False}
+
+    def _p5_gate_enabled(self, sink: str) -> bool:
+        key = (
+            "private_companion_bridge.enable_p5_b1_recall_gate"
+            if sink == "memory_recall"
+            else "private_companion_bridge.enable_p5_b1_bridge_gate"
+        )
+        return self.config.bool(key, False)
+
+    async def _p5_gate(
+        self,
+        *,
+        event: Any = None,
+        sink: str,
+        attestation: Any = None,
+        consumer: Any = None,
+    ) -> dict[str, Any]:
+        """Consume an opaque Companion attestation when a P5 gate is enabled."""
+
+        if not self._p5_gate_enabled(sink):
+            if attestation is not None and callable(consumer):
+                try:
+                    consumed = consumer(attestation, sink)
+                    if inspect.isawaitable(consumed):
+                        await consumed
+                except Exception:
+                    pass
+            result = {"ok": True, "state": "legacy", "legacy": True, "enabled": False}
+            self._last_p5_gate_status = result
+            return result
+        if attestation is None and event is not None:
+            issuer = getattr(event, "private_companion_p5_issue_attestation", None)
+            if callable(issuer):
+                try:
+                    issued = issuer(sink)
+                except Exception:
+                    issued = None
+                if isinstance(issued, tuple) and len(issued) == 2:
+                    attestation, consumer = issued
+        if attestation is None or not callable(consumer):
+            result = {
+                "ok": False,
+                "state": "degraded",
+                "enabled": True,
+                "error_code": "p5_attestation_required",
+                "warnings": ["legacy_call_not_attested"],
+            }
+            self._last_p5_gate_status = result
+            return result
+        try:
+            snapshot = consumer(attestation, sink)
+            if inspect.isawaitable(snapshot):
+                snapshot = await snapshot
+        except Exception:
+            snapshot = None
+        snapshot_record = observed_from_companion_snapshot("p5_gate", snapshot)
+        snapshot_sink = getattr(snapshot, "sink", None)
+        if snapshot_sink is None and isinstance(snapshot, Mapping):
+            snapshot_sink = snapshot.get("sink")
+        if snapshot_record.get("provenance_state") != "observed" or snapshot_sink != sink:
+            result = {
+                "ok": False,
+                "state": "denied",
+                "enabled": True,
+                "error_code": "p5_attestation_invalid",
+                "warnings": ["invalid_or_replayed_attestation"],
+            }
+            self._last_p5_gate_status = result
+            return result
+        disposition = str(getattr(snapshot, "disposition", "") or "")
+        trust = str(getattr(snapshot, "source_trust", "") or "")
+        if isinstance(snapshot, Mapping):
+            disposition = str(snapshot.get("disposition") or disposition)
+            trust = str(snapshot.get("source_trust") or snapshot.get("trust") or trust)
+        if disposition == "deny_high_risk":
+            state, error_code, allowed = "denied", "p5_high_risk_denied", False
+        elif disposition != "allow" or trust in {"T3", "T4"}:
+            state, error_code, allowed = "shadow", "p5_source_shadowed", False
+        else:
+            state, error_code, allowed = "allowed", "", True
+        result = {
+            "ok": allowed,
+            "state": state,
+            "enabled": True,
+            "snapshot": snapshot,
+            "error_code": error_code or None,
+            "warnings": [] if allowed else [error_code],
+        }
+        self._last_p5_gate_status = {key: value for key, value in result.items() if key != "snapshot"}
+        return result
+
+    def p5_capability_status(self) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        snapshot = ledger.snapshot() if isinstance(ledger, ProvenanceLedger) else {
+            "records": {}, "operation_count": 0, "observation_count": 0, "path_present": False,
+        }
+        return {
+            "schema_version": "ops.p5.provenance.v1",
+            "recall_gate": self._p5_gate_enabled("memory_recall"),
+            "bridge_gate": self._p5_gate_enabled("bridge_serialization"),
+            "last_gate_state": str(getattr(self, "_last_p5_gate_status", {}).get("state") or "disabled"),
+            "provenance_records": len(snapshot.get("records", {})),
+            "provenance_operations": int(snapshot.get("operation_count", 0) or 0),
+            "provenance_observations": int(snapshot.get("observation_count", 0) or 0),
+            "provenance_file_present": bool(snapshot.get("path_present", False)),
+        }
+
+    async def _p5_record_observed(self, memory_ids: list[str], snapshot: Any) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "provenance_ledger_unavailable"}
+        return await asyncio.to_thread(ledger.record_observed, memory_ids, snapshot)
+
+    def provenance_snapshot(self) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        return ledger.snapshot() if isinstance(ledger, ProvenanceLedger) else {"records": {}, "operation_count": 0}
+
+    def provenance_preview(self, candidates: list[Mapping[str, Any]], *, operation_ref_hash: str) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"mode": "preview", "readonly": True, "write_count": 0, "error_codes": ["ledger_unavailable"]}
+        return ledger.preview_legacy(candidates, operation_ref_hash=operation_ref_hash)
+
+    async def provenance_backup(self) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "ledger_unavailable"}
+        return await asyncio.to_thread(ledger.backup)
+
+    async def provenance_apply(self, operation: Mapping[str, Any]) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "ledger_unavailable"}
+        return await asyncio.to_thread(ledger.apply, operation)
+
+    async def provenance_rollback(self, operation: Mapping[str, Any]) -> dict[str, Any]:
+        ledger = getattr(self, "provenance_ledger", None)
+        if not isinstance(ledger, ProvenanceLedger):
+            return {"ok": False, "state": "degraded", "error_code": "ledger_unavailable"}
+        return await asyncio.to_thread(ledger.rollback, operation)
 
     def preview_historical_chat_upload(
         self,
@@ -312,6 +481,8 @@ class MemoryCompanionService:
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
+        self._apply_companion_relationship_projection(ctx, event=event, req=req)
+        self._apply_companion_expression_decision(ctx, event=event, req=req)
         self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
@@ -627,6 +798,106 @@ class MemoryCompanionService:
             or getattr(event, "_private_companion_preferred_address_locked", False)
         )
 
+    @staticmethod
+    def _apply_companion_relationship_projection(
+        ctx: SessionContext,
+        *,
+        event: Any = None,
+        req: Any = None,
+    ) -> None:
+        """Consume a bounded Companion-owned relationship projection in private scope."""
+
+        if ctx.scope != "private":
+            return
+        raw_projection: Any = None
+        for target in (event, req):
+            if target is None:
+                continue
+            for attr in (
+                "private_companion_context",
+                "companion_context",
+                "memory_companion_context",
+            ):
+                payload = getattr(target, attr, None)
+                if isinstance(payload, dict) and isinstance(payload.get("relationship_projection"), dict):
+                    raw_projection = payload["relationship_projection"]
+                    break
+            if raw_projection is not None:
+                break
+        consumed = consume_authenticated_companion_projection(
+            raw_projection,
+            kind="relationship",
+            expected_person_id=ctx.user_id,
+            expected_scope=ctx.scope,
+            expected_session_id=ctx.session_id,
+            expected_platform=ctx.platform,
+            expected_bot_id=ctx.bot_id,
+        )
+        projection = consumed.get("projection") if isinstance(consumed, dict) else None
+        if not isinstance(projection, dict):
+            return
+        ctx.relationship_authority_source = "private_companion.relationship_score"
+        ctx.companion_relationship_score = int(projection.get("score") or 0)
+        ctx.companion_relationship_phase_key = clean_text(projection.get("phase_key"), 40)
+        ctx.companion_relationship_phase_label = clean_text(projection.get("phase_label"), 40)
+        ctx.companion_relationship_tone = clean_text(projection.get("tone"), 160)
+        ctx.companion_relationship_address_level = clean_text(projection.get("address_level"), 120)
+        interaction = projection.get("current_interaction")
+        if isinstance(interaction, dict):
+            ctx.companion_interaction_dynamics_version = clean_text(interaction.get("dynamics_version"), 48)
+            ctx.companion_interaction_band = clean_text(interaction.get("expression_band"), 24)
+            ctx.companion_interaction_recovery_band = clean_text(interaction.get("recovery_band"), 24)
+            try:
+                ctx.companion_interaction_expires_at = max(0.0, min(10**12, float(interaction.get("expires_at") or 0.0)))
+                ctx.companion_interaction_projection_revision = max(0, min(1000000, int(interaction.get("projection_revision") or 0)))
+            except (TypeError, ValueError):
+                ctx.companion_interaction_expires_at = 0.0
+                ctx.companion_interaction_projection_revision = 0
+
+    @staticmethod
+    def _apply_companion_expression_decision(
+        ctx: SessionContext,
+        *,
+        event: Any = None,
+        req: Any = None,
+    ) -> None:
+        """Consume a bounded, request-scoped Companion expression decision."""
+
+        if ctx.scope != "private":
+            return
+        raw_decision: Any = None
+        for target in (req, event):
+            if target is None:
+                continue
+            candidate = getattr(target, "_private_companion_expression_decision", None)
+            if candidate is not None:
+                raw_decision = candidate
+                break
+        consumed = consume_authenticated_companion_projection(
+            raw_decision,
+            kind="expression",
+            expected_person_id=ctx.user_id,
+            expected_scope=ctx.scope,
+            expected_session_id=ctx.session_id,
+            expected_platform=ctx.platform,
+            expected_bot_id=ctx.bot_id,
+        )
+        decision = consumed.get("decision") if isinstance(consumed, dict) else None
+        if not isinstance(decision, dict):
+            return
+        ctx.companion_expression_contract = clean_text(decision.get("contract"), 80)
+        ctx.companion_expression_band = clean_text(decision.get("expression_band"), 40)
+        ctx.companion_expression_allowed_behaviors = tuple(decision.get("allowed_behaviors") or ())
+        ctx.companion_expression_safety_mode = clean_text(decision.get("safety_mode"), 60)
+        ctx.companion_expression_blocker = clean_text(decision.get("blocker"), 60)
+        ctx.companion_expression_reason_codes = tuple(decision.get("reason_codes") or ())
+        ctx.companion_expression_pacing = clean_text(decision.get("pacing"), 24)
+        ctx.companion_expression_directness = clean_text(decision.get("directness"), 24)
+        ctx.companion_expression_validation_style = clean_text(decision.get("validation_style"), 24)
+        ctx.companion_expression_self_disclosure = clean_text(decision.get("self_disclosure"), 24)
+        ctx.companion_expression_humor_mode = clean_text(decision.get("humor_mode"), 24)
+        ctx.companion_expression_topic_initiative = clean_text(decision.get("topic_initiative"), 24)
+
     def _sanitize_visible_timeline_text(self, text: Any) -> str:
         cleaned = clean_text(text, 1200)
         if not cleaned:
@@ -745,16 +1016,409 @@ class MemoryCompanionService:
             )
         return memory_id
 
+    async def record_bot_personal_archive(self, envelope: BotPersonalArchiveDTO | dict[str, Any]) -> dict[str, Any]:
+        """Persist one Bot Personal envelope in its isolated memory domain."""
+        result = {
+            "ok": False, "record_id": "", "deduplicated": False, "version": 0,
+            "error_code": None, "state": "degraded",
+        }
+        try:
+            dto = build_bot_personal_archive(envelope)
+        except BotPersonalValidationError as exc:
+            return {**result, "state": "invalid", "error_code": exc.error_code, "field": exc.field}
+        except Exception:
+            return {**result, "state": "invalid", "error_code": "invalid"}
+
+        store = getattr(self, "store", None)
+        getter = getattr(store, "get_memory", None)
+        inserter = getattr(store, "insert_memory", None)
+        if not callable(inserter):
+            return {**result, "error_code": "store_unavailable", "state": "degraded"}
+        fingerprint = bot_personal_payload_fingerprint(dto)
+        existing = None
+        if callable(getter):
+            try:
+                existing = await getter(dto.record_id)
+            except Exception:
+                return {**result, "record_id": dto.record_id, "error_code": "store_unavailable", "state": "degraded"}
+        if existing is not None:
+            metadata = existing.metadata if isinstance(existing.metadata, dict) else {}
+            old_version = int(metadata.get("version") or 0)
+            old_fingerprint = str(metadata.get("payload_fingerprint") or "")
+            if old_version > dto.version:
+                return {**result, "record_id": dto.record_id, "version": old_version, "error_code": "stale_version", "state": "stale_version"}
+            if old_version == dto.version:
+                if old_fingerprint == fingerprint:
+                    return {**result, "ok": True, "record_id": dto.record_id, "deduplicated": True, "version": old_version, "state": "deduplicated"}
+                return {**result, "record_id": dto.record_id, "version": old_version, "error_code": "version_conflict", "state": "version_conflict"}
+
+        payload = dict(dto.payload)
+        # The raw payload stays in the isolated Bot domain for future internal use;
+        # Profile readers below deliberately expose only a safe reference.
+        metadata = {
+            "bot_personal": True,
+            "memory_domain": dto.memory_domain,
+            "subject": dto.subject,
+            "date": dto.date,
+            "window": dto.window,
+            "occurred_at": dto.occurred_at,
+            "source_kind": dto.source_kind,
+            "source_refs": list(dto.source_refs),
+            "certainty": dto.certainty,
+            "evidence_level": dto.evidence_level,
+            "status": dto.status,
+            "version": dto.version,
+            "idempotency_key": dto.idempotency_key,
+            "payload_schema_version": dto.payload_schema_version,
+            "payload_fingerprint": fingerprint,
+            "payload": payload,
+        }
+        reality_level = {
+            "planned": "planned",
+            "observed": "observed_activity",
+            "reconciled": "reconciled",
+            "projection": "window_projection",
+            "subjective": "subjective",
+            "creative": "creative_work",
+            "media": "media_index",
+            "shared": "shared_activity",
+            "detail": "detail_fragment",
+            "calendar": "calendar_event",
+            "proactive": "proactive_action",
+        }.get(dto.source_kind, dto.source_kind)
+        record = MemoryRecord(
+            id=dto.record_id,
+            memory_type=dto.memory_type,
+            subject=EntityRef(kind="bot", id=dto.subject, role="subject"),
+            object=EntityRef(kind="bot", id=dto.subject, role="object"),
+            scope="private",
+            session_id="bot_personal",
+            visibility="bot_self",
+            sayability="indirect",
+            reality_level=reality_level,
+            lifecycle="planned_projection" if dto.status == "planned" else "stable_memory",
+            content=f"Bot Personal archive reference [{dto.memory_type}]",
+            evidence="; ".join(dto.source_refs),
+            confidence=dto.certainty,
+            importance=0.55,
+            review_status="auto",
+            tags=["bot_personal", dto.memory_type, dto.source_kind],
+            metadata=metadata,
+            source_plugin="bot_personal_bridge",
+            occurred_at=dto.occurred_at,
+            # MemoryStore's generic content dedupe intentionally ignores the
+            # metadata payload.  Bot Personal records therefore need a stable
+            # key-derived fingerprint or different agenda keys would merge
+            # into one row merely because their display reference is similar.
+            content_fingerprint=hashlib.sha256(
+                f"bot_personal|{dto.memory_type}|{dto.idempotency_key}".encode("utf-8")
+            ).hexdigest(),
+        )
+        try:
+            memory_id = await inserter(record)
+            scheduler = getattr(self, "_schedule_memory_embedding", None)
+            if callable(scheduler):
+                try:
+                    scheduler(memory_id, record)
+                except Exception:
+                    pass
+        except Exception:
+            return {**result, "record_id": dto.record_id, "version": dto.version, "error_code": "store_write_failed", "state": "degraded"}
+        return {**result, "ok": True, "record_id": dto.record_id, "version": dto.version, "state": "sent"}
+
+    async def record_bot_personal_memory(self, *, memory_type: str, payload: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+        try:
+            dto = build_bot_personal_archive(memory_type=memory_type, payload=payload or {}, **kwargs)
+        except BotPersonalValidationError as exc:
+            return {"ok": False, "record_id": "", "deduplicated": False, "version": 0, "error_code": exc.error_code, "state": "invalid"}
+        return await self.record_bot_personal_archive(dto)
+
+    async def read_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
+        """Read-only, domain-isolated Bot Personal references with no payload output."""
+        store = getattr(self, "store", None)
+        lister = getattr(store, "list_memories", None)
+        if not callable(lister):
+            return {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": [], "error_code": "store_unavailable"}
+        try:
+            records = await lister(
+                limit=max(1, min(100, int(limit or 10) * 3)),
+                include_pending=False,
+                query="",
+                scope="private",
+                visibility="bot_self",
+                session_id="bot_personal",
+            )
+        except Exception:
+            return {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": [], "error_code": "store_unavailable"}
+        query_text = clean_text(query, 240).lower()
+        items: list[dict[str, Any]] = []
+        for record in records:
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            if clean_text(metadata.get("memory_domain"), 80) != "bot_self_schedule":
+                continue
+            source_refs: list[str] = []
+            raw_source_refs = metadata.get("source_refs")
+            if isinstance(raw_source_refs, (list, tuple)):
+                for raw_reference in raw_source_refs:
+                    if not isinstance(raw_reference, str):
+                        continue
+                    try:
+                        safe_reference = sanitize_bot_personal_value(
+                            raw_reference,
+                            path="source_refs",
+                        )
+                    except BotPersonalValidationError:
+                        continue
+                    source_refs.append(clean_text(safe_reference, 240))
+            searchable = " ".join([
+                clean_text(record.memory_type, 80), clean_text(metadata.get("date"), 20),
+                clean_text(metadata.get("window"), 40), clean_text(metadata.get("source_kind"), 40),
+                clean_text((metadata.get("payload") or {}).get("summary"), 240)
+                if isinstance(metadata.get("payload"), dict) else "",
+                clean_text((metadata.get("payload") or {}).get("title"), 240)
+                if isinstance(metadata.get("payload"), dict) else "",
+                clean_text((metadata.get("payload") or {}).get("activity"), 240)
+                if isinstance(metadata.get("payload"), dict) else "",
+            ]).lower()
+            if query_text and query_text not in searchable:
+                continue
+            items.append({
+                "record_id": record.id,
+                "memory_domain": "bot_self_schedule",
+                "memory_type": record.memory_type,
+                "subject": "bot_self",
+                "date": clean_text(metadata.get("date"), 20),
+                "window": clean_text(metadata.get("window"), 40),
+                "occurred_at": clean_text(record.occurred_at, 80),
+                "source_kind": clean_text(metadata.get("source_kind"), 40),
+                "source_refs": source_refs[:8],
+                "evidence_level": clean_text(metadata.get("evidence_level"), 8),
+                "status": clean_text(metadata.get("status"), 40),
+                "version": int(metadata.get("version") or 0),
+                "summary": f"Bot Personal archive reference [{record.memory_type}]",
+            })
+        return {"ok": True, "read_only": True, "state": "ready", "degraded": False, "pending": False, "items": items[:max(1, min(100, int(limit or 10)))]}
+
+    async def read_user_memory_summary(
+        self,
+        user_id: str,
+        *,
+        session_id: str = "",
+        limit: int = 6,
+    ) -> dict[str, Any]:
+        """Return a bounded, content-free Memory workspace projection for one user.
+
+        Companion remains the authority for relationship and interaction state.
+        This method only reports exact-user Memory categories and opaque, redacted
+        anchors that can be used to open the Memory workspace.
+        """
+
+        identity = clean_text(user_id, 120)
+        requested_session = clean_text(session_id, 200)
+        base = self._user_memory_summary_base(identity, requested_session)
+        if not identity:
+            return {**base, "error_code": "missing_user_id"}
+        if requested_session and session_target_id(requested_session, "private") != identity:
+            return {**base, "error_code": "session_identity_mismatch"}
+        try:
+            bridge_enabled = self.config.bridge_enabled()
+        except Exception:
+            return {**base, "error_code": "bridge_config_unavailable"}
+        if bridge_enabled is not True:
+            return {**base, "error_code": "bridge_disabled"}
+        store = getattr(self, "store", None)
+        reader = getattr(store, "read_user_memory_summary_records", None)
+        if not callable(reader):
+            return {**base, "error_code": "store_unavailable"}
+        try:
+            safe_limit = max(1, min(8, int(limit or 6)))
+        except (TypeError, ValueError, OverflowError):
+            safe_limit = 6
+        try:
+            raw = await reader(identity, session_id=requested_session, limit=safe_limit)
+        except Exception:
+            return {**base, "error_code": "store_query_failed"}
+        if not isinstance(raw, dict):
+            return {**base, "error_code": "invalid_store_response"}
+
+        type_counts = raw.get("type_counts") if isinstance(raw.get("type_counts"), dict) else {}
+        counts = {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0}
+        for memory_type, value in type_counts.items():
+            try:
+                count = max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            counts[self._user_memory_category(memory_type)] += count
+            counts["total"] += count
+
+        summaries: list[dict[str, Any]] = []
+        records = raw.get("records") if isinstance(raw.get("records"), list) else []
+        for record in records[:safe_limit]:
+            if not isinstance(record, MemoryRecord):
+                continue
+            memory_type = clean_text(record.memory_type, 80)
+            category = self._user_memory_category(memory_type)
+            summaries.append(
+                {
+                    "category": category,
+                    "memory_type": memory_type,
+                    "occurred_at": clean_text(record.occurred_at or record.created_at, 80),
+                    "summary": f"{self._user_memory_category_label(category)}（内容已脱敏）",
+                    "content_redacted": True,
+                    "truncated": True,
+                }
+            )
+        return {
+            **base,
+            "ok": True,
+            "state": "ready",
+            "degraded": False,
+            "pending": False,
+            "counts": counts,
+            "summaries": summaries,
+        }
+
+    @staticmethod
+    def _user_memory_summary_base(user_id: str, session_id: str) -> dict[str, Any]:
+        return {
+            "contract": USER_MEMORY_SUMMARY_VERSION,
+            "ok": False,
+            "read_only": True,
+            "state": "degraded",
+            "degraded": True,
+            "pending": True,
+            "user_id": user_id,
+            "session_id": session_id,
+            "counts": {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0},
+            "summaries": [],
+            "workspace": {
+                "kind": "memory_user_workspace",
+                "route_hint": "user_memory",
+                "user_id": user_id,
+            },
+        }
+
+    @staticmethod
+    def _user_memory_category(memory_type: Any) -> str:
+        normalized = clean_text(memory_type, 80).lower()
+        if normalized in _USER_MEMORY_PROFILE_TYPES:
+            return "profile"
+        if normalized in _USER_MEMORY_PREFERENCE_TYPES:
+            return "preference"
+        if normalized in _USER_MEMORY_RELATIONSHIP_TYPES:
+            return "relationship"
+        if normalized in _USER_MEMORY_CONVERSATION_TYPES:
+            return "private_conversation"
+        return "other"
+
+    @staticmethod
+    def _user_memory_category_label(category: str) -> str:
+        return {
+            "profile": "用户画像记忆",
+            "preference": "用户偏好记忆",
+            "relationship": "关系线索记忆",
+            "private_conversation": "私聊连续性记忆",
+        }.get(category, "其他用户记忆")
+
+    async def read_bot_profile(
+        self,
+        profile: str,
+        query: str = "",
+        *,
+        limit: int = 10,
+        current_date: str = "",
+        current_window: str = "",
+        authorized: bool = False,
+    ) -> dict[str, Any]:
+        """Read a C4 Bot Profile after hard domain and storage filtering."""
+
+        store = getattr(self, "store", None)
+        lister = getattr(store, "list_memories", None)
+        if not callable(lister):
+            return {
+                "ok": False,
+                "read_only": True,
+                "state": "degraded",
+                "degraded": True,
+                "pending": True,
+                "profile": clean_text(profile, 80),
+                "items": [],
+                "warnings": ["store_unavailable"],
+            }
+        try:
+            safe_limit = max(1, min(100, int(limit or 10)))
+        except (TypeError, ValueError):
+            safe_limit = 10
+        try:
+            records = await lister(
+                # The profile filter is applied again in profile_api; this
+                # bounded overscan leaves room for malformed or other-domain
+                # rows without scanning the whole database.
+                limit=min(300, max(24, safe_limit * 3)),
+                include_pending=False,
+                query="",
+                scope="private",
+                visibility="bot_self",
+                session_id="bot_personal",
+            )
+        except Exception:
+            return {
+                "ok": False,
+                "read_only": True,
+                "state": "degraded",
+                "degraded": True,
+                "pending": True,
+                "profile": clean_text(profile, 80),
+                "items": [],
+                "warnings": ["store_unavailable"],
+            }
+        if not clean_text(current_date, 20) or not clean_text(current_window, 40):
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            current_date = current_date or now.strftime("%Y-%m-%d")
+            current_window = current_window or self._bot_personal_window_for_datetime(now)
+        return build_profile_result(
+            records,
+            profile,
+            query=query,
+            limit=safe_limit,
+            current_date=current_date,
+            current_window=current_window,
+            authorized=authorized,
+        )
+
+    @staticmethod
+    def _bot_personal_window_for_datetime(value: datetime) -> str:
+        minutes = value.hour * 60 + value.minute
+        try:
+            from .bot_personal_contract import window_for_minutes
+
+            return window_for_minutes(minutes)
+        except Exception:
+            return ""
+
     async def bridge_search(
         self,
         query: str,
         *,
         session_context: SessionContext | dict[str, Any] | None = None,
         top_k: int | None = None,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
     ) -> list[dict[str, Any]]:
+        gate = await self._p5_gate(
+            sink="bridge_serialization",
+            attestation=p5_attestation,
+            consumer=p5_attestation_consumer,
+        )
+        if not gate.get("ok"):
+            return []
         ctx = self.session_context_from_bridge(session_context)
         results = await self.search(query, ctx, top_k or self.config.int("memory_injection.top_k", 6))
-        return [serialize_memory(item.memory, item.score, item.reason) for item in results]
+        serialized = [serialize_memory(item.memory, item.score, item.reason) for item in results]
+        snapshot = gate.get("snapshot")
+        if snapshot is not None:
+            await self._p5_record_observed([item.memory.id for item in results], snapshot)
+        return serialized
 
     async def bridge_compose_injection(
         self,
@@ -765,7 +1429,18 @@ class MemoryCompanionService:
         max_chars: int | None = None,
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
+        _p5_gate_passed: bool = False,
     ) -> str:
+        if not _p5_gate_passed:
+            gate = await self._p5_gate(
+                sink="bridge_serialization",
+                attestation=p5_attestation,
+                consumer=p5_attestation_consumer,
+            )
+            if not gate.get("ok"):
+                return ""
         ctx = self.session_context_from_bridge(session_context)
         query_text = clean_text(query or ctx.message_text, 1400)
         if not query_text:
@@ -791,7 +1466,16 @@ class MemoryCompanionService:
         companion_bot_mood: str = "",
         companion_bot_energy: float = 0.0,
         retrieval_profile: str = "",
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
     ) -> str:
+        gate = await self._p5_gate(
+            sink="bridge_serialization",
+            attestation=p5_attestation,
+            consumer=p5_attestation_consumer,
+        )
+        if not gate.get("ok"):
+            return ""
         profile = clean_text(retrieval_profile, 40).lower()
         fast_profile_enabled = {
             "schedule_fast": self.config.bool(
@@ -820,6 +1504,7 @@ class MemoryCompanionService:
             max_chars=max_chars,
             companion_bot_mood=companion_bot_mood,
             companion_bot_energy=companion_bot_energy,
+            _p5_gate_passed=True,
         )
 
     async def _bridge_compose_schedule_fast_context(
@@ -1048,31 +1733,55 @@ class MemoryCompanionService:
         return injection
 
     def bridge_get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
-        """Return pending emotional drift events for the companion plugin to consume."""
-        if not session_id and not self.config.bool(
-            "private_companion_bridge.cross_window_emotional_continuity_enabled", False
-        ):
+        """Consume a redacted exact-window queue during the capability migration."""
+
+        try:
+            compatibility_enabled = self.config.bool(
+                "private_companion_bridge.legacy_emotion_compatibility_enabled",
+                True,
+            )
+        except Exception:
+            compatibility_enabled = False
+        if compatibility_enabled is not True:
             return []
+        safe_session = clean_text(session_id, 220)
+        if not safe_session or ":" not in safe_session:
+            return []
+        try:
+            bounded_limit = max(1, min(20, int(limit or 5)))
+        except (TypeError, ValueError):
+            bounded_limit = 5
         now = time.time()
-        events: list[dict[str, Any]] = []
-        if session_id:
-            keys = [session_id]
-        else:
-            keys = list(self._emotional_event_queue.keys())
-        for key in keys:
-            queue = self._emotional_event_queue.get(key, [])
-            fresh = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
-            if len(fresh) != len(queue):
-                self._emotional_event_queue[key] = fresh
-            events.extend(fresh)
-        events.sort(key=lambda e: e.get("ts", 0), reverse=True)
-        result = events[:max(1, min(limit, 20))]
-        for key in keys:
-            queue = self._emotional_event_queue.get(key, [])
-            consumed_ids = {e.get("id", "") for e in result if e.get("session_id") == key}
-            if consumed_ids:
-                self._emotional_event_queue[key] = [e for e in queue if e.get("id", "") not in consumed_ids]
-        return result
+        queue = self._emotional_event_queue.get(safe_session, [])
+        fresh: list[dict[str, Any]] = []
+        for item in queue:
+            if not isinstance(item, dict):
+                continue
+            try:
+                age = now - float(item.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= age < self._EMOTIONAL_EVENT_TTL:
+                fresh.append(item)
+        self._emotional_event_queue[safe_session] = fresh
+        selected = sorted(fresh, key=lambda item: float(item.get("ts") or 0.0), reverse=True)[:bounded_limit]
+        consumed = {clean_text(item.get("id") or item.get("event_id"), 96) for item in selected}
+        if consumed:
+            self._emotional_event_queue[safe_session] = [
+                item
+                for item in fresh
+                if clean_text(item.get("id") or item.get("event_id"), 96) not in consumed
+            ]
+        return [
+            {
+                "id": clean_text(item.get("id") or item.get("event_id"), 96),
+                "event_type": clean_text(item.get("event_type"), 48),
+                "energy_delta": float(item.get("energy_delta") or item.get("applied_energy_delta") or 0.0),
+                "mood_hint": clean_text(item.get("mood_hint"), 40),
+                "ts": float(item.get("ts") or 0.0),
+            }
+            for item in selected
+        ]
 
     async def bridge_search_open_loops(self, *, session_id: str = "", limit: int = 3) -> list[dict[str, Any]]:
         """Search for unresolved open-loop / promise memories for proactive companionship."""
@@ -1123,7 +1832,7 @@ class MemoryCompanionService:
                 break
         return open_loops
 
-    def _detect_and_queue_emotional_events(
+    async def _detect_and_queue_emotional_events(
         self,
         ctx: SessionContext,
         results: list[Any],
@@ -1166,6 +1875,9 @@ class MemoryCompanionService:
                 mood_hint = "柔软"
             if not event_type:
                 continue
+            refs = memory_emotion_refs(memory, ctx)
+            if refs is None:
+                continue
             # Mood resonance check: if Bot is already in a contrasting mood, dampen the drift
             if companion_bot_mood:
                 mood_lower = companion_bot_mood.strip().lower()
@@ -1177,27 +1889,74 @@ class MemoryCompanionService:
             event_id = hashlib.sha1(
                 f"{ctx.session_id}|{event_key}|{memory.id}|{event_type}".encode("utf-8", errors="ignore")
             ).hexdigest()[:20]
-            events.append({
-                "id": f"emo_{event_id}",
-                "ts": now,
+            event = normalize_emotion_event({
+                "event_id": f"emo_{event_id}",
+                "trace_id": f"etr_{event_id}",
+                "producer_plugin": "memory_companion",
+                "origin_kind": "memory_recall",
+                "platform": ctx.platform,
+                "bot_id": ctx.bot_id,
+                "scope": ctx.scope,
                 "session_id": ctx.session_id,
+                **refs,
                 "event_type": event_type,
+                "intensity": max(scar_w, emotional_w, vulnerability_w) * 100.0,
+                "confidence": max(0.5, min(1.0, getattr(item, "score", 0.5))),
+                "valence_hint": 0.35 if event_type == "warm_memory" else -0.45 if event_type == "scar_touched" else -0.1,
+                "arousal_hint": min(1.0, max(scar_w, emotional_w)),
+                "vulnerability_hint": max(vulnerability_w, 0.6 if event_type == "vulnerable_resonance" else 0.0),
+                "source_rule": event_type,
+                "occurred_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(timespec="seconds"),
+                "dedupe_key": f"{ctx.session_id}|{event_key}|{memory.id}|{event_type}",
+                "payload_hash": hashlib.sha256(memory.id.encode("utf-8", errors="ignore")).hexdigest(),
+                "privacy_level": "redacted",
+                "applied_energy_delta": round(energy_delta, 2),
+                "status": "observed",
+                "reason_codes": [event_type, "memory_recall_resonance"],
+            }, producer_plugin="memory_companion")
+            event.update({
+                "id": event["event_id"],
+                "ts": now,
                 "memory_id": memory.id,
                 "energy_delta": round(energy_delta, 2),
                 "mood_hint": mood_hint,
                 "scar_weight": round(scar_w, 3),
                 "emotional_weight": round(emotional_w, 3),
-                "content_preview": clean_text(memory.content, 120),
             })
+            events.append(event)
         if not events:
             return
         queue = self._emotional_event_queue.setdefault(ctx.session_id, [])
         existing_ids = {clean_text(item.get("id"), 80) for item in queue if isinstance(item, dict)}
-        queue.extend(event for event in events if clean_text(event.get("id"), 80) not in existing_ids)
+        fresh_events = [event for event in events if clean_text(event.get("id"), 80) not in existing_ids]
+        queue.extend(fresh_events)
+        for event in fresh_events:
+            await self.store.upsert_emotion_event(event)
         # Trim old events
         queue[:] = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
         if len(queue) > self._EMOTIONAL_EVENT_MAX_PER_SESSION:
             queue[:] = queue[-self._EMOTIONAL_EVENT_MAX_PER_SESSION:]
+
+    @staticmethod
+    def _same_private_emotion_domain(event: Any, ctx: SessionContext) -> bool:
+        if not isinstance(event, dict):
+            return False
+        actor = event.get("actor_ref") if isinstance(event.get("actor_ref"), dict) else {}
+        target = event.get("target_ref") if isinstance(event.get("target_ref"), dict) else {}
+        bot_id = clean_text(ctx.bot_id, 160)
+        platform = clean_text(ctx.platform, 80)
+        user_id = clean_text(ctx.user_id, 160)
+        return (
+            bool(bot_id and platform and user_id)
+            and clean_text(ctx.scope, 24).lower() == "private"
+            and clean_text(event.get("bot_id"), 160) == bot_id
+            and clean_text(event.get("scope"), 24).lower() == "private"
+            and clean_text(event.get("platform"), 80) == platform
+            and clean_text(actor.get("kind"), 24) == "user"
+            and clean_text(actor.get("id"), 160) == user_id
+            and clean_text(target.get("kind"), 24) == "bot"
+            and clean_text(target.get("id"), 160) == bot_id
+        )
 
     def _get_cross_window_emotional_hint(self, ctx: SessionContext) -> str:
         """Generate a subtle hint about emotional residue from other chat windows.
@@ -1209,7 +1968,9 @@ class MemoryCompanionService:
         if not self.config.bool("private_companion_bridge.cross_window_emotional_continuity_enabled", False):
             return ""
         now = time.time()
-        current_session = ctx.session_id
+        current_session = clean_text(ctx.session_id, 220)
+        if not current_session:
+            return ""
         # Collect recent events from OTHER sessions (within last 30 minutes)
         recent_window = 1800.0  # 30 minutes
         other_events: list[dict[str, Any]] = []
@@ -1217,8 +1978,14 @@ class MemoryCompanionService:
             if session_id == current_session:
                 continue
             for event in queue:
-                age = now - event.get("ts", 0)
-                if age < recent_window:
+                try:
+                    age = now - float(event.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    0.0 <= age < recent_window
+                    and self._same_private_emotion_domain(event, ctx)
+                ):
                     other_events.append(event)
         if not other_events:
             return ""
@@ -1242,33 +2009,23 @@ class MemoryCompanionService:
             return ""
         return " ".join(hints)
 
-    def _get_cross_window_emotional_state(self) -> dict[str, Any]:
-        """Return a summary of recent emotional events across all sessions for the companion plugin."""
-        if not self.config.bool("private_companion_bridge.cross_window_emotional_continuity_enabled", False):
-            return {
-                "enabled": False,
-                "total": 0,
-                "scar_count": 0,
-                "warm_count": 0,
-                "vulnerable_count": 0,
-            }
-        now = time.time()
-        recent_window = 1800.0
-        all_events: list[dict[str, Any]] = []
-        for session_id, queue in self._emotional_event_queue.items():
-            for event in queue:
-                age = now - event.get("ts", 0)
-                if age < recent_window:
-                    all_events.append({**event, "age_seconds": round(age, 0)})
-        if not all_events:
-            return {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
-        all_events.sort(key=lambda e: e.get("ts", 0), reverse=True)
+    def _get_cross_window_emotional_state(
+        self,
+        *,
+        exclude_session_id: str = "",
+        window_seconds: float = 1800.0,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        """Deprecated unscoped aggregate; callers must use a delivery context."""
+        _ = (exclude_session_id, window_seconds, limit)
         return {
-            "total": len(all_events),
-            "scar_count": sum(1 for e in all_events if e.get("event_type") == "scar_touched"),
-            "warm_count": sum(1 for e in all_events if e.get("event_type") == "warm_memory"),
-            "vulnerable_count": sum(1 for e in all_events if e.get("event_type") == "vulnerable_resonance"),
-            "recent": all_events[:5],
+            "enabled": False,
+            "state": "migration_required",
+            "error_code": "delivery_context_required",
+            "total": 0,
+            "scar_count": 0,
+            "warm_count": 0,
+            "vulnerable_count": 0,
         }
 
     async def _retrieval_cache_key(
@@ -1940,7 +2697,7 @@ class MemoryCompanionService:
         error: str = "",
     ) -> None:
         usage = self._extract_token_usage(resp, prompt, completion)
-        now_dt = datetime.now()
+        now_dt = datetime.now(LOCAL_TZ)
         now_ts = time.time()
         day = now_dt.strftime("%Y-%m-%d")
         hour = now_dt.strftime("%Y-%m-%dT%H:00")
@@ -2103,9 +2860,13 @@ class MemoryCompanionService:
         provider_id = clean_text(provider_id, 160)
         indexed = 0
         try:
+            batch_size = max(
+                1,
+                min(200, self.config.int("retrieval.embedding_backfill_batch_size", 50)),
+            )
             records = await self.store.list_memories_missing_embeddings(
                 provider_id=provider_id,
-                limit=self.config.int("retrieval.embedding_backfill_batch_size", 50),
+                limit=batch_size,
                 include_pending=self.config.bool("retrieval.embedding_index_pending", False),
             )
             for record in records:
@@ -3394,11 +4155,32 @@ class MemoryCompanionService:
             )
             return {"ok": False, "error": "memory write failed"}
 
-    async def tool_recall(self, event: Any, query: str, top_k: int = 5) -> dict[str, Any]:
+    async def tool_recall(
+        self,
+        event: Any,
+        query: str,
+        top_k: int = 5,
+        *,
+        p5_attestation: Any = None,
+        p5_attestation_consumer: Any = None,
+    ) -> dict[str, Any]:
         ctx = await self.identity.resolve_event_context(event)
         query = clean_text(query, 1000)
         if not query:
             return {"ok": False, "error": "empty query", "memories": []}
+        p5_gate = await self._p5_gate(
+            event=event,
+            sink="memory_recall",
+            attestation=p5_attestation,
+            consumer=p5_attestation_consumer,
+        )
+        if not p5_gate.get("ok"):
+            return {
+                "ok": False,
+                "state": p5_gate.get("state", "degraded"),
+                "error": p5_gate.get("error_code", "p5_attestation_required"),
+                "memories": [],
+            }
         limit = max(1, min(10, int(top_k or 5)))
         results, _blocked, slot_map = await self.search_context_slots(
             query,
@@ -3416,8 +4198,12 @@ class MemoryCompanionService:
             "acl_allowed:private:" in clean_text(getattr(item, "reason", ""), 1200)
             for item in results
         )
+        snapshot = p5_gate.get("snapshot")
+        if snapshot is not None:
+            await self._p5_record_observed([item.memory.id for item in results], snapshot)
         return {
             "ok": True,
+            "state": p5_gate.get("state", "legacy"),
             "usage": (
                 "群聊中的 acl_allowed 私聊结果只是条件候选：仅当当前发言者的核心意图确实需要其本人相关事实时使用；"
                 "普通陈述、转述、反问或意图不清时忽略，不主动公开或扩展私聊内容。"
@@ -3731,7 +4517,15 @@ class MemoryCompanionService:
         if memory_ids:
             current = await self.store.get_memories_by_ids(memory_ids)
             candidates = [current[memory_id] for memory_id in memory_ids if memory_id in current]
-            visible = await self._filter_navigation_results(ctx, candidates)
+            # A caller-supplied ID is an explicit relevance signal. Keep the
+            # normal visibility/ACL check, but do not let the generic route
+            # reason make an otherwise visible second-hop record look
+            # unrelated and get discarded by the group actor guard.
+            visible = await self._filter_navigation_results(
+                ctx,
+                candidates,
+                relevance_reason="direct_memory_id;exact=1;hits=1",
+            )
         else:
             scan_limit = min(self._reconstruction_scan_limit(), max(per_step_limit * 4, per_step_limit))
             time_intent = parse_time_intent(query)
@@ -3819,9 +4613,9 @@ class MemoryCompanionService:
                 hint = self._navigation_hint(memory_id, path)
                 if hint and hint not in hints:
                     hints.append(hint)
-                if len(hints) >= per_step_limit * 3:
+                if len(hints) >= per_step_limit:
                     break
-            if len(hints) >= per_step_limit * 3:
+            if len(hints) >= per_step_limit:
                 break
         return evidence, hints
 
@@ -3894,7 +4688,7 @@ class MemoryCompanionService:
         payload: dict[str, Any] = {
             "memory_id": memory.id,
             "memory_type": memory.memory_type,
-            "content": clean_text(memory.content, 1200),
+            "content": self._navigation_safe_text(memory.content, 1200),
             "reality_level": memory.reality_level,
             "confidence": memory.confidence,
             "occurred_at": memory.occurred_at,
@@ -3908,26 +4702,35 @@ class MemoryCompanionService:
             },
             "subject": {
                 "id": clean_text(memory.subject.id, 120),
-                "name": clean_text(memory.subject.name, 80),
+                "name": self._navigation_safe_text(memory.subject.name, 80),
             },
             "object": {
                 "id": clean_text(memory.object.id, 120),
-                "name": clean_text(memory.object.name, 80),
+                "name": self._navigation_safe_text(memory.object.name, 80),
             },
         }
         if action == "event_context":
-            payload["evidence_preview"] = clean_text(memory.evidence, 1000)
-            payload["canonical_summary"] = clean_text(metadata.get("canonical_summary"), 600)
+            payload["evidence_preview"] = self._navigation_safe_text(memory.evidence, 1000)
+            payload["canonical_summary"] = self._navigation_safe_text(metadata.get("canonical_summary"), 600)
         association_hints: list[dict[str, str]] = []
         for path in paths or []:
             hint = self._navigation_hint(memory.id, path)
             if hint and hint not in association_hints:
                 association_hints.append(hint)
-            if len(association_hints) >= 4:
+            # Top-level hints already carry the next-hop choices. Keep one
+            # compact association on each evidence item so a step's output
+            # remains proportional to ``per_step_limit`` instead of repeating
+            # the whole graph on every candidate.
+            if len(association_hints) >= 1:
                 break
         if association_hints:
             payload["associations"] = association_hints
         return payload
+
+    def _navigation_safe_text(self, value: Any, limit: int) -> str:
+        """Reuse the injection redactor for every text-bearing navigation field."""
+        redacted = self.injection._redact_sensitive_text(value)
+        return clean_text(redacted, limit)
 
     @staticmethod
     def _navigation_hint(memory_id: str, path: dict[str, Any]) -> dict[str, str]:
@@ -3941,8 +4744,11 @@ class MemoryCompanionService:
             cue = clean_text(path.get("target_label"), 160)
         if not cue:
             cue = clean_text(path.get("source_label") or path.get("target_label"), 160)
-        tag = clean_text(metadata.get("associative_tag") or path.get("relation_type"), 80)
-        content = clean_text(path.get("evidence"), 240)
+        cue = InjectionComposer._redact_sensitive_text(cue)
+        tag = InjectionComposer._redact_sensitive_text(
+            clean_text(metadata.get("associative_tag") or path.get("relation_type"), 80)
+        )
+        content = InjectionComposer._redact_sensitive_text(clean_text(path.get("evidence"), 240))
         layer = clean_text(metadata.get("content_layer"), 24)
         if not (cue or tag or content):
             return {}
@@ -5038,7 +5844,7 @@ class MemoryCompanionService:
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
         )
-        self._detect_and_queue_emotional_events(
+        await self._detect_and_queue_emotional_events(
             ctx, results,
             companion_bot_mood=merged_bot_mood,
             companion_bot_energy=merged_bot_energy,
@@ -5076,6 +5882,22 @@ class MemoryCompanionService:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map={})
             if self.config.bool("memory_injection.debug_log_injection_enabled", False):
                 logger.info("[MemoryCompanion] 记忆注入已关闭: session=%s", ctx.session_id)
+            return
+        p5_gate = await self._p5_gate(event=event, sink="memory_recall")
+        if not p5_gate.get("ok"):
+            self._mark_memory_companion_injection_state(
+                event,
+                req,
+                injected=False,
+                conversation_memory=False,
+                slot_map={},
+            )
+            logger.info(
+                "[MemoryCompanion] P5 召回闸门未放行本轮记忆注入: session=%s state=%s error=%s",
+                ctx.session_id,
+                p5_gate.get("state"),
+                p5_gate.get("error_code"),
+            )
             return
         self._sanitize_request_history_for_companion(ctx, req)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
@@ -5324,7 +6146,7 @@ class MemoryCompanionService:
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
         )
-        self._detect_and_queue_emotional_events(
+        await self._detect_and_queue_emotional_events(
             ctx, results,
             companion_bot_mood=_bot_mood,
             companion_bot_energy=_bot_energy,
@@ -6613,18 +7435,26 @@ class MemoryCompanionService:
         return any(re.search(pattern, compact) for pattern in patterns)
 
     @staticmethod
-    def _message_targets_bot_personal_schedule(
+    def _schedule_query_owner(
         text: str,
         *,
         bot_id: str = "",
         allow_implicit_temporal: bool = False,
-    ) -> bool:
+    ) -> str:
+        """Return the structured owner of a personal-schedule question.
+
+        This is deliberately a positive grammar rather than a list of topics to
+        reject.  A schedule overflow is only useful when the query identifies a
+        Bot-owned plan, or is the short conversational form of a personal status
+        question (for example, ``明天有空吗``).  Generic schedule nouns remain
+        ordinary retrieval candidates.
+        """
         compact = re.sub(r"\s+", "", clean_text(text, 800)).lower()
         if not compact or len(compact) > 80:
-            return False
+            return ""
 
-        bot_tokens = ["你", "您", "bot"]
         normalized_bot_id = clean_text(bot_id, 120).lower()
+        bot_tokens = ["你", "您", "bot"]
         if normalized_bot_id and normalized_bot_id not in {"self", "bot"}:
             bot_tokens.append(normalized_bot_id)
         bot_pattern = "(?:" + "|".join(
@@ -6634,47 +7464,151 @@ class MemoryCompanionService:
             r"(?:今天|今日|昨天|昨日|前天|明天|后天|今晚|明早|明晚|现在|当前|目前|"
             r"最近|本周|这周|这一周|下周|周末|这周末|本月|下个月)"
         )
-        specific_noun = r"(?:日程|行程|待办|提醒事项|时间表)"
         schedule_noun = r"(?:日程|行程|安排|计划|待办|提醒事项|时间表)"
-        personal_action = r"(?:上班|上学|上课|出门|休息|起床|睡觉|睡|工作)"
+        # Modifiers accepted after an explicit Bot owner are themselves
+        # personal/time qualifiers.  An arbitrary domain noun (for example
+        # ``项目计划`` or ``会议安排``) must not turn a generic plan into Bot
+        # autobiography.
+        personal_modifier = r"(?:今天|今日|昨天|昨日|前天|明天|后天|今晚|明早|明晚|"
+        personal_modifier += r"现在|当前|目前|最近|本周|这周|这一周|下周|周末|这周末|"
+        personal_modifier += r"本月|下个月|工作|生活|休息|学习|任务)"
+        personal_action = r"(?:上班|下班|加班|上学|上课|出门|回家|回宿舍|休息|起床|睡觉|睡|工作)"
         personal_status = (
-            r"(?:有事|有安排|有计划|忙|(?:要|会|得|准备)?(?:上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|工作)|有空|有时间)"
+            r"(?:有事|有安排|有计划|忙|有空|有时间|"
+            r"(?:要|会|得|准备)?(?:上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|工作))"
         )
         status_suffix = r"(?:吗|呢|呀|嘛|不|了没|没有)?[?？]?$"
 
-        direct_patterns = (
-            rf"{bot_pattern}的(?:{temporal}(?:的)?)?{schedule_noun}",
-            rf"{bot_pattern}{temporal}(?:的)?{schedule_noun}",
-            rf"{bot_pattern}(?:的)?{specific_noun}",
-            rf"{bot_pattern}(?:{temporal})?(?:都)?(?:有|有没有|有什么|有哪些)(?:什么)?{schedule_noun}",
-            rf"{temporal}{bot_pattern}(?:的)?{schedule_noun}",
-            rf"{temporal}{bot_pattern}(?:都)?(?:有|有没有|有什么|有哪些)(?:什么)?{schedule_noun}",
+        bot_patterns = (
+            # Possessive forms: 你的日程、你明天的安排、bot 的待办。
+            rf"{bot_pattern}(?:{personal_modifier})?(?:的)?{schedule_noun}",
+            rf"{bot_pattern}的(?:{personal_modifier})?{schedule_noun}",
+            rf"{bot_pattern}的(?:schedule|calendar|itinerary|todo)",
+            # Subject forms: 你今天有什么安排、本周你有空吗、你什么时候上班。
+            rf"{bot_pattern}(?:知道|能不能|可以|能|会不会|想问|问(?:一下|下)?)?"
+            rf"(?:{temporal})?(?:的)?(?:都)?(?:有|有没有|有什么|有哪些){schedule_noun}",
+            rf"{temporal}{bot_pattern}(?:的)?(?:都)?(?:有|有没有|有什么|有哪些){schedule_noun}",
             rf"{bot_pattern}(?:{temporal})?(?:几点|什么时候|何时)(?:要|会|得|准备)?{personal_action}",
             rf"{temporal}{bot_pattern}(?:几点|什么时候|何时)?(?:要|会|得|准备)?{personal_action}",
+            rf"{bot_pattern}(?:{temporal})?(?:几点|什么时候|何时){personal_status}{status_suffix}",
+            rf"{temporal}{bot_pattern}(?:几点|什么时候|何时)?{personal_status}{status_suffix}",
             rf"{bot_pattern}(?:{temporal})?{personal_status}{status_suffix}",
             rf"{temporal}{bot_pattern}{personal_status}{status_suffix}",
-            rf"{bot_pattern}{temporal}(?:做了什么|做什么|要做什么|准备做什么|去了哪(?:里|儿)?)",
-            rf"{temporal}{bot_pattern}(?:做了什么|做什么|要做什么|准备做什么|去了哪(?:里|儿)?)",
+            rf"{bot_pattern}(?:{temporal})?(?:在)?(?:做了什么|做什么|要做什么|准备做什么|"
+            rf"去(?:了)?哪(?:里|儿)?|干什么|干嘛)",
+            rf"{temporal}{bot_pattern}(?:在)?(?:做了什么|做什么|要做什么|准备做什么|"
+            rf"去(?:了)?哪(?:里|儿)?|干什么|干嘛)",
         )
-        if any(re.search(pattern, compact) for pattern in direct_patterns):
-            return True
+
+        def last_match_end(patterns: tuple[str, ...]) -> int:
+            ends = [match.end() for pattern in patterns for match in re.finditer(pattern, compact)]
+            return max(ends, default=-1)
+
+        bot_end = last_match_end(bot_patterns)
 
         english_owner = r"(?:your|bot(?:'s)?"
         if normalized_bot_id and normalized_bot_id not in {"self", "bot"}:
             english_owner += rf"|{re.escape(normalized_bot_id)}(?:'s)?"
         english_owner += r")"
-        if re.search(rf"{english_owner}(?:schedule|calendar|itinerary|todo)", compact):
-            return True
+        english_bot_end = last_match_end((rf"{english_owner}(?:schedule|calendar|itinerary|todo)",))
+        bot_end = max(bot_end, english_bot_end)
+
+        # User-owned forms are checked separately so a polite prefix such as
+        # "你能查一下" cannot make ``我的日程`` look like a Bot request.
+        user_patterns = (
+            rf"(?:我|我的|咱们|我们|本人|自己)(?:{personal_modifier})?(?:的)?{schedule_noun}",
+            rf"(?:我|咱们|我们|本人|自己)(?:{temporal})?{personal_status}{status_suffix}",
+            rf"(?:我|咱们|我们|本人|自己)(?:{temporal})?(?:要|会|得|准备)?{personal_action}",
+            r"(?:my)(?:schedule|calendar|itinerary|todo)",
+        )
+        user_end = last_match_end(user_patterns)
+
+        # A named/group owner is any explicit possessive or subject that is not
+        # one of the pronouns above.  The owner is intentionally structural;
+        # no domain-specific blacklist is needed for ``小王的日程`` or
+        # ``会议的安排``.
+        generic_owner = r"(?:他|她|它|他们|她们|对方|群|群聊|会议|活动|课程|[\u4e00-\u9fff]{2,16}|[a-z][a-z0-9_.-]{1,40})"
+        other_patterns = (
+            rf"{generic_owner}的(?:{personal_modifier})?{schedule_noun}",
+            rf"{generic_owner}(?:{temporal})?{personal_status}{status_suffix}",
+            rf"{generic_owner}(?:{temporal})?(?:要|会|得|准备)?{personal_action}",
+            r"(?:my|project)(?:schedule|calendar|itinerary|todo)",
+        )
+        other_end = -1
+        temporal_words = {
+            "今天",
+            "今日",
+            "昨天",
+            "昨日",
+            "前天",
+            "明天",
+            "后天",
+            "今晚",
+            "明早",
+            "明晚",
+            "现在",
+            "当前",
+            "目前",
+            "最近",
+            "本周",
+            "这周",
+            "这一周",
+            "下周",
+            "周末",
+            "这周末",
+            "本月",
+            "下个月",
+        }
+        for pattern in other_patterns:
+            for match in re.finditer(pattern, compact):
+                owner = clean_text(match.group(0), 120).lower()
+                # The generic pattern may also see an ASCII Bot id.  Do not
+                # treat it as a third-party owner when it is the configured Bot.
+                if normalized_bot_id and owner.startswith(normalized_bot_id):
+                    continue
+                if owner.startswith(("你", "您", "bot", "我", "咱", "我们", "本人", "自己")):
+                    continue
+                if any(owner.startswith(word) for word in temporal_words):
+                    continue
+                other_end = max(other_end, match.end())
+
+        # The nearest explicit owner wins when a query mentions both parties
+        # (e.g. "我想问你的日程").
+        if bot_end >= 0 and bot_end >= max(user_end, other_end):
+            return "bot"
+        if user_end >= 0 and user_end >= other_end:
+            return "user"
+        if other_end >= 0:
+            return "other"
 
         if not allow_implicit_temporal:
-            return False
-        personal_state = (
-            r"(?:有事|有安排|有计划|忙|上班|上学|上课|出门|休息|睡觉|睡|起床|赖床|"
-            r"有空|有时间|要做什么|准备做什么)"
+            return ""
+        # Short owner-omitted status questions are conventionally addressed to
+        # the Bot in a chat.  Keep this grammar anchored so "明天考试有什么
+        # 安排" and other group/event schedules remain ambiguous.
+        implicit_state = (
+            rf"(?:{personal_status}|(?:要|会|得|准备)?{personal_action}|"
+            r"(?:要|会|得|准备)?(?:做什么|干什么|干嘛)|"
+            r"(?:几点|什么时候|何时)(?:要|会|得|准备)?(?:上班|下班|加班|上学|上课|出门|回家|回宿舍|休息|睡觉|睡|工作))"
         )
         prefix = r"(?:请问|想问(?:一下|下)?|问(?:一下|下)?)?"
         suffix = r"(?:吗|呢|呀|嘛|不|了没|没有)?[?？]?"
-        return bool(re.fullmatch(rf"{prefix}{temporal}{personal_state}{suffix}", compact))
+        if re.fullmatch(rf"{prefix}{temporal}{implicit_state}{suffix}", compact):
+            return "implicit"
+        return ""
+
+    @staticmethod
+    def _message_targets_bot_personal_schedule(
+        text: str,
+        *,
+        bot_id: str = "",
+        allow_implicit_temporal: bool = False,
+    ) -> bool:
+        return MemoryCompanionService._schedule_query_owner(
+            text,
+            bot_id=bot_id,
+            allow_implicit_temporal=allow_implicit_temporal,
+        ) in {"bot", "implicit"}
 
     @staticmethod
     def _message_is_future_arrangement_question(text: str, *, bot_id: str = "") -> bool:
@@ -6821,11 +7755,15 @@ class MemoryCompanionService:
                 if is_private:
                     if not contextual_private_use and not acl_authorized_for_sender:
                         reason = "group_private_memory_requires_recall_or_personalization"
-                    elif not owner_id and not actor_mentioned:
+                    elif not owner_id:
                         reason = "group_private_memory_actor_unknown"
-                    elif current_user_id and owner_id and owner_id != current_user_id and not actor_mentioned:
+                    # Mentioning another member is not an authorization to
+                    # disclose that member's private conversation. Only the
+                    # current speaker's own private memory may cross into the
+                    # group, after visibility/ACL checks have allowed it.
+                    elif current_user_id and owner_id and owner_id != current_user_id:
                         reason = "group_private_memory_actor_not_current_sender"
-                    elif not current_user_id and not actor_mentioned:
+                    elif not current_user_id:
                         reason = "group_private_memory_sender_unknown"
                 elif is_user_profile and owner_id and current_user_id and owner_id != current_user_id and not actor_mentioned:
                     reason = "group_profile_actor_not_current_sender"
@@ -6978,6 +7916,8 @@ class MemoryCompanionService:
         bridge_enabled = self.config.bool("private_companion_bridge.enabled", True)
         return {
             "available": True,
+            "state": "ready" if bridge_enabled else "local_only",
+            "degraded": False,
             "schedule_fast_context": bridge_enabled and self.config.bool(
                 "private_companion_bridge.schedule_fast_context_enabled",
                 True,
@@ -7468,6 +8408,9 @@ class MemoryCompanionService:
             return "uncertain", "low_confidence"
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
+        companion_cap_reason = self._companion_memory_mention_cap(ctx, explicit_memory=explicit_memory)
+        if companion_cap_reason:
+            return "tone", companion_cap_reason
         acl_authorized_for_sender = self._acl_authorized_private_group_result(
             ctx,
             memory,
@@ -7550,6 +8493,23 @@ class MemoryCompanionService:
             return "tone", "indirect_memory"
         return "mention", "direct_relevance"
 
+    @staticmethod
+    def _companion_memory_mention_cap(ctx: SessionContext, *, explicit_memory: bool) -> str:
+        """Return a reason when Companion limits unsolicited memory expression."""
+
+        if explicit_memory or ctx.scope != "private" or not ctx.companion_expression_contract:
+            return ""
+        if ctx.companion_expression_blocker:
+            return "companion_expression:blocker"
+        if ctx.companion_expression_safety_mode != "normal":
+            return f"companion_expression:safety_{ctx.companion_expression_safety_mode}"
+        if ctx.companion_expression_band in {"avoidant", "hurt"}:
+            return f"companion_expression:band_{ctx.companion_expression_band}"
+        mention_capable = {"support", "followup", "shared_ritual"}
+        if not mention_capable.intersection(ctx.companion_expression_allowed_behaviors):
+            return "companion_expression:behavior_cap"
+        return ""
+
     def _memory_age_days(self, memory: MemoryRecord) -> float | None:
         timestamp = clean_text(memory.occurred_at or memory.updated_at or memory.created_at, 80)
         parsed = self._parse_utc_datetime(timestamp)
@@ -7592,7 +8552,7 @@ class MemoryCompanionService:
         if not check_like:
             return False
         try:
-            hour = datetime.now().hour
+            hour = datetime.now(LOCAL_TZ).hour
         except Exception:
             return True
         return hour >= 23 or hour < 7
@@ -7749,9 +8709,36 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
         bot_id: str = "",
     ) -> set[str]:
+        # Both mutable personal timelines and unresolved commitments can be
+        # numerous.  Keep them inside their diversity budgets for ordinary
+        # questions; an explicit owner/focus may opt one of them into overflow.
+        capped = {"self_timeline", "open_loop"}
         if self._query_focuses_self_timeline(query, time_intent=time_intent, bot_id=bot_id):
-            return set()
-        return {"self_timeline"}
+            capped.discard("self_timeline")
+        if self._query_focuses_open_loop(query):
+            capped.discard("open_loop")
+        return capped
+
+    @staticmethod
+    def _query_focuses_open_loop(query: str) -> bool:
+        """Recognize an explicit unresolved-workflow request.
+
+        These are positive workflow forms, so ordinary schedule words such as
+        "明天" or "提醒" in a stored record cannot grant open-loop overflow by
+        themselves.
+        """
+        compact = re.sub(r"\s+", "", clean_text(query, 1000)).lower()
+        if not compact:
+            return False
+        if MemoryCompanionService._message_is_vague_recent_followup(compact):
+            return True
+        patterns = (
+            r"(?:未完成|没完成|没做完|没写完|待办|待续|未了事项|没聊完|还欠着)",
+            r"(?:承诺|答应|约定).{0,12}(?:还记得|完成|兑现|做到|没做)",
+            r"(?:提醒|下次|回头).{0,12}(?:什么|哪些|还有|没)",
+            r"(?:open[ _-]?loop|unfinished|todo|promise|commitment)",
+        )
+        return any(re.search(pattern, compact) for pattern in patterns)
 
     def _query_focuses_self_timeline(
         self,
@@ -8126,7 +9113,7 @@ class MemoryCompanionService:
     def _compute_time_of_day(self) -> str:
         """Compute time-of-day category for atmosphere hints."""
         try:
-            hour = datetime.now().hour
+            hour = datetime.now(LOCAL_TZ).hour
         except Exception:
             return ""
         if 23 <= hour or hour < 4:
@@ -8265,6 +9252,51 @@ class MemoryCompanionService:
         state["_identity"] = identity
         return state
 
+    def _peek_relationship_phase(self, ctx: SessionContext) -> dict[str, Any]:
+        """Project an existing phase without creating or saving state."""
+        fallback = {"observed": False, "phase": "unknown", "momentum_band": "unknown"}
+        try:
+            identity = self._phase_identity(ctx)
+            key = self._phase_key(ctx)
+            state = self._relationship_phase_state.get(key)
+            if type(state) is not dict and not identity["bot_id"]:
+                matches = [
+                    candidate
+                    for candidate in self._relationship_phase_state.values()
+                    if type(candidate) is dict
+                    and type(candidate.get("_identity")) is dict
+                    and all(candidate["_identity"].get(field, "") == identity[field] for field in ("platform", "scope", "target_id", "member_id"))
+                ]
+                if len(matches) == 1:
+                    state = matches[0]
+            if type(state) is not dict:
+                legacy_key = clean_text(f"{ctx.scope}:{ctx.current_target_id or ctx.session_id}", 120)
+                legacy_state = self._relationship_phase_state.get(legacy_key)
+                if type(legacy_state) is dict:
+                    state = legacy_state
+            if type(state) is not dict:
+                return fallback
+            phase = state.get("phase")
+            momentum = state.get("momentum")
+            touch_count = state.get("touch_count")
+            if type(phase) is not str or phase not in self._PHASES:
+                return fallback
+            if type(momentum) not in {int, float} or type(momentum) is bool:
+                return fallback
+            if not math.isfinite(momentum):
+                return fallback
+            if type(touch_count) is not int:
+                return fallback
+        except Exception:
+            return fallback
+        momentum_band = "rising" if momentum >= 0.08 else "cooling" if momentum <= -0.08 else "steady"
+        return {
+            "observed": True,
+            "phase": phase,
+            "momentum_band": momentum_band,
+            "touch_count": max(0, min(256, touch_count)),
+        }
+
     def _update_relationship_phase_momentum(
         self,
         ctx: SessionContext,
@@ -8278,6 +9310,11 @@ class MemoryCompanionService:
     ) -> bool:
         message_id = clean_text(message_id or ctx.message_id, 160)
         if not message_id:
+            return False
+        if (
+            ctx.relationship_authority_source == "private_companion.relationship_score"
+            or ctx.companion_expression_contract
+        ):
             return False
         state = self._get_relationship_phase(ctx)
         recent_ids = state.get("recent_touch_message_ids")
@@ -8378,6 +9415,11 @@ class MemoryCompanionService:
 
     def _update_address_evolution(self, ctx: SessionContext, text: str) -> None:
         """Track address evolution in the relationship phase state."""
+        if (
+            ctx.relationship_authority_source == "private_companion.relationship_score"
+            or ctx.companion_expression_contract
+        ):
+            return
         phase = self._detect_address_phase(text)
         if not phase:
             return
@@ -8411,6 +9453,20 @@ class MemoryCompanionService:
                 f"当前对象已明确固定称呼为“{preferred_address}”。需要直接称呼时只使用这一项，"
                 "不必每句都带称呼；关系阶段建议、历史称呼、显示名和旧记忆只作识别资料，"
                 "不能另造或追加亲昵称呼。若对方本轮明确要求改称呼，以本轮最新要求为准。"
+            )
+        if ctx.companion_expression_contract:
+            return ""
+        if ctx.relationship_authority_source == "private_companion.relationship_score":
+            label = clean_text(ctx.companion_relationship_phase_label, 40) or clean_text(
+                ctx.companion_relationship_phase_key,
+                40,
+            )
+            tone = clean_text(ctx.companion_relationship_tone, 160)
+            address = clean_text(ctx.companion_relationship_address_level, 120)
+            return (
+                f"陪伴插件是长期亲密度权威：当前阶段为“{label or '未标注'}”。"
+                f"基础语气按“{tone or '自然、尊重当前节奏'}”，称呼尺度按“{address or '沿用已确认称呼'}”。"
+                "Memory 仅提供记忆触动趋势和相关事实，不得用自身阶段另行升级称呼、语气或权限。"
             )
         state = self._get_relationship_phase(ctx)
         user_address_phase = state.get("current_address_phase", "")

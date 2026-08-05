@@ -78,6 +78,29 @@ class SessionContext:
     strict_session_only: bool = False
     preferred_address: str = ""
     preferred_address_locked: bool = False
+    relationship_authority_source: str = ""
+    companion_relationship_score: int = 0
+    companion_relationship_phase_key: str = ""
+    companion_relationship_phase_label: str = ""
+    companion_relationship_tone: str = ""
+    companion_relationship_address_level: str = ""
+    companion_interaction_dynamics_version: str = ""
+    companion_interaction_band: str = ""
+    companion_interaction_recovery_band: str = ""
+    companion_interaction_expires_at: float = 0.0
+    companion_interaction_projection_revision: int = 0
+    companion_expression_contract: str = ""
+    companion_expression_band: str = ""
+    companion_expression_allowed_behaviors: tuple[str, ...] = ()
+    companion_expression_safety_mode: str = ""
+    companion_expression_blocker: str = ""
+    companion_expression_reason_codes: tuple[str, ...] = ()
+    companion_expression_pacing: str = ""
+    companion_expression_directness: str = ""
+    companion_expression_validation_style: str = ""
+    companion_expression_self_disclosure: str = ""
+    companion_expression_humor_mode: str = ""
+    companion_expression_topic_initiative: str = ""
 
     @property
     def current_target_id(self) -> str:

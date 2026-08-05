@@ -638,6 +638,7 @@ class HistoricalChatImporter:
     IDENTITY_LINKS_VERSION = 2
     SUMMARY_PERSPECTIVE_VERSION = 1
     DETAIL_SCHEMA_VERSION = 1
+    STAGED_DATA_ERROR = "历史导入暂存数据损坏，请重新上传或清理该预览"
 
     def __init__(self, service: Any) -> None:
         self.service = service
@@ -1277,17 +1278,32 @@ class HistoricalChatImporter:
         manifest_path = self._upload_dir(upload_id) / "manifest.json"
         if not manifest_path.is_file():
             raise ValueError("上传预览不存在或已被清理")
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(self.STAGED_DATA_ERROR) from exc
+        if not isinstance(manifest, dict):
+            raise ValueError(self.STAGED_DATA_ERROR)
+        if clean_text(manifest.get("upload_id"), 120) != clean_text(upload_id, 120):
+            raise ValueError(self.STAGED_DATA_ERROR)
+        return manifest
 
     def _load_upload_messages(self, upload_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         manifest = self.preview_upload(upload_id)
         parsed_path = self._upload_dir(upload_id) / "parsed.jsonl"
         messages: list[dict[str, Any]] = []
-        for raw in parsed_path.read_text(encoding="utf-8").splitlines():
-            if raw.strip():
+        try:
+            for line_no, raw in enumerate(parsed_path.read_text(encoding="utf-8").splitlines(), 1):
+                if not raw.strip():
+                    continue
                 value = json.loads(raw)
-                if isinstance(value, dict):
-                    messages.append(value)
+                if not isinstance(value, dict):
+                    raise ValueError(f"line={line_no}")
+                messages.append(value)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(self.STAGED_DATA_ERROR) from exc
+        if not messages:
+            raise ValueError(self.STAGED_DATA_ERROR)
         return manifest, messages
 
     def _private_api(self) -> Any | None:
@@ -2217,7 +2233,12 @@ class HistoricalChatImporter:
             batch["id"], statuses={"completed", "archived_only"}
         )
         memory_counts = await self.store.chat_import_memory_counts(batch["id"])
-        checkpoint = max((int(item.get("segment_index") or 0) + 1 for item in completed_segments), default=0)
+        current_checkpoint = max(0, int(batch.get("checkpoint_segment") or 0))
+        computed_checkpoint = max(
+            (int(item.get("segment_index") or 0) + 1 for item in completed_segments),
+            default=0,
+        )
+        checkpoint = max(current_checkpoint, computed_checkpoint)
         await self.store.update_chat_import_batch(
             batch["id"],
             checkpoint_segment=checkpoint,

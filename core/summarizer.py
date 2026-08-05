@@ -14,6 +14,10 @@ from .turn_signal import message_terms
 
 class MemorySummarizer:
     MAX_ASSOCIATIONS = 12
+    # Keep a bounded provider response, but size it from the JSON contract so
+    # a complete association-rich payload is not cut in the middle of a JSON
+    # string or array.
+    MAX_PROVIDER_RESPONSE_CHARS = 64_000
     ASSOCIATION_FIELD_LIMITS = {
         "cue": 80,
         "tag": 80,
@@ -96,7 +100,10 @@ class MemorySummarizer:
                 except Exception:
                     pass
             raise
-        text = clean_text(getattr(resp, "completion_text", "") or "", self.max_summary_chars * 2)
+        text = clean_text(
+            getattr(resp, "completion_text", "") or "",
+            self._provider_response_limit(),
+        )
         if callable(usage_recorder):
             try:
                 usage_recorder(
@@ -121,6 +128,29 @@ class MemorySummarizer:
             if clean_text(row.get("id"), 160)
         ]
         return normalized
+
+    def _provider_response_limit(self) -> int:
+        """Return a bounded size that covers the full documented JSON shape."""
+        scalar_budget = self.max_summary_chars * 3  # summary/canonical/persona
+        list_budget = (6 * 80) + (8 * 160) + (8 * 180) + (10 * 80)
+        association_budget = self.MAX_ASSOCIATIONS * (
+            sum(self.ASSOCIATION_FIELD_LIMITS.values()) + 32
+        )
+        bot_fact_budget = 4 * (160 + 220 + 24 + 32)
+        structural_overhead = 1024
+        contract_budget = (
+            scalar_budget
+            + list_budget
+            + association_budget
+            + bot_fact_budget
+            + structural_overhead
+        )
+        # Leave room for provider-specific extra fields while retaining an
+        # absolute ceiling against unbounded completions.
+        return max(
+            self.max_summary_chars * 2,
+            min(self.MAX_PROVIDER_RESPONSE_CHARS, max(4096, contract_budget * 2)),
+        )
 
     def compose_memory_content(self, payload: dict[str, Any]) -> str:
         summary = clean_text(payload.get("summary"), self.max_summary_chars)

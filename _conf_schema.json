@@ -657,7 +657,7 @@
     }
   },
   "private_companion_bridge": {
-    "description": "陪伴插件协同",
+    "description": "记忆插件协同",
     "hint": "与主动陪伴插件协调记忆、连续对话和自我时间线，减少重复注入和提示词污染。",
     "type": "object",
     "items": {
@@ -685,6 +685,18 @@
         "type": "bool",
         "default": true
       },
+      "enable_p5_b1_recall_gate": {
+        "description": "启用 P5-B1 召回闸门",
+        "hint": "默认关闭。开启后普通记忆注入和主动 recall 需要陪伴侧当前请求的一次性 attestation；无效时返回明确 degraded。",
+        "type": "bool",
+        "default": false
+      },
+      "enable_p5_b1_bridge_gate": {
+        "description": "启用 P5-B1 Bridge 闸门",
+        "hint": "默认关闭。开启后 Bridge 搜索、上下文和序列化入口需要一次性 attestation；不会删除原版娱乐写入。",
+        "type": "bool",
+        "default": false
+      },
       "dedupe_prompt_context": {
         "description": "协同去重陪伴注入",
         "hint": "开启后会和陪伴插件协调，让重复的自我时间线、私聊上下文等段落只由一侧注入。",
@@ -708,6 +720,12 @@
         "hint": "默认关闭。开启后其他会话中触发的情绪余波可影响当前窗口，但不会注入原始记忆内容。",
         "type": "bool",
         "default": false
+      },
+      "legacy_emotion_compatibility_enabled": {
+        "description": "兼容旧版同窗口情绪读取",
+        "hint": "过渡期开启。仅允许旧版陪伴插件读取并消费当前精确私聊窗口的脱敏情绪事件；跨窗口读取仍需新版能力上下文。升级陪伴插件后可关闭。",
+        "type": "bool",
+        "default": true
       },
       "clean_proactive_history": {
         "description": "清理主动消息历史提示",

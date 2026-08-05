@@ -38,7 +38,12 @@ class MemoryClassifier:
             importance=importance,
             review_status="auto",
             tags=["user_message", ctx.scope],
-            metadata={"raw_text": text, "sender_name": ctx.user_name, "sender_id": ctx.user_id},
+            metadata={
+                "raw_text": text,
+                "sender_name": ctx.user_name,
+                "sender_id": ctx.user_id,
+                "owner_bot_id": clean_text(ctx.bot_id, 120),
+            },
         )
 
     def from_bot_response(self, ctx: SessionContext, response_text: str) -> MemoryRecord | None:
@@ -103,7 +108,11 @@ class MemoryClassifier:
                     content=fact["content"],
                     evidence=text,
                     tags=fact["tags"],
-                    metadata={"source_memory_id": source_memory_id, "extractor": "rule_v1"},
+                    metadata={
+                        "source_memory_id": source_memory_id,
+                        "extractor": "rule_v1",
+                        "owner_bot_id": clean_text(ctx.bot_id, 120),
+                    },
                     **base,
                 )
             )

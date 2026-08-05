@@ -16,6 +16,7 @@ from .visibility import VisibilityPolicy
 
 
 class RetrievalEngine:
+    DEFAULT_MATERIALIZE_LIMIT = 2000
     def __init__(
         self,
         store: MemoryStore,
@@ -1005,7 +1006,11 @@ class RetrievalEngine:
             )
         expanded_terms = self._merge_terms(terms, graph_terms)
         include_pending = not self.policy.hide_pending_review
-        ranked_candidates = await self.store.list_candidate_memories(limit=2000, include_pending=include_pending)
+        # Keep the broad priority scan explicitly bounded.
+        ranked_candidates = await self.store.list_candidate_memories(
+            limit=self.DEFAULT_MATERIALIZE_LIMIT,
+            include_pending=include_pending,
+        )
         current_window_candidates = await self.store.list_current_window_candidate_memories(
             scope=ctx.scope,
             session_id=ctx.session_id,
@@ -1756,16 +1761,22 @@ class RetrievalEngine:
         memory_type = (memory.memory_type or "").lower()
         reality = (memory.reality_level or "").lower()
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
-        # The producer already gives schedule entries a structured type. Keep
-        # that ownership signal ahead of generic promise/open-loop weights,
-        # which are often raised by ordinary schedule words such as "tomorrow".
-        if memory_type == "schedule_fragment":
-            return "self_timeline"
-        if self._memory_is_open_loop(memory, metadata):
-            return "open_loop"
+        subject = getattr(memory, "subject", None)
+        subject_id = clean_text(getattr(subject, "id", ""), 120).lower()
+        context_bot_id = clean_text(getattr(ctx, "bot_id", ""), 120).lower()
+        bot_subject = (
+            clean_text(getattr(subject, "kind", ""), 40).lower() == "bot"
+            and (not subject_id or subject_id in {"self", context_bot_id} or not context_bot_id)
+        )
+        # Bot-owned records carry a stronger slot signal than generic promise
+        # weights.  Calibrating a schedule often raises ``open_loop_weight``
+        # because its text contains "tomorrow" or "remind"; that must not move
+        # a Bot schedule into the overflowable open-loop bucket.
         if (
             memory.visibility == "bot_self"
             or reality in {"bot_action", "persona_life", "fictional_content"}
+            or bot_subject
+            or memory_type == "schedule_fragment"
             or memory_type
             in {
                 "self_action",
@@ -1780,6 +1791,8 @@ class RetrievalEngine:
             }
         ):
             return "self_timeline"
+        if self._memory_is_open_loop(memory, metadata):
+            return "open_loop"
         if (
             memory_type
             in {

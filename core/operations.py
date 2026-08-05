@@ -15,6 +15,7 @@ from .models import EntityRef, MemoryRecord, clean_text, json_loads
 PORTABLE_FORMAT = "astrbot-memory-jsonl"
 PORTABLE_VERSION = 1
 MAX_PORTABLE_BYTES = 64 * 1024 * 1024
+PORTABLE_EXPORT_PAGE_SIZE = 500
 
 
 PRESETS: dict[str, dict[str, Any]] = {
@@ -302,17 +303,14 @@ class PortableMemoryArchive:
         self.export_dir = self.data_dir / "exports"
 
     async def export(self) -> dict[str, Any]:
-        memories = await self.store.list_memories(limit=1_000_000)
-        identities = await self.store.list_identities(limit=1_000_000)
-        relationships = await self.store.list_relationships(limit=1_000_000)
-        timeline = await self.store.recent_timeline(limit=1_000_000)
+        stats = await self.store.stats()
         acl_rules = await self.store.list_acl_rules()
         acl_policies = await self.store.list_acl_policies()
         counts = {
-            "memory": len(memories),
-            "identity": len(identities),
-            "relationship": len(relationships),
-            "timeline": len(timeline),
+            "memory": int(stats.get("total_memories") or 0),
+            "identity": int(stats.get("identities") or 0),
+            "relationship": int(stats.get("relationships") or 0),
+            "timeline": int(stats.get("timeline_events") or 0),
             "acl_rule": len(acl_rules),
             "acl_policy": len(acl_policies),
         }
@@ -333,15 +331,26 @@ class PortableMemoryArchive:
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 self._write_line(handle, header)
-                for memory in memories:
-                    self._write_line(handle, {"record_type": "memory", "data": self._memory_payload(memory)})
-                for kind, rows in (
-                    ("identity", identities),
-                    ("relationship", relationships),
-                    ("timeline", timeline),
-                    ("acl_rule", acl_rules),
-                    ("acl_policy", acl_policies),
+                for record_type, loader, normalizer in (
+                    ("memory", self.store.list_memories, self._memory_payload),
+                    ("identity", self.store.list_identities, self._normalized_row),
+                    ("relationship", self.store.list_relationships, self._normalized_row),
+                    ("timeline", self.store.recent_timeline, self._normalized_row),
                 ):
+                    offset = 0
+                    while True:
+                        rows = await loader(limit=PORTABLE_EXPORT_PAGE_SIZE, offset=offset)
+                        if not rows:
+                            break
+                        for row in rows:
+                            self._write_line(
+                                handle,
+                                {"record_type": record_type, "data": normalizer(row)},
+                            )
+                        offset += len(rows)
+                        if len(rows) < PORTABLE_EXPORT_PAGE_SIZE:
+                            break
+                for kind, rows in (("acl_rule", acl_rules), ("acl_policy", acl_policies)):
                     for row in rows:
                         self._write_line(handle, {"record_type": kind, "data": self._normalized_row(row)})
             os.replace(temp_name, path)

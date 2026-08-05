@@ -140,7 +140,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=1.7.1", page)
+        self.assertIn("app.css?v=1.7.1-user-workspace", page)
 
     def test_microscope_has_explicit_context_and_non_overlapping_results(self) -> None:
         page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
@@ -264,10 +264,26 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .projection-stage', styles)
         self.assertIn(".film-app.is-workspace .overview-layout-switch", styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=1.7.1", page)
+        self.assertIn("app.js?v=1.7.1-user-workspace", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")
+
+    def test_user_profile_and_private_memory_share_one_user_workspace(self) -> None:
+        page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("用户档案与记忆", page)
+        self.assertIn('data-overview-view="relations" data-user-memory-filter="private"', page)
+        self.assertIn('id="userMemoryTitle"', page)
+        self.assertIn('data-user-memory-filter="profile"', page)
+        self.assertIn('data-user-memory-filter="private"', page)
+        self.assertIn('if (view === "maintain")', script)
+        self.assertIn('view = "relations"', script)
+        self.assertIn('if (state.activeView === "relations") return "private"', script)
+        self.assertIn('scopedMemoryParams("private", { limit: 180 })', script)
+        self.assertIn('params.delete("session_id")', script)
+        self.assertNotIn('id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>\n            </div>\n            <div id="privateMemoryList"', page)
 
 
 if __name__ == "__main__":

@@ -3,10 +3,10 @@ const PAGE_ENDPOINT_PREFIX = "page";
 const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 
 const VIEWS = {
-  objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和拟人维度概览。" },
+  objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和互动协同概览。" },
   film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。" },
   microscope: { title: "记忆显微镜", hint: "对比全库管理检索与指定会话中的实际召回和过滤。" },
-  relations: { title: "用户记忆", hint: "聚焦用户画像、偏好、称呼和关系声明。" },
+  relations: { title: "用户档案与记忆", hint: "按用户统一查看私聊、画像、偏好、称呼和关系记忆。" },
   review: { title: "个人记忆", hint: "查看 Bot 自身的每日生活日程、相册、主观记忆和细化片段。" },
   archive: { title: "维护 / 迁移 / 配置", hint: "执行维护、迁移、清理和导入修复。" },
   maintain: { title: "私聊记忆", hint: "查看私聊范围内的对话、偏好、事实和稳定记忆。" },
@@ -36,19 +36,12 @@ const SECONDARY_NAV = {
     { id: "relations", label: "图谱边", sublabel: "人物、话题、事实与记忆关联", badge: "图谱" },
     { id: "threads", label: "跨窗口线程", sublabel: "不同私聊/群聊之间的待办线索", badge: "线程" },
     { id: "timeline", label: "时间线", sublabel: "最近记录的事件节点", badge: "时间" },
-    { id: "persona", label: "拟人维度", sublabel: "关系阶段 · 情绪连续性 · 称呼演进", badge: "拟人" },
+    { id: "persona", label: "互动协同", sublabel: "表达权威 · 记忆触动 · 情绪连续性", badge: "协同" },
   ],
   microscope: [
     { id: "query", label: "召回测试", sublabel: "输入一句话模拟检索", badge: "测试" },
     { id: "hits", label: "命中记忆", sublabel: "查看检索结果", badge: "命中" },
     { id: "blocked", label: "过滤原因", sublabel: "查看被挡下的记忆", badge: "过滤" },
-  ],
-  relations: [
-    { id: "all", label: "全部用户记忆", sublabel: "画像、偏好与关系", badge: "全部" },
-    { id: "profile", label: "用户画像", sublabel: "稳定画像片段", badge: "画像" },
-    { id: "preference", label: "偏好", sublabel: "喜好、习惯、倾向", badge: "偏好" },
-    { id: "relationship", label: "关系声明", sublabel: "身份和关系线索", badge: "关系" },
-    { id: "explicit", label: "明确记住", sublabel: "用户主动要求记住", badge: "记住" },
   ],
   archive: [
     { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
@@ -60,7 +53,7 @@ const SECONDARY_NAV = {
     { id: "retrieval", label: "检索召回", sublabel: "候选、Embedding、Rerank", badge: "召回" },
     { id: "config:memory_injection", label: "记忆注入", sublabel: "注入数量、字数与日志", badge: "注入" },
     { id: "config:context_orchestration", label: "注入编排", sublabel: "分槽调度与当前状态保护", badge: "编排" },
-    { id: "config:private_companion_bridge", label: "陪伴协同", sublabel: "桥接、去重与提示清理", badge: "联动" },
+    { id: "config:private_companion_bridge", label: "记忆插件协同", sublabel: "与陪伴插件桥接、去重和清理提示", badge: "联动" },
     { id: "config:visibility", label: "可见性", sublabel: "跨窗口默认边界", badge: "权限" },
     { id: "topology", label: "权限拓扑", sublabel: "可视化记忆权限矩阵", badge: "拓扑" },
     { id: "config:knowledge_graph", label: "图谱关联", sublabel: "节点、边与检索扩展", badge: "图谱" },
@@ -166,6 +159,7 @@ const state = {
   overviewLayout: document.documentElement.dataset.overviewLayout === "cinema" ? "cinema" : "standard",
   activeView: "objects",
   activeBucketId: "all",
+  userMemoryFilter: "all",
   microscopeBucketId: "all",
   microscopeSearchToken: 0,
   bucketLoadToken: 0,
@@ -194,6 +188,8 @@ const state = {
   historicalChatTargetContextId: "",
   historicalChatTargetBuckets: [],
   historicalChatPollTimer: 0,
+  historicalChatPollAttempts: 0,
+  historicalChatPollStartedAt: 0,
   historicalChatFile: null,
   conversationImportSource: "qq",
   qqHistoryCapabilities: null,
@@ -495,7 +491,21 @@ async function httpRequest(path, method, body) {
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
-  return response.json();
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (error) {
+    if (!response.ok) {
+      throw new Error(`请求失败（HTTP ${response.status}）`);
+    }
+    throw new Error("页面 API 返回了无效 JSON");
+  }
+  if (!response.ok || data?.success === false) {
+    const error = new Error(data?.error || `请求失败（HTTP ${response.status}）`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
 }
 
 function sleep(ms) {
@@ -1209,18 +1219,21 @@ function bindBucketListInteractions() {
 
 function currentRailScope() {
   if (state.activeView === "film") return "group";
+  if (state.activeView === "relations") return "private";
   if (state.activeView === "maintain") return "private";
   return "";
 }
 
 function scopedViewScope(view = state.activeView) {
   if (view === "film") return "group";
+  if (view === "relations") return "private";
   if (view === "maintain") return "private";
   return "";
 }
 
 function scopedViewTarget(view = state.activeView) {
   if (view === "film") return "#groupMemoryList";
+  if (view === "relations") return "#relationList";
   if (view === "maintain") return "#privateMemoryList";
   return "";
 }
@@ -1228,15 +1241,15 @@ function scopedViewTarget(view = state.activeView) {
 function renderScopedModeControls(view = state.activeView) {
   const scope = scopedViewScope(view);
   if (!scope) return;
-  const title = view === "film" ? $("#groupMemoryTitle") : $("#privateMemoryTitle");
-  const hint = view === "film" ? $("#groupMemoryHint") : $("#privateMemoryHint");
-  if (title) title.textContent = `${windowKindLabel(scope)}记忆`;
+  const title = view === "film" ? $("#groupMemoryTitle") : view === "relations" ? $("#userMemoryTitle") : $("#privateMemoryTitle");
+  const hint = view === "film" ? $("#groupMemoryHint") : view === "relations" ? $("#userMemoryHint") : $("#privateMemoryHint");
+  if (title) title.textContent = view === "relations" ? "用户档案与记忆" : `${windowKindLabel(scope)}记忆`;
   if (hint) hint.textContent = VIEWS[view]?.hint || "";
   updateScopedClearButton(view);
 }
 
 function updateScopedClearButton(view = state.activeView) {
-  const button = view === "film" ? $("#clearCurrentGroupMemoryBtn") : view === "maintain" ? $("#clearCurrentPrivateMemoryBtn") : null;
+  const button = view === "film" ? $("#clearCurrentGroupMemoryBtn") : ["relations", "maintain"].includes(view) ? $("#clearCurrentPrivateMemoryBtn") : null;
   const bucket = activeBucket();
   const scope = scopedViewScope(view);
   const canClear = Boolean(bucket && bucket.id !== "all" && bucket.scope === scope && bucket.target_id);
@@ -1722,6 +1735,11 @@ async function playRailRefreshTransition(task) {
 }
 
 async function openView(view, { preserveBucket = false } = {}) {
+  if (view === "maintain") {
+    view = "relations";
+    state.userMemoryFilter = "private";
+    preserveBucket = true;
+  }
   const app = $("#app");
   const wasWorkspace = app.classList.contains("is-workspace");
   const switchingWorkspaceView = wasWorkspace && state.activeView !== view;
@@ -1761,7 +1779,7 @@ async function openView(view, { preserveBucket = false } = {}) {
   renderScopedModeControls(view);
   if (view === "film") {
     renderScopedBucketRail("group");
-  } else if (view === "maintain") {
+  } else if (view === "relations" || view === "maintain") {
     renderScopedBucketRail("private");
   } else if (view !== "review") {
     renderSecondaryNav(view, !switchingWorkspaceView);
@@ -1993,14 +2011,30 @@ function renderMemoryList(selector, memories, emptyText) {
 }
 
 function relationTypesForSecondary() {
-  const active = activeSecondaryNav("relations");
+  const active = state.userMemoryFilter || "all";
   const map = {
     profile: ["user_profile"],
     preference: ["user_preference"],
     relationship: ["relationship_claim"],
     explicit: ["explicit_memory"],
   };
-  return map[active] || ["user_profile", "user_preference", "explicit_memory", "relationship_claim"];
+  return map[active] || [];
+}
+
+function syncUserMemoryFilterControls() {
+  $$('[data-user-memory-filter]').forEach((button) => {
+    if (!button.closest('#view-relations')) return;
+    const active = button.dataset.userMemoryFilter === state.userMemoryFilter;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+}
+
+async function selectUserMemoryFilter(filter) {
+  const allowed = new Set(['all', 'profile', 'preference', 'relationship', 'explicit', 'private']);
+  state.userMemoryFilter = allowed.has(filter) ? filter : 'all';
+  syncUserMemoryFilterControls();
+  if (state.activeView === 'relations') await loadUserMemory();
 }
 
 async function loadScopedMemories(selector, scope, loadingText, emptyText, extra = {}) {
@@ -2076,20 +2110,34 @@ async function loadContextPanel() {
       apiGet(`/timeline?${params.toString()}`),
       apiGet(`/logs?${params.toString()}`),
     ]);
-    const settled = (idx) => results[idx].status === "fulfilled" ? (results[idx].value?.items || []) : [];
-    const failures = results.filter(r => r.status === "rejected");
+    const settled = (idx) => {
+      const result = results[idx];
+      if (result.status === "fulfilled") {
+        return { items: Array.isArray(result.value?.items) ? result.value.items : [], error: "" };
+      }
+      return { items: [], error: result.reason?.message || "读取失败，请稍后重试" };
+    };
+    const sections = results.map((_, idx) => settled(idx));
+    const failures = sections.filter((item) => item.error);
     if (failures.length === results.length) {
       throw results[0].reason || new Error("所有知识图谱 API 请求失败");
     }
     target.innerHTML = renderKnowledgeOverview({
-      graph: settled(0),
-      relations: settled(1),
-      threads: settled(2),
-      timeline: settled(3),
-      logs: settled(4),
+      graph: sections[0].items,
+      relations: sections[1].items,
+      threads: sections[2].items,
+      timeline: sections[3].items,
+      logs: sections[4].items,
+      errors: {
+        graph: sections[0].error,
+        relations: sections[1].error,
+        threads: sections[2].error,
+        timeline: sections[3].error,
+        logs: sections[4].error,
+      },
     });
     if (failures.length > 0) {
-      const failedNames = ["图谱边", "身份关系", "跨窗口线程", "时间线", "注入日志"].filter((_, i) => results[i].status === "rejected");
+      const failedNames = ["图谱边", "身份关系", "跨窗口线程", "时间线", "注入日志"].filter((_, i) => sections[i].error);
       showToast(`${failedNames.join("、")}加载失败，已显示可用数据`, "error");
     }
   }
@@ -2109,7 +2157,16 @@ function rawAttr(value) {
   return escapeHtml(JSON.stringify(value || {}));
 }
 
-function renderKnowledgeOverview({ graph = [], relations = [], threads = [], timeline = [], logs = [] } = {}) {
+function renderContextPanelErrors(errors = {}) {
+  const labels = { graph: "图谱边", relations: "身份关系", threads: "跨窗口线程", timeline: "时间线", logs: "注入日志" };
+  const rows = Object.entries(errors)
+    .filter(([, message]) => message)
+    .map(([key, message]) => `<div class="empty-state error-state"><b>${escapeHtml(labels[key] || key)}读取失败</b><span>${escapeHtml(message)}</span></div>`)
+    .join("");
+  return rows ? `<section class="context-section film-panel"><h4>部分数据暂不可用</h4>${rows}</section>` : "";
+}
+
+function renderKnowledgeOverview({ graph = [], relations = [], threads = [], timeline = [], logs = [], errors = {} } = {}) {
   const activeThreads = threads.filter((item) => (item.status || "open") === "open").length;
   return `
     <section class="context-section film-panel">
@@ -2121,6 +2178,7 @@ function renderKnowledgeOverview({ graph = [], relations = [], threads = [], tim
         ${configCard("时间线节点", `${timeline.length} 条`, "最近记录的事件、消息和整理结果", "blue", "时间")}
       </div>
     </section>
+    ${renderContextPanelErrors(errors)}
     ${renderKnowledgeGraphEdges(graph, "最近图谱边")}
     ${renderKnowledgeRelations(relations, "最近身份关系")}
     ${renderKnowledgeThreads(threads, "最近跨窗口线程")}
@@ -2394,10 +2452,25 @@ function renderContextLogs(logs) {
 async function loadUserMemory() {
   const target = $("#relationList");
   if (!target) return;
-  target.innerHTML = loadingState("正在读取用户记忆...");
+  syncUserMemoryFilterControls();
+  target.innerHTML = loadingState("正在读取用户档案与记忆...");
   const types = relationTypesForSecondary();
-  const memories = (await loadMemories({ limit: 160 })).filter((memory) => hasMemoryType(memory, types));
-  renderMemoryList("#relationList", memories, "当前范围还没有用户画像、偏好或关系声明。");
+  const { params, incompatible } = scopedMemoryParams("private", { limit: 180 });
+  if (incompatible) {
+    target.innerHTML = '<div class="empty-state">当前对象不是私聊用户，请从左侧选择用户。</div>';
+    return;
+  }
+  // 用户工作区按精确用户身份聚合其全部私聊窗口；会话 ID 只用于旧私聊入口，
+  // 不能把同一用户在其他私聊窗口中的画像/偏好切掉。
+  if (activeBucket()?.target_id) params.delete("session_id");
+  const data = await apiGet(`/memories?${params.toString()}`);
+  const allMemories = data.memories || [];
+  let memories = allMemories;
+  if (types.length) memories = allMemories.filter((memory) => hasMemoryType(memory, types));
+  if (state.userMemoryFilter === 'private') {
+    memories = allMemories.filter((memory) => memory.scope === 'private');
+  }
+  renderMemoryList("#relationList", memories, "当前用户在这个分类下还没有记忆。");
 }
 
 async function loadPersonalMemory() {
@@ -4454,7 +4527,7 @@ function renderMemoryStructuredMetadata(memory) {
           <div class="memory-diagnostics-grid">
             ${policy ? `<span><em>策略</em><strong>${escapeHtml(mentionPolicyLabel(policy))}</strong></span>` : ""}
             ${mentionability !== undefined && mentionability !== null ? `<span><em>可提及性</em><strong>${escapeHtml(percentLabel(mentionability))}</strong></span>` : ""}
-            ${phase ? `<span><em>关系阶段</em><strong>${escapeHtml(phase)}</strong></span>` : ""}
+            ${phase ? `<span><em>当时关系情境</em><strong>${escapeHtml(phase)}</strong></span>` : ""}
             ${decayMode ? `<span><em>衰减</em><strong>${escapeHtml(decayModeLabel(decayMode))}</strong></span>` : ""}
             ${feedback.last_reaction ? `<span><em>上次反馈</em><strong>${escapeHtml(reactionLabel(feedback.last_reaction))}</strong></span>` : ""}
           </div>
@@ -5793,7 +5866,16 @@ async function refreshHistoricalChatStatus() {
 
 function scheduleHistoricalChatPoll() {
   stopHistoricalChatPoll();
+  state.historicalChatPollAttempts = 0;
+  state.historicalChatPollStartedAt = Date.now();
   state.historicalChatPollTimer = window.setInterval(() => {
+    state.historicalChatPollAttempts += 1;
+    const elapsed = Date.now() - state.historicalChatPollStartedAt;
+    if (state.historicalChatPollAttempts > 120 || elapsed > 10 * 60 * 1000) {
+      stopHistoricalChatPoll();
+      showToast("历史导入轮询已达到上限，请手动刷新任务状态", "error");
+      return;
+    }
     refreshHistoricalChatStatus().catch(() => stopHistoricalChatPoll());
   }, 3000);
 }
@@ -5801,6 +5883,7 @@ function scheduleHistoricalChatPoll() {
 function stopHistoricalChatPoll() {
   if (state.historicalChatPollTimer) window.clearInterval(state.historicalChatPollTimer);
   state.historicalChatPollTimer = 0;
+  state.historicalChatPollStartedAt = 0;
 }
 
 function historicalChatSegmentStatusLabel(value) {
@@ -5967,7 +6050,7 @@ function renderHistoricalChatStatus(result) {
           <span>重要事件 ${number(memoryCounts.important_event)}</span>
           <span>日摘要 ${number(memoryCounts.daily_digest)}</span>
           <span>稳定事实 ${number(memoryCounts.stable_fact)}</span>
-          <span>阶段摘要 ${number(memoryCounts.relationship_phase_summary)}</span>
+          <span>相处经历摘要 ${number(memoryCounts.relationship_phase_summary)}</span>
         </div>
       ` : ""}
       ${batch.stats?.embedding?.enabled ? `<small class="chat-import-embedding-note">向量索引 ${number(batch.stats.embedding.indexed)}/${number(batch.stats.embedding.eligible)} · ${escapeHtml(batch.stats.embedding.status || "处理中")}</small>` : ""}
@@ -6281,6 +6364,7 @@ function bindActions() {
     if (!button || !$("#standardOverview").contains(button)) return;
     const view = button.dataset.overviewView;
     if (!VIEWS[view]) return;
+    if (button.dataset.userMemoryFilter) state.userMemoryFilter = button.dataset.userMemoryFilter;
     const bucketId = button.dataset.overviewBucket || "";
     if (bucketId && state.buckets.some((bucket) => bucket.id === bucketId)) {
       state.activeBucketId = bucketId;
@@ -6326,7 +6410,10 @@ function bindActions() {
       strip.style.transition = "transform .95s cubic-bezier(.18,.88,.22,1)";
       strip.style.transform  = `rotate(${ang}deg) translateY(${off}px) translateX(${initialAxis}px)`;
     });
-    strip.addEventListener("click", () => openView(strip.dataset.view));
+    strip.addEventListener("click", () => {
+      if (strip.dataset.userMemoryFilter) state.userMemoryFilter = strip.dataset.userMemoryFilter;
+      openView(strip.dataset.view);
+    });
   });
   $("#backHomeBtn").addEventListener("click", returnHome);
   $("#refreshBtn").addEventListener("click", () => playRailRefreshTransition(refreshAll));
@@ -6343,6 +6430,10 @@ function bindActions() {
     }
   });
   $("#runSearchBtn").addEventListener("click", runSearch);
+  $$('[data-user-memory-filter]').forEach((button) => {
+    if (!button.closest('#view-relations')) return;
+    button.addEventListener('click', () => selectUserMemoryFilter(button.dataset.userMemoryFilter));
+  });
   $("#microscopeContext")?.addEventListener("change", (event) => {
     state.microscopeBucketId = event.currentTarget.value || "all";
     updateMicroscopeContextMeta();
@@ -6441,29 +6532,48 @@ function bindActions() {
 async function loadPersonaState() {
   const panel = $("#personaStatePanel");
   if (!panel) return;
-  panel.innerHTML = `<div class="persona-loading">正在读取拟人维度数据...</div>`;
+  panel.innerHTML = `<div class="persona-loading">正在读取互动协同数据...</div>`;
   let data;
   try {
     data = await apiGet("/persona-state");
+    try {
+      const traces = await apiGet("/emotion/traces?scope=private&limit=20");
+      data.emotion_trace_diagnostics = traces?.result || traces || {};
+    } catch (_) {
+      data.emotion_trace_diagnostics = { state: "degraded", items: [], error_code: "trace_summary_unavailable" };
+    }
   } catch (err) {
     panel.innerHTML = `<div class="persona-error">读取失败：${escapeHtml(err?.message || "未知错误")}</div>`;
     return;
   }
   panel.innerHTML = renderPersonaState(data || {});
+  panel.querySelectorAll("[data-memory-emotion-trace]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const traceId = String(button.dataset.memoryEmotionTrace || "");
+      const target = panel.querySelector("[data-memory-emotion-trace-detail]");
+      if (!traceId || !target) return;
+      target.textContent = "正在读取脱敏链路...";
+      try {
+        const response = await apiGet(`/emotion/trace?trace_id=${encodeURIComponent(traceId)}&scope=private`);
+        const result = response?.result || response || {};
+        target.textContent = JSON.stringify(result, null, 2);
+      } catch (error) {
+        target.textContent = `degraded: ${error?.message || "trace unavailable"}`;
+      }
+    });
+  });
 }
 
 function renderPersonaState(d) {
-  const phases = d.phases || [];
-  const events = d.pending_emotional_events || [];
+  const coordination = d.expression_coordination || {};
+  const trends = d.memory_touch_trends || [];
+  const events = d.memory_touch_events || [];
   const crossState = d.cross_window_emotional_state || {};
   const timeOfDay = d.time_of_day || "";
-  const phaseLabels = d.phase_labels || {};
-  const addressLabels = d.address_phase_labels || {};
+  const legacyLabels = d.legacy_context_labels || {};
   const timeLabels = d.time_of_day_labels || {};
-  const botAddress = d.bot_address_suggestions || {};
-  const phaseDefs = d.phase_definitions || {};
-  const allPhases = phaseDefs.phases || ["acquaintance", "familiar", "close", "intimate", "deeply_bonded"];
-  const thresholds = phaseDefs.thresholds || [0.0, 0.20, 0.45, 0.65, 0.85];
+  const traceDiagnostics = d.emotion_trace_diagnostics || {};
+  const traceItems = Array.isArray(traceDiagnostics.items) ? traceDiagnostics.items.slice(0, 20) : [];
 
   const timeLabel = timeLabels[timeOfDay] || timeOfDay || "未知";
   const crossTotal = crossState.total || 0;
@@ -6473,7 +6583,38 @@ function renderPersonaState(d) {
 
   let html = '<div class="persona-grid">';
 
-  // 1. Time-of-day and cross-window summary card
+  html += `
+    <div class="persona-card persona-card-wide">
+      <div class="persona-card-head"><b>情绪链路诊断</b><span class="persona-badge">${escapeHtml(traceDiagnostics.state || "degraded")}</span></div>
+      <div class="persona-card-body">
+        <div class="persona-event-list">
+          ${traceItems.map((item) => `<button type="button" class="persona-event-item" data-memory-emotion-trace="${escapeHtml(item.trace_id || "")}"><b>${escapeHtml(item.event_type || "neutral")} · r${escapeHtml(item.revision || 1)}</b><small>${escapeHtml(item.status || "observed")} · ${escapeHtml(item.occurred_at || "")}</small></button>`).join("") || '<p class="persona-empty">暂无可展示的脱敏 trace。</p>'}
+        </div>
+        <pre class="json-box" data-memory-emotion-trace-detail>选择一条 trace 查看事件 revision 与投递确认状态。</pre>
+      </div>
+    </div>
+  `;
+
+  html += `
+    <div class="persona-card persona-card-wide">
+      <div class="persona-card-head">
+        <b>陪伴表达协同状态</b>
+        <span class="persona-badge">只读</span>
+      </div>
+      <div class="persona-card-body">
+        <div class="persona-cross-window">
+          <span class="persona-cw-label">最终语气、称呼、互动档位由陪伴插件统一决定</span>
+          <div class="persona-cw-stats">
+            <span class="persona-cw-stat is-active">${escapeHtml(coordination.contract || "未检测到合同")}</span>
+            <span class="persona-cw-stat">请求级消费</span>
+            <span class="persona-cw-stat">不持久化表达状态</span>
+          </div>
+          <small class="persona-cw-empty">记忆插件只负责事实、可见性、召回和记忆提及上限，不会建立第二套好感度、互动状态或称呼系统。</small>
+        </div>
+      </div>
+    </div>
+  `;
+
   html += `
     <div class="persona-card persona-card-wide">
       <div class="persona-card-head">
@@ -6495,38 +6636,37 @@ function renderPersonaState(d) {
     </div>
   `;
 
-  // 2. Relationship phases
-  if (phases.length === 0) {
+  if (trends.length === 0) {
     html += `
       <div class="persona-card persona-card-wide">
-        <div class="persona-card-head"><b>关系阶段</b></div>
+        <div class="persona-card-head"><b>记忆触动趋势</b></div>
         <div class="persona-card-body">
-          <p class="persona-empty">还没有足够的关系互动数据。随着对话积累，关系阶段会自然演进。</p>
+          <p class="persona-empty">暂无历史记忆触动记录。该区域只反映记忆被触动的趋势，不代表当前好感度或互动状态。</p>
         </div>
       </div>
     `;
   } else {
     html += `
       <div class="persona-card persona-card-wide">
-        <div class="persona-card-head"><b>关系阶段演进</b><span class="persona-badge">${phases.length} 个会话</span></div>
+        <div class="persona-card-head"><b>记忆触动趋势</b><span class="persona-badge">${trends.length} 个会话</span></div>
         <div class="persona-card-body">
           <div class="persona-phase-list">
-            ${phases.map(p => renderPersonaPhaseItem(p, allPhases, thresholds, phaseLabels, addressLabels, botAddress)).join('')}
+            ${trends.map(item => renderMemoryTouchTrend(item, legacyLabels)).join('')}
           </div>
         </div>
       </div>
     `;
   }
 
-  // 3. Pending emotional events
   if (events.length > 0) {
     html += `
       <div class="persona-card persona-card-wide">
-        <div class="persona-card-head"><b>情绪事件队列</b><span class="persona-badge">${events.length} 条待处理</span></div>
+        <div class="persona-card-head"><b>记忆触动事件</b><span class="persona-badge">${events.length} 条待处理</span></div>
         <div class="persona-card-body">
           <div class="persona-event-list">
             ${events.map(e => renderPersonaEventItem(e)).join('')}
           </div>
+          <small class="persona-cw-empty">这些事件只作为陪伴插件 Bot 心情与精力的输入，最终表达仍由陪伴插件裁决。</small>
         </div>
       </div>
     `;
@@ -6536,80 +6676,38 @@ function renderPersonaState(d) {
   return html;
 }
 
-function renderPersonaPhaseItem(p, allPhases, thresholds, phaseLabels, addressLabels, botAddress) {
-  const phase = p.phase || 'acquaintance';
-  const momentum = p.momentum || 0;
-  const phaseLabel = phaseLabels[phase] || phase;
+function renderMemoryTouchTrend(p, legacyLabels) {
+  const trend = p.trend_band || 'steady';
+  const trendLabels = { rising: '升温触动', steady: '平稳触动', cooling: '降温触动' };
+  const trendLabel = trendLabels[trend] || trend;
+  const trendPercent = trend === 'rising' ? 82 : trend === 'cooling' ? 24 : 52;
+  const trendClass = trend === 'rising' ? 'is-high' : trend === 'cooling' ? 'is-low' : 'is-mid';
   const touchCount = p.touch_count || 0;
-  const addressPhase = p.current_address_phase || '';
-  const addressLabel = addressLabels[addressPhase] || '';
+  const legacyContext = p.legacy_context || '';
+  const legacyLabel = legacyLabels[legacyContext] || legacyContext;
   const updatedAt = p.updated_at || '';
   const sessionKey = p.session_label || p.session_key || '';
   const shortSession = sessionKey.length > 40 ? sessionKey.slice(0, 37) + '...' : sessionKey;
-
-  // Find current phase index for progress bar
-  const phaseIdx = allPhases.indexOf(phase);
-  const phasePercent = phaseIdx >= 0 ? ((phaseIdx + 1) / allPhases.length) * 100 : 20;
-
-  // Momentum bar: map [-0.3, 1.0] to [0%, 100%]
-  const momentumPercent = Math.max(0, Math.min(100, ((momentum + 0.3) / 1.3) * 100));
-  const momentumClass = momentum >= 0.45 ? 'is-high' : momentum >= 0.15 ? 'is-mid' : momentum < 0 ? 'is-low' : '';
-
-  // Bot address suggestion
-  const botSuggestion = botAddress[phase] || {};
-  const botTone = botSuggestion.tone || '';
-  const botHint = botSuggestion.hint || '';
-
-  // Address log
-  const addressLog = p.address_log || [];
-  const hasAddressLog = addressLog.length > 0;
 
   return `
     <div class="persona-phase-item">
       <div class="persona-phase-header">
         <div class="persona-phase-info">
-          <span class="persona-phase-name">${escapeHtml(phaseLabel)}</span>
+          <span class="persona-phase-name">${escapeHtml(trendLabel)}</span>
           <small class="persona-phase-session">${escapeHtml(shortSession)}</small>
         </div>
         <div class="persona-phase-meta">
           <span class="persona-phase-touch">${touchCount} 次触动</span>
-          ${addressLabel ? `<span class="persona-phase-address">称呼：${escapeHtml(addressLabel)}</span>` : ''}
-        </div>
-      </div>
-      <div class="persona-phase-progress">
-        <div class="persona-phase-bar">
-          <div class="persona-phase-bar-fill" style="width:${phasePercent}%"></div>
-        </div>
-        <div class="persona-phase-steps">
-          ${allPhases.map((ph, i) => `<span class="persona-phase-step ${i <= phaseIdx ? 'is-active' : ''}">${escapeHtml(phaseLabels[ph] || ph)}</span>`).join('')}
+          ${legacyLabel ? `<span class="persona-phase-address">历史情境：${escapeHtml(legacyLabel)}</span>` : ''}
         </div>
       </div>
       <div class="persona-momentum">
-        <span class="persona-momentum-label">动量</span>
+        <span class="persona-momentum-label">触动趋势</span>
         <div class="persona-momentum-bar">
-          <div class="persona-momentum-fill ${momentumClass}" style="width:${momentumPercent}%"></div>
+          <div class="persona-momentum-fill ${trendClass}" style="width:${trendPercent}%"></div>
         </div>
-        <span class="persona-momentum-value">${momentum.toFixed(3)}</span>
+        <span class="persona-momentum-value">${escapeHtml(trendLabel)}</span>
       </div>
-      ${botTone ? `
-        <div class="persona-bot-address">
-          <span class="persona-bot-tone">${escapeHtml(botTone)}</span>
-          ${botHint ? `<small class="persona-bot-hint">${escapeHtml(botHint)}</small>` : ''}
-        </div>
-      ` : ''}
-      ${hasAddressLog ? `
-        <details class="persona-address-log">
-          <summary>称呼演变记录 (${addressLog.length})</summary>
-          <div class="persona-address-timeline">
-            ${addressLog.map(log => `
-              <div class="persona-address-entry">
-                <span class="persona-address-time">${escapeHtml((log.ts || '').slice(0, 16))}</span>
-                <span class="persona-address-change">${escapeHtml(addressLabels[log.previous] || log.previous || '—')} → ${escapeHtml(addressLabels[log.phase] || log.phase || '')}</span>
-              </div>
-            `).join('')}
-          </div>
-        </details>
-      ` : ''}
       ${updatedAt ? `<small class="persona-phase-updated">更新于 ${escapeHtml(updatedAt.slice(0, 16))}</small>` : ''}
     </div>
   `;

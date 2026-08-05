@@ -665,7 +665,7 @@ class InjectionComposer:
             scar = 0.0
         hints: list[str] = []
         if phase and phase != "neutral":
-            hints.append(f"关系阶段={phase}")
+            hints.append(f"当时关系情境={phase}")
         if scar >= 0.45:
             hints.append("伤痕感=高")
         try:

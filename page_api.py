@@ -17,7 +17,13 @@ from zoneinfo import ZoneInfo
 
 from quart import jsonify, request, send_file
 
+try:
+    from astrbot.api.web import request as astrbot_web_request
+except Exception:  # pragma: no cover - optional in isolated page tests.
+    astrbot_web_request = None
+
 from .core.bridge import serialize_memory
+from .core.coordination_status import build_coordination_status, project_p6_status
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
 from .core.models import SessionContext, clean_text
 
@@ -50,6 +56,14 @@ DEFAULT_THEME_KEY = THEME_NAME_TO_KEY[DEFAULT_THEME_NAME]
 class PluginPageApi:
     def __init__(self, plugin: Any) -> None:
         self.plugin = plugin
+        self._emotion_page_admin_capability = None
+        bridge = getattr(plugin, "memory_companion", None)
+        binder = getattr(bridge, "bind_emotion_page_api", None)
+        if callable(binder):
+            try:
+                self._emotion_page_admin_capability = binder(self)
+            except Exception:
+                self._emotion_page_admin_capability = None
 
     def register_routes(self) -> None:
         register = self.plugin.context.register_web_api
@@ -78,6 +92,9 @@ class PluginPageApi:
             ("/config/module/update", self.config_module_update, ["POST"], "MemoryCompanion Page config module update"),
             ("/retrieval/config/update", self.retrieval_config_update, ["POST"], "MemoryCompanion Page retrieval config update"),
             ("/operations/diagnostics", self.operations_diagnostics, ["GET"], "MemoryCompanion operations diagnostics"),
+            ("/emotion/trace", self.emotion_trace, ["GET"], "MemoryCompanion redacted emotion trace"),
+            ("/emotion/traces", self.emotion_traces, ["GET"], "MemoryCompanion redacted emotion trace list"),
+            ("/coordination/status", self.coordination_status, ["GET"], "MemoryCompanion safe coordination status"),
             ("/operations/preset", self.operations_preset, ["GET", "POST"], "MemoryCompanion operations preset"),
             ("/data/export", self.data_export, ["POST"], "MemoryCompanion portable data export"),
             ("/data/import/preview", self.data_import_preview, ["GET"], "MemoryCompanion portable data preview"),
@@ -92,6 +109,9 @@ class PluginPageApi:
             ("/conversation-import/resume", self.conversation_import_resume, ["POST"], "MemoryCompanion historical chat resume"),
             ("/conversation-import/rebind", self.conversation_import_rebind, ["POST"], "MemoryCompanion historical chat rebind"),
             ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
+            ("/profiles", self.profiles, ["GET"], "MemoryCompanion Bot Profiles"),
+            ("/user-memory-summary", self.user_memory_summary, ["GET"], "MemoryCompanion User Memory workspace summary"),
+            ("/capabilities/bot-personal", self.bot_personal_capabilities, ["GET"], "MemoryCompanion Bot Personal capability"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
             ("/companion/personal-photo-data", self.companion_personal_photo_data, ["GET"], "MemoryCompanion Page companion personal photo data"),
@@ -114,11 +134,204 @@ class PluginPageApi:
         stats.pop("pending_review", None)
         return self._ok({"stats": stats})
 
+    async def profiles(self):
+        profile = clean_text(request.args.get("profile", ""), 80)
+        query = clean_text(request.args.get("query", ""), 240)
+        current_date = clean_text(request.args.get("date", ""), 20)
+        current_window = clean_text(request.args.get("window", ""), 40)
+        try:
+            limit = max(1, min(100, int(request.args.get("limit", "10"))))
+        except (TypeError, ValueError):
+            limit = 10
+        result = await self.plugin.service.read_bot_profile(
+            profile,
+            query=query,
+            limit=limit,
+            current_date=current_date,
+            current_window=current_window,
+            authorized=False,
+        )
+        return self._ok({"result": result})
+
+    async def user_memory_summary(self):
+        user_id = clean_text(request.args.get("user_id", ""), 120)
+        session_id = clean_text(request.args.get("session_id", ""), 200)
+        try:
+            limit = max(1, min(8, int(request.args.get("limit", "6"))))
+        except (TypeError, ValueError):
+            limit = 6
+        reader = getattr(getattr(self.plugin, "service", None), "read_user_memory_summary", None)
+        if not callable(reader):
+            result = {
+                "contract": "memory.user_memory_summary.v1",
+                "ok": False,
+                "read_only": True,
+                "state": "degraded",
+                "degraded": True,
+                "pending": True,
+                "user_id": user_id,
+                "session_id": session_id,
+                "counts": {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0},
+                "summaries": [],
+                "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": user_id},
+                "error_code": "bridge_method_unavailable",
+            }
+        else:
+            try:
+                result = await reader(user_id, session_id=session_id, limit=limit)
+            except Exception:
+                result = {
+                    "contract": "memory.user_memory_summary.v1",
+                    "ok": False,
+                    "read_only": True,
+                    "state": "degraded",
+                    "degraded": True,
+                    "pending": True,
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "counts": {"profile": 0, "preference": 0, "relationship": 0, "private_conversation": 0, "other": 0, "total": 0},
+                    "summaries": [],
+                    "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": user_id},
+                    "error_code": "summary_unavailable",
+                }
+        return self._ok({"result": result})
+
+    async def bot_personal_capabilities(self):
+        getter = getattr(self.plugin, "bot_personal_capability_status", None)
+        result = getter() if callable(getter) else {
+            "available": False,
+            "state": "degraded",
+            "degraded": True,
+            "warnings": ["capability_status_unavailable"],
+        }
+        return self._ok({"result": result if isinstance(result, dict) else {}})
+
     async def operations_diagnostics(self):
         try:
             return self._ok({"diagnostics": await self.plugin.service.operational_report()})
         except Exception as exc:
             return self._err(f"运维诊断失败: {exc}", 500)
+
+    async def emotion_trace(self):
+        context = self._trusted_emotion_admin_context()
+        if context is None:
+            return self._err("admin_required", 403)
+        trace_id = clean_text(request.args.get("trace_id", ""), 96)
+        if not trace_id:
+            return self._err("缺少 trace_id", 400)
+        bridge = getattr(self.plugin, "memory_companion", None)
+        getter = getattr(bridge, "get_emotion_trace_diagnostic", None)
+        if not callable(getter):
+            return self._ok({"result": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
+        return self._ok({"result": await getter(trace_id, context, limit=100)})
+
+    async def emotion_traces(self):
+        context = self._trusted_emotion_admin_context()
+        if context is None:
+            return self._err("admin_required", 403)
+        bridge = getattr(self.plugin, "memory_companion", None)
+        getter = getattr(bridge, "get_emotion_trace_summary", None)
+        if not callable(getter):
+            return self._ok({"result": {"state": "degraded", "read_only": True, "items": [], "error_code": "bridge_method_unavailable"}})
+        return self._ok({"result": await getter(
+            context,
+            cursor=clean_text(request.args.get("cursor", ""), 20),
+            limit=max(1, min(100, self._int(request.args.get("limit", "20"), 20))),
+        )})
+
+    def _trusted_emotion_admin_context(self) -> Any | None:
+        """Construct diagnostic authority only from AstrBot's bound dashboard user."""
+
+        if not self._is_bound_dashboard_admin():
+            return None
+        bridge = getattr(self.plugin, "memory_companion", None)
+        creator = getattr(bridge, "create_emotion_admin_context", None)
+        if not callable(creator) or self._emotion_page_admin_capability is None:
+            return None
+        try:
+            return creator(
+                self._emotion_page_admin_capability,
+                bot_id=clean_text(request.args.get("bot_id", ""), 160),
+                scope=clean_text(request.args.get("scope", ""), 24),
+                session_id=clean_text(request.args.get("session_id", ""), 220),
+            )
+        except Exception:
+            return None
+
+    def _is_bound_dashboard_admin(self) -> bool:
+        """Accept only the framework-injected dashboard user, never request claims."""
+
+        bound_request = astrbot_web_request
+        if bound_request is None:
+            return False
+        try:
+            username = clean_text(bound_request.username, 160)
+        except Exception:
+            return False
+        context = getattr(self.plugin, "context", None)
+        config_getter = getattr(context, "get_config", None)
+        if not callable(config_getter):
+            return False
+        try:
+            config = config_getter()
+        except Exception:
+            return False
+        dashboard = config.get("dashboard") if isinstance(config, dict) else None
+        expected_username = clean_text(
+            dashboard.get("username") if isinstance(dashboard, dict) else "",
+            160,
+        )
+        return bool(username and expected_username and username == expected_username)
+
+    async def coordination_status(self):
+        """Expose a fixed, read-only coordination projection."""
+        try:
+            service = getattr(self.plugin, "service", None)
+            p6_raw, bridge = self._companion_p6_status(service)
+            status = build_coordination_status(
+                config=getattr(service, "config", None),
+                runtime={"compatibility_level": "full"},
+                bridge=bridge,
+                p6_raw=p6_raw,
+            )
+        except Exception:
+            status = build_coordination_status(
+                config=None,
+                runtime=None,
+                bridge={"health": "unverifiable", "reason_code": "bridge_status_unavailable"},
+                p6_raw=None,
+            )
+        return self._ok({"status": status})
+
+    def _companion_p6_status(self, service: Any) -> tuple[Any, dict[str, str]]:
+        config = getattr(service, "config", None)
+        getter = getattr(config, "bool", None)
+        if not callable(getter):
+            return None, {"health": "unverifiable", "reason_code": "bridge_config_unavailable"}
+        try:
+            enabled = getter("private_companion_bridge.enabled", True)
+        except Exception:
+            return None, {"health": "unverifiable", "reason_code": "bridge_config_unreadable"}
+        if type(enabled) is not bool:
+            return None, {"health": "unverifiable", "reason_code": "bridge_config_invalid"}
+        if not enabled:
+            return None, {"health": "degraded", "reason_code": "bridge_disabled"}
+        companion = self._private_companion_status()
+        if type(companion) is not dict or companion.get("available") is not True:
+            return None, {"health": "unverifiable", "reason_code": "companion_api_unavailable"}
+        plugin = companion.get("plugin")
+        extension_api = getattr(plugin, "extension_api", None)
+        status_getter = getattr(extension_api, "get_p6_readonly_status", None)
+        if not callable(status_getter):
+            return None, {"health": "unverifiable", "reason_code": "companion_p6_producer_unavailable"}
+        try:
+            p6_raw = status_getter()
+        except Exception:
+            return None, {"health": "unverifiable", "reason_code": "companion_p6_producer_unreadable"}
+        p6 = project_p6_status(p6_raw)
+        if p6["health"] == "ready":
+            return p6_raw, {"health": "ready", "reason_code": "companion_bridge_available"}
+        return p6_raw, {"health": "degraded", "reason_code": "companion_p6_unverifiable"}
 
     async def operations_preset(self):
         if request.method == "GET":
@@ -294,10 +507,10 @@ class PluginPageApi:
             return self._err(f"历史对话导入回滚失败: {exc}", 500)
 
     async def persona_state(self):
-        """Return persona state: relationship phases, emotional events, address evolution, cross-window state."""
+        """Return read-only expression coordination and memory-touch diagnostics."""
         try:
             service = self.plugin.service
-            phases: list[dict[str, Any]] = []
+            touch_trends: list[dict[str, Any]] = []
             phase_state = getattr(service, "_relationship_phase_state", None)
             if isinstance(phase_state, dict):
                 for key, state in phase_state.items():
@@ -313,19 +526,19 @@ class PluginPageApi:
                     member_id = clean_text(identity.get("member_id"), 120)
                     if member_id:
                         identity_parts.append(f"member={member_id}")
-                    phases.append({
+                    raw_momentum = state.get("momentum", 0.0)
+                    momentum = float(raw_momentum) if type(raw_momentum) in {int, float} else 0.0
+                    trend_band = "rising" if momentum >= 0.08 else "cooling" if momentum <= -0.08 else "steady"
+                    touch_trends.append({
                         "session_key": key,
                         "session_label": " / ".join(part for part in identity_parts if part) or key,
-                        "phase": state.get("phase", "acquaintance"),
-                        "momentum": round(state.get("momentum", 0.0), 3),
+                        "trend_band": trend_band,
                         "touch_count": state.get("touch_count", 0),
-                        "last_transition_at": state.get("last_transition_at", ""),
+                        "legacy_context": clean_text(state.get("phase"), 40),
                         "updated_at": state.get("updated_at", ""),
-                        "current_address_phase": state.get("current_address_phase", ""),
-                        "address_log": (state.get("address_log") or [])[-5:],
                     })
-            phases.sort(key=lambda p: p.get("updated_at", ""), reverse=True)
-            pending_emotional_events: list[dict[str, Any]] = []
+            touch_trends.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+            memory_touch_events: list[dict[str, Any]] = []
             event_queue = getattr(service, "_emotional_event_queue", None)
             if isinstance(event_queue, dict):
                 for session_id, queue in event_queue.items():
@@ -334,7 +547,7 @@ class PluginPageApi:
                     for event in queue[-3:]:
                         if not isinstance(event, dict):
                             continue
-                        pending_emotional_events.append({
+                        memory_touch_events.append({
                             "session_id": session_id,
                             "event_type": event.get("event_type"),
                             "energy_delta": event.get("energy_delta"),
@@ -348,24 +561,18 @@ class PluginPageApi:
             cross_window_state: dict[str, Any] = {"total": 0, "scar_count": 0, "warm_count": 0, "vulnerable_count": 0}
             if hasattr(service, "_get_cross_window_emotional_state"):
                 cross_window_state = service._get_cross_window_emotional_state()
-            phases_list = getattr(service, "_PHASES", ["acquaintance", "familiar", "close", "intimate", "deeply_bonded"])
-            thresholds = getattr(service, "_PHASE_THRESHOLDS", [0.0, 0.20, 0.45, 0.65, 0.85])
-            bot_suggestions = getattr(service, "_BOT_ADDRESS_SUGGESTIONS", {})
             return self._ok({
-                "phases": phases[:20],
-                "pending_emotional_events": pending_emotional_events[:15],
+                "expression_coordination": {
+                    "contract": "companion_interaction_expression.v1",
+                    "mode": "request_scoped_read_only",
+                    "expression_authority": "private_companion",
+                    "memory_role": "recall_visibility_and_mention_cap",
+                    "persistent": False,
+                },
+                "memory_touch_trends": touch_trends[:20],
+                "memory_touch_events": memory_touch_events[:15],
                 "time_of_day": time_of_day,
-                "phase_definitions": {
-                    "phases": phases_list,
-                    "thresholds": thresholds,
-                },
                 "cross_window_emotional_state": cross_window_state,
-                "address_phase_labels": {
-                    "formal": "正式",
-                    "casual": "随意",
-                    "intimate": "亲密",
-                    "playful": "玩笑",
-                },
                 "time_of_day_labels": {
                     "late_night": "深夜",
                     "dawn": "凌晨",
@@ -374,8 +581,7 @@ class PluginPageApi:
                     "evening": "傍晚",
                     "night": "夜间",
                 },
-                "bot_address_suggestions": bot_suggestions,
-                "phase_labels": {
+                "legacy_context_labels": {
                     "acquaintance": "初识",
                     "familiar": "熟悉",
                     "close": "亲近",
@@ -384,7 +590,7 @@ class PluginPageApi:
                 },
             })
         except Exception as exc:
-            return self._err(f"拟人维度数据读取失败: {exc}", 500)
+            return self._err(f"互动协同数据读取失败: {exc}", 500)
 
     async def acl_matrix(self):
         """Return all windows, ACL rules and policies in one shot for topology visualization."""
@@ -762,7 +968,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] timeline 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("timeline_unavailable", 500)
 
     async def relations(self):
         try:
@@ -776,7 +982,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] relations 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("relations_unavailable", 500)
 
     async def graph(self):
         try:
@@ -790,7 +996,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] graph 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("graph_unavailable", 500)
 
     async def threads(self):
         try:
@@ -802,7 +1008,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] threads 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("threads_unavailable", 500)
 
     async def thread_status(self):
         payload = await self._json()
@@ -833,7 +1039,7 @@ class PluginPageApi:
             return self._ok({"items": rows})
         except Exception as exc:
             logger.warning("[MemoryCompanion] logs 端点异常: %s", exc, exc_info=True)
-            return self._ok({"items": []})
+            return self._err("logs_unavailable", 500)
 
     async def context_config(self):
         config = self.plugin.service.config
