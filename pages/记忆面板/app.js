@@ -160,6 +160,9 @@ const state = {
   activeView: "objects",
   activeBucketId: "all",
   userMemoryFilter: "all",
+  portraitProfiles: [],
+  selectedPortraitPersonId: "",
+  portraitGovernanceDetail: null,
   microscopeBucketId: "all",
   microscopeSearchToken: 0,
   bucketLoadToken: 0,
@@ -2454,6 +2457,7 @@ async function loadUserMemory() {
   if (!target) return;
   syncUserMemoryFilterControls();
   target.innerHTML = loadingState("正在读取用户档案与记忆...");
+  await loadPortraitGovernance();
   const types = relationTypesForSecondary();
   const { params, incompatible } = scopedMemoryParams("private", { limit: 180 });
   if (incompatible) {
@@ -2471,6 +2475,110 @@ async function loadUserMemory() {
     memories = allMemories.filter((memory) => memory.scope === 'private');
   }
   renderMemoryList("#relationList", memories, "当前用户在这个分类下还没有记忆。");
+}
+
+function portraitModeText(value) {
+  return {
+    disabled: "关闭",
+    use_existing: "仅使用已有",
+    learn_and_use: "学习并使用",
+  }[String(value || "")] || "关闭";
+}
+
+function renderPortraitProfileList(items) {
+  if (!items.length) return '<p class="persona-empty">尚无已同步的统一画像。画像不会从昵称猜测创建，需由 Companion 提供精确身份投影。</p>';
+  return `<div class="row-list compact portrait-profile-list">${items.map((item) => {
+    const selected = String(item.person_id || "") === state.selectedPortraitPersonId;
+    const capabilities = item.capability_summary && typeof item.capability_summary === "object" ? item.capability_summary : {};
+    return `<button type="button" class="memory-row ${selected ? "is-selected" : ""}" data-portrait-person="${escapeHtml(item.person_id || "")}"><div><b>${escapeHtml(shortId(item.person_id || ""))}</b><small>身份 ${escapeHtml(item.identity_assurance || "unknown")} · 同步 ${escapeHtml(formatTime(item.last_synced_at || ""))}</small></div><span class="memory-type-pill">事实 ${number(item.fact_count || 0)} · 证据 ${number(item.evidence_count || 0)} · ${escapeHtml(portraitModeText(capabilities.portrait_mode))}</span></button>`;
+  }).join("")}</div>`;
+}
+
+function renderPortraitGovernanceDetail(detail) {
+  if (!detail?.ok) return '<p class="persona-empty">选择画像后可查看脱敏事实摘要、证据计数和抑制记录。</p>';
+  const facts = Array.isArray(detail.facts) ? detail.facts : [];
+  const suppressions = Array.isArray(detail.suppressions) ? detail.suppressions : [];
+  const person = detail.person && typeof detail.person === "object" ? detail.person : {};
+  return `
+    <section class="context-section film-panel portrait-governance-detail">
+      <div class="section-head compact"><div><h4>画像治理</h4><p>管理员可冻结或忘记一条结论。操作立即在写入和读取前生效，不保存聊天正文。</p></div><span class="memory-type-pill">r${escapeHtml(person.portrait_revision || 0)}</span></div>
+      <div class="config-grid">
+        ${configCard("低敏事实", `${facts.filter((item) => item.sensitivity === "low").length} 条`, "事实与推断分层保留", "teal", "画像")}
+        ${configCard("抑制标记", `${suppressions.length} 条`, "删除和否认优先于旧证据", "violet", "治理")}
+      </div>
+      <div class="row-list compact portrait-fact-list">
+        ${facts.length ? facts.map((fact) => `<article class="memory-row"><div><b>${escapeHtml(fact.claim_summary || fact.dimension || "未命名结论")}</b><small>${escapeHtml(fact.portrait_tier || "")} · ${escapeHtml(fact.epistemic_status || "")} · ${escapeHtml(fact.source_scope || "source_only")} · 置信 ${escapeHtml(Number(fact.confidence || 0).toFixed(2))}</small></div><div class="memory-row-actions"><button type="button" class="danger subtle" data-portrait-govern="suppress" data-portrait-fact-id="${escapeHtml(fact.id || "")}">忘记</button><button type="button" class="subtle" data-portrait-govern="freeze" data-portrait-fact-id="${escapeHtml(fact.id || "")}">冻结 7 天</button></div></article>`).join("") : '<p class="persona-empty">暂无画像事实。</p>'}
+      </div>
+      <details class="context-section"><summary>抑制与待确认记录 ${escapeHtml(suppressions.length)}</summary><div class="row-list compact">${suppressions.map((item) => `<article class="memory-row"><div><b>${escapeHtml(item.dimension || "结论")}</b><small>${escapeHtml(item.status || "active")} · ${escapeHtml(item.reason || "")} · ${escapeHtml(formatTime(item.updated_at || ""))}</small></div></article>`).join("") || '<p class="persona-empty">暂无抑制记录。</p>'}</div></details>
+    </section>`;
+}
+
+async function loadPortraitGovernance() {
+  const target = $("#portraitGovernance");
+  if (!target) return;
+  target.innerHTML = loadingState("正在读取统一画像治理状态...");
+  try {
+    const data = await apiGet("/portrait/profiles?limit=100");
+    const items = Array.isArray(data.items) ? data.items : [];
+    state.portraitProfiles = items;
+    if (state.selectedPortraitPersonId && !items.some((item) => String(item.person_id || "") === state.selectedPortraitPersonId)) {
+      state.selectedPortraitPersonId = "";
+      state.portraitGovernanceDetail = null;
+    }
+    target.innerHTML = `<section class="context-section film-panel"><div class="section-head compact"><div><h4>统一用户画像</h4><p>事实、证据、敏感等级、作用域、纠错和遗忘由 Memory 管理；关系和私聊权限仍由 Companion 管理。</p></div><span class="memory-type-pill">${escapeHtml(items.length)} 人</span></div>${renderPortraitProfileList(items)}${renderPortraitGovernanceDetail(state.portraitGovernanceDetail)}</section>`;
+    target.querySelectorAll("[data-portrait-person]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        state.selectedPortraitPersonId = String(button.dataset.portraitPerson || "");
+        state.portraitGovernanceDetail = null;
+        await loadPortraitGovernanceDetail();
+      });
+    });
+    bindPortraitGovernanceActions(target);
+  } catch (error) {
+    target.innerHTML = `<div class="empty-state error-state"><b>统一画像暂不可用</b><span>${escapeHtml(error?.message || "bridge_unavailable")}</span></div>`;
+  }
+}
+
+async function loadPortraitGovernanceDetail() {
+  if (!state.selectedPortraitPersonId) return;
+  try {
+    const data = await apiGet(`/portrait/profile?person_id=${encodeURIComponent(state.selectedPortraitPersonId)}`);
+    state.portraitGovernanceDetail = data.result || null;
+  } catch (error) {
+    state.portraitGovernanceDetail = { ok: false, code: error?.message || "bridge_unavailable" };
+  }
+  await loadPortraitGovernance();
+}
+
+function bindPortraitGovernanceActions(target) {
+  target.querySelectorAll("[data-portrait-govern]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const action = String(button.dataset.portraitGovern || "");
+      const factId = String(button.dataset.portraitFactId || "");
+      if (!factId || !state.selectedPortraitPersonId) return;
+      if (action === "suppress" && button.dataset.portraitConfirmed !== "1") {
+        button.dataset.portraitConfirmed = "1";
+        button.textContent = "再次确认忘记";
+        return;
+      }
+      button.disabled = true;
+      try {
+        const result = await apiPost("/portrait/govern", {
+          person_id: state.selectedPortraitPersonId,
+          fact_id: factId,
+          action,
+          operation_id: `portrait.page:${Date.now()}:${factId.slice(-12)}`,
+          expires_at: action === "freeze" ? new Date(Date.now() + 7 * 86400000).toISOString() : "",
+        });
+        if (!result?.result?.ok) throw new Error(result?.result?.code || "操作未完成");
+        showToast(action === "freeze" ? "已冻结该画像结论 7 天" : "已抑制该画像结论");
+        await loadPortraitGovernanceDetail();
+      } catch (error) {
+        button.disabled = false;
+        showToast(error?.message || "画像治理失败", "error");
+      }
+    });
+  });
 }
 
 async function loadPersonalMemory() {

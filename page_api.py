@@ -111,6 +111,10 @@ class PluginPageApi:
             ("/conversation-import/rollback", self.conversation_import_rollback, ["POST"], "MemoryCompanion historical chat rollback"),
             ("/profiles", self.profiles, ["GET"], "MemoryCompanion Bot Profiles"),
             ("/user-memory-summary", self.user_memory_summary, ["GET"], "MemoryCompanion User Memory workspace summary"),
+            ("/portrait/profiles", self.portrait_profiles, ["GET"], "MemoryCompanion unified portrait profiles"),
+            ("/portrait/profile", self.portrait_profile, ["GET"], "MemoryCompanion unified portrait governance detail"),
+            ("/portrait/govern", self.portrait_govern, ["POST"], "MemoryCompanion unified portrait governance"),
+            ("/portrait/migration", self.portrait_migration, ["POST"], "MemoryCompanion portrait migration control"),
             ("/capabilities/bot-personal", self.bot_personal_capabilities, ["GET"], "MemoryCompanion Bot Personal capability"),
             ("/companion/personal-memory", self.companion_personal_memory, ["GET"], "MemoryCompanion Page companion personal memory"),
             ("/companion/personal-photo", self.companion_personal_photo, ["GET"], "MemoryCompanion Page companion personal photo"),
@@ -194,6 +198,77 @@ class PluginPageApi:
                     "workspace": {"kind": "memory_user_workspace", "route_hint": "user_memory", "user_id": user_id},
                     "error_code": "summary_unavailable",
                 }
+        return self._ok({"result": result})
+
+    async def portrait_profiles(self):
+        try:
+            limit = max(1, min(500, int(request.args.get("limit", "100"))))
+        except (TypeError, ValueError):
+            limit = 100
+        portraits = getattr(getattr(self.plugin, "service", None), "portraits", None)
+        if portraits is None:
+            return self._ok({"items": [], "state": "bridge_unavailable"})
+        try:
+            items = await portraits.list_governance_profiles(limit=limit)
+        except Exception:
+            logger.exception("统一画像列表读取失败")
+            return self._err("统一画像列表读取失败", 500)
+        return self._ok({"items": items, "state": "ready"})
+
+    async def portrait_profile(self):
+        person_id = clean_text(request.args.get("person_id", ""), 80)
+        if not person_id:
+            return self._err("缺少 person_id", 400)
+        portraits = getattr(getattr(self.plugin, "service", None), "portraits", None)
+        if portraits is None:
+            return self._ok({"result": {"ok": False, "code": "bridge_unavailable", "person": {}, "facts": [], "suppressions": []}})
+        try:
+            result = await portraits.governance_detail(person_id)
+        except Exception:
+            logger.exception("统一画像详情读取失败")
+            return self._err("统一画像详情读取失败", 500)
+        return self._ok({"result": result})
+
+    async def portrait_govern(self):
+        payload = await self._json()
+        portraits = getattr(getattr(self.plugin, "service", None), "portraits", None)
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        try:
+            result = await portraits.govern_fact(
+                person_id=clean_text(payload.get("person_id"), 80),
+                fact_id=clean_text(payload.get("fact_id"), 120),
+                action=clean_text(payload.get("action"), 40),
+                actor="page_administrator",
+                operation_id=clean_text(payload.get("operation_id"), 120),
+                expires_at=clean_text(payload.get("expires_at"), 80),
+            )
+        except Exception:
+            logger.exception("统一画像治理失败")
+            return self._err("统一画像治理失败", 500)
+        return self._ok({"result": result})
+
+    async def portrait_migration(self):
+        payload = await self._json()
+        mode = clean_text(payload.get("mode"), 40) or "dry_run"
+        operation_id = clean_text(payload.get("operation_id"), 120)
+        portraits = getattr(getattr(self.plugin, "service", None), "portraits", None)
+        if portraits is None:
+            return self._err("统一画像服务不可用", 503)
+        if not operation_id:
+            return self._err("缺少 operation_id", 400)
+        try:
+            if mode == "dry_run":
+                result = await portraits.migrate_legacy(operation_id=operation_id, dry_run=True)
+            elif mode == "apply":
+                result = await portraits.migrate_legacy(operation_id=operation_id, dry_run=False)
+            elif mode == "rollback":
+                result = await portraits.rollback_legacy_migration(operation_id=operation_id)
+            else:
+                return self._err("无效的迁移模式", 400)
+        except Exception:
+            logger.exception("统一画像迁移操作失败")
+            return self._err("统一画像迁移操作失败", 500)
         return self._ok({"result": result})
 
     async def bot_personal_capabilities(self):

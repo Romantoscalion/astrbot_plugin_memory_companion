@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
+from core.service import MemoryCompanionService
 
 
 class VisibleTurnSummaryScheduleTests(unittest.IsolatedAsyncioTestCase):
@@ -55,6 +55,24 @@ class VisibleTurnSummaryScheduleTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual("tl_reply_2", event_id)
+        service._schedule_session_summary.assert_not_called()
+
+    async def test_visible_user_turn_waits_for_confirmed_bot_reply(self) -> None:
+        service = MemoryCompanionService.__new__(MemoryCompanionService)
+        service.store = SimpleNamespace(add_timeline_event=AsyncMock(return_value="tl_user_1"))
+        service._schedule_session_summary = Mock()
+
+        event_id = await service.record_visible_turn(
+            role="user",
+            content="用户刚发出的消息",
+            scope="private",
+            session_id="test_platform:private:test_user_001",
+            platform="astrbot",
+            user_id="test_user_001",
+            message_id="test_message_002",
+        )
+
+        self.assertEqual("tl_user_1", event_id)
         service._schedule_session_summary.assert_not_called()
 
 
