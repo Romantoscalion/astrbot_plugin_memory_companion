@@ -214,6 +214,10 @@ class MemoryCompanionService:
         self.importance = ImportanceEvaluator()
         self._summary_locks: dict[str, asyncio.Lock] = {}
         self._summary_lock_ts: dict[str, float] = {}
+        self._summary_workers: dict[str, asyncio.Task[Any]] = {}
+        self._summary_pending: set[str] = set()
+        self._summary_pending_contexts: dict[str, SessionContext] = {}
+        self._summary_pending_reasons: dict[str, str] = {}
         self._summary_lock_last_cleanup: float = time.monotonic()
         self._SUMMARY_LOCK_TTL: float = 600.0  # 10 minutes
         self._decay_lock = asyncio.Lock()
@@ -966,16 +970,32 @@ class MemoryCompanionService:
             event_metadata.setdefault("sender_name", clean_text(user_name, 120))
         if message_id:
             event_metadata.setdefault("message_id", clean_text(message_id, 120))
-        return await self.store.add_timeline_event(
+        normalized_session_id = clean_text(session_id, 200)
+        normalized_scope = clean_text(scope, 40)
+        event_id = await self.store.add_timeline_event(
             event_type=event_type,
-            session_id=clean_text(session_id, 200),
-            scope=clean_text(scope, 40),
+            session_id=normalized_session_id,
+            scope=normalized_scope,
             subject_id=subject_id,
             object_id=object_id,
             content=text,
             metadata=event_metadata,
             occurred_at=occurred_at,
         )
+        if event_id and normalized_session_id:
+            summary_ctx = SessionContext(
+                session_id=normalized_session_id,
+                scope=normalized_scope,
+                platform=clean_text(platform, 40),
+                user_id=clean_text(user_id, 120),
+                user_name=clean_text(user_name, 120),
+                group_id=clean_text(group_id, 120),
+                bot_id=clean_text(event_metadata.get("bot_id"), 120),
+                message_id=clean_text(message_id, 120),
+                message_text=text,
+            )
+            self._schedule_session_summary(summary_ctx, reason="bridge_visible_turn")
+        return event_id
 
     async def record_external_event(self, **kwargs: Any) -> str:
         if not self.config.bool("private_companion_bridge.accept_external_records", True):
@@ -3100,12 +3120,71 @@ class MemoryCompanionService:
         if not self.config.bool("memory_summary.enabled", True):
             return
         snapshot = self._snapshot_context(ctx)
-        self._spawn_background(self._background_summarize_session(snapshot, reason), label=f"summary:{reason}")
+        session_id = snapshot.session_id
+        if not session_id:
+            logger.debug("[MemoryCompanion] 跳过阶段性总结调度: reason=%s cause=empty_session", reason)
+            return
+
+        worker = self._summary_workers.get(session_id)
+        if worker is not None and not worker.done():
+            self._summary_pending.add(session_id)
+            self._summary_pending_contexts[session_id] = snapshot
+            self._summary_pending_reasons[session_id] = reason
+            logger.debug(
+                "[MemoryCompanion] 阶段性总结任务忙，已合并为一次补偿执行: session=%s reason=%s",
+                session_id,
+                reason,
+            )
+            return
+
+        task = self._spawn_background(
+            self._background_summarize_session(snapshot, reason),
+            label=f"summary:{reason}",
+        )
+        if task is None:
+            logger.debug(
+                "[MemoryCompanion] 阶段性总结任务未启动: session=%s reason=%s closing=%s closed=%s",
+                session_id,
+                reason,
+                self._closing,
+                self._closed,
+            )
+            return
+        self._summary_workers[session_id] = task
+        logger.debug("[MemoryCompanion] 阶段性总结任务已启动: session=%s reason=%s", session_id, reason)
 
     async def _background_summarize_session(self, ctx: SessionContext, reason: str) -> None:
-        memory_id = await self.maybe_summarize_session(ctx)
-        if memory_id:
-            logger.info("[MemoryCompanion] 后台阶段性总结完成: session=%s reason=%s memory=%s", ctx.session_id, reason, memory_id)
+        session_id = ctx.session_id
+        current_ctx = ctx
+        current_reason = reason
+        try:
+            while True:
+                memory_id = await self.maybe_summarize_session(current_ctx)
+                if memory_id:
+                    logger.info(
+                        "[MemoryCompanion] 后台阶段性总结完成: session=%s reason=%s memory=%s",
+                        session_id,
+                        current_reason,
+                        memory_id,
+                    )
+                if session_id not in self._summary_pending:
+                    break
+                self._summary_pending.discard(session_id)
+                current_ctx = self._summary_pending_contexts.pop(session_id, current_ctx)
+                current_reason = self._summary_pending_reasons.pop(session_id, "coalesced_trigger")
+                logger.debug(
+                    "[MemoryCompanion] 开始阶段性总结补偿执行: session=%s reason=%s",
+                    session_id,
+                    current_reason,
+                )
+        finally:
+            self._summary_pending.discard(session_id)
+            self._summary_pending_contexts.pop(session_id, None)
+            self._summary_pending_reasons.pop(session_id, None)
+            current_task = asyncio.current_task()
+            if self._summary_workers.get(session_id) is current_task:
+                self._summary_workers.pop(session_id, None)
+            logger.debug("[MemoryCompanion] 阶段性总结任务已结束: session=%s", session_id)
 
     def _cleanup_stale_summary_locks(self) -> None:
         """Remove summary locks that haven't been used in TTL seconds and aren't currently held."""
@@ -3196,7 +3275,11 @@ class MemoryCompanionService:
         self._summary_lock_ts[ctx.session_id] = time.monotonic()
         self._cleanup_stale_summary_locks()
         if lock.locked():
-            return ""
+            logger.debug(
+                "[MemoryCompanion] 阶段性总结等待同会话现有任务: session=%s force=%s",
+                ctx.session_id,
+                force,
+            )
         async with lock:
             window = await self.store.unsummarized_timeline_window(
                 session_id=ctx.session_id,
