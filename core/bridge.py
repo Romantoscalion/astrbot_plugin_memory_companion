@@ -14,6 +14,7 @@ from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
 from .capability_probe import CapabilityCache, PROFILE_NAMES as C4_PROFILE_NAMES, build_capability_snapshot
 from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
+from .namespace_capability import namespace_capability_descriptor
 from .person_projection import consume_person_projection
 
 
@@ -1678,6 +1679,14 @@ class MemoryCompanionBridge:
             result["state"] = "ready"
         result["legacy_state"] = result.get("state", "degraded")
         return result
+
+    def probe_namespace_context_capabilities(self) -> dict[str, Any]:
+        """Advertise the strict contract without overstating unwired APIs."""
+        return namespace_capability_descriptor(
+            available=False,
+            methods=(),
+            error_code="namespace_scoped_api_not_bound",
+        )
 
     def capability_status(self) -> dict[str, Any]:
         """Return the bounded C4 cache state without probing storage."""
