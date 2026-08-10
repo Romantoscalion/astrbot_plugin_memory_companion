@@ -150,6 +150,15 @@ class ScopedStore:
                     revision INTEGER NOT NULL,
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS scoped_namespace_operations (
+                    operation_id TEXT NOT NULL,
+                    migration_epoch TEXT NOT NULL,
+                    namespace_scope TEXT NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(operation_id,migration_epoch)
+                );
                 """
             )
             state = conn.execute(
@@ -422,6 +431,66 @@ class ScopedStore:
                 (event, context.migration_epoch, request_hash, "tombstoned", now),
             )
         return "tombstoned"
+
+    def tombstone_namespace(
+        self,
+        context: NamespaceContext,
+        *,
+        operation_id: str,
+        reason_code: str,
+        record_prefix: str = "req041-",
+    ) -> dict[str, Any]:
+        purpose = "rule_write" if context.kind == "persona_global" else "memory_write"
+        decision = AssurancePolicy.authorize(context, purpose)
+        if not decision.allowed:
+            raise ScopedStoreError(decision.code)
+        if self._active_epoch and (
+            context.migration_epoch != self._active_epoch
+            or context.policy_version != self._active_policy_version
+        ):
+            raise ScopedStoreError("scoped_migration_epoch_stale")
+        operation = _token(operation_id)
+        reason = _token(reason_code, 80)
+        prefix = _token(record_prefix, 40)
+        if not operation or not reason or not prefix:
+            raise ScopedStoreError("scoped_namespace_tombstone_invalid")
+        scope = self._scope(context)
+        request_hash = hashlib.sha256(
+            _canonical({"scope": scope, "reason": reason, "prefix": prefix}).encode("utf-8")
+        ).hexdigest()
+        now = float(self._clock())
+        with self._transaction() as conn:
+            prior = conn.execute(
+                "SELECT request_hash,result_json FROM scoped_namespace_operations WHERE operation_id=? AND migration_epoch=?",
+                (operation, context.migration_epoch),
+            ).fetchone()
+            if prior is not None:
+                if prior["request_hash"] != request_hash:
+                    raise ScopedRecordConflict("scoped_namespace_operation_conflict")
+                return json.loads(prior["result_json"])
+            rows = conn.execute(
+                """SELECT record_kind,record_id,revision FROM scoped_records
+                   WHERE namespace_scope=? AND deleted=0 AND record_id LIKE ? ORDER BY record_kind,record_id""",
+                (scope, f"{prefix}%"),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """UPDATE scoped_records SET revision=?,deleted=1,updated_at=?
+                       WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
+                    (int(row["revision"]) + 1, now, scope, row["record_kind"], row["record_id"]),
+                )
+            result = {
+                "code": "namespace_tombstoned" if rows else "namespace_already_empty",
+                "count": len(rows),
+                "reason_code": reason,
+            }
+            conn.execute(
+                """INSERT INTO scoped_namespace_operations(
+                       operation_id,migration_epoch,namespace_scope,request_hash,result_json,created_at
+                   ) VALUES(?,?,?,?,?,?)""",
+                (operation, context.migration_epoch, scope, request_hash, _canonical(result), now),
+            )
+        return result
 
 
 __all__ = [

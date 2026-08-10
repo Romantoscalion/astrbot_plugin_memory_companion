@@ -1693,6 +1693,7 @@ class MemoryCompanionBridge:
             methods=(
                 "list_scoped_records",
                 "read_scoped_record",
+                "tombstone_scoped_namespace",
                 "tombstone_scoped_record",
                 "upsert_scoped_record",
             ) if ready else (),
@@ -1810,6 +1811,25 @@ class MemoryCompanionBridge:
         except ScopedStoreError as exc:
             return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
         return {"ok": True, "state": "ready", "code": result}
+
+    def tombstone_scoped_namespace(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.tombstone_namespace(
+                context, operation_id=operation_id, reason_code=reason_code,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", **result}
 
     def capability_status(self) -> dict[str, Any]:
         """Return the bounded C4 cache state without probing storage."""

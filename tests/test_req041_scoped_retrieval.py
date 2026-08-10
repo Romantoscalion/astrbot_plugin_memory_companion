@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from core.namespace import NamespaceContext
+from core.scoped_domain_contract import build_scoped_domain_payload
 from core.scoped_store import ScopedRecordConflict, ScopedRevisionGap, ScopedStore, ScopedStoreError
 
 
@@ -124,6 +125,48 @@ class ScopedStoreTests(unittest.TestCase):
             "created",
             self.store.upsert(shared, record_kind="memory", record_id="group-topic", revision=1, payload={"value": "topic"}, event_id="event-2"),
         )
+
+    def test_namespace_tombstone_is_atomic_idempotent_and_prevents_resurrection(self) -> None:
+        self.store.upsert(
+            self.private, record_kind="memory", record_id="req041-private-memory-a", revision=1,
+            payload=build_scoped_domain_payload(
+                domain="memory", source_kind="private", content={"value": "a"}, source_revision=1,
+            ), event_id="write-a",
+        )
+        self.store.upsert(
+            self.private, record_kind="rule", record_id="req041-private-rule-a", revision=1,
+            payload=build_scoped_domain_payload(
+                domain="learning", source_kind="private", content={"value": "rule"},
+                source_revision=1, approval_state="approved", approved_by="user",
+            ), event_id="write-rule",
+        )
+        self.store.upsert(
+            self.private, record_kind="memory", record_id="legacy-unmanaged", revision=1,
+            payload={"value": "keep"}, event_id="write-legacy",
+        )
+        result = self.store.tombstone_namespace(
+            self.private, operation_id="archive-1", reason_code="person_archive",
+        )
+        self.assertEqual(2, result["count"])
+        self.assertEqual(result, self.store.tombstone_namespace(
+            self.private, operation_id="archive-1", reason_code="person_archive",
+        ))
+        self.assertIsNone(self.store.read(self.private, record_kind="memory", record_id="req041-private-memory-a"))
+        self.assertEqual("keep", self.store.read(
+            self.private, record_kind="memory", record_id="legacy-unmanaged"
+        )["payload"]["value"])
+        with self.assertRaisesRegex(ScopedRecordConflict, "scoped_record_tombstoned"):
+            self.store.upsert(
+                self.private, record_kind="memory", record_id="req041-private-memory-a", revision=3,
+                payload=build_scoped_domain_payload(
+                    domain="memory", source_kind="private", content={"value": "resurrect"},
+                    source_revision=3,
+                ), event_id="resurrect-a",
+            )
+        with self.assertRaisesRegex(ScopedRecordConflict, "scoped_namespace_operation_conflict"):
+            self.store.tombstone_namespace(
+                self.private, operation_id="archive-1", reason_code="different_reason",
+            )
 
 
 if __name__ == "__main__":

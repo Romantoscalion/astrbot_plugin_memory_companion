@@ -8,6 +8,7 @@ import unittest
 from core.bridge import MemoryCompanionBridge
 from core.namespace import NamespaceContext
 from core.namespace_capability import validate_namespace_capability
+from core.scoped_domain_contract import build_scoped_domain_payload
 from core.scoped_store import ScopedStore
 
 
@@ -201,6 +202,25 @@ class ScopedBridgeTests(unittest.TestCase):
                 self.capability, context, record_kind="profile_fact", record_id="nickname"
             )["code"],
         )
+
+    def test_bridge_exposes_atomic_namespace_tombstone(self) -> None:
+        self._bind()
+        context = _context()
+        written = self.bridge.upsert_scoped_record(
+            self.capability, context, record_kind="memory", record_id="req041-private-memory-a",
+            revision=1, payload=build_scoped_domain_payload(
+                domain="memory", source_kind="private", content={"value": "a"}, source_revision=1,
+            ), event_id="write-a",
+        )
+        self.assertTrue(written["ok"])
+        result = self.bridge.tombstone_scoped_namespace(
+            self.capability, context, operation_id="archive-1", reason_code="person_archive",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["count"])
+        self.assertEqual("not_found", self.bridge.read_scoped_record(
+            self.capability, context, record_kind="memory", record_id="req041-private-memory-a"
+        )["code"])
 
 
 if __name__ == "__main__":
