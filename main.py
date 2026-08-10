@@ -118,7 +118,17 @@ class MemoryCompanionPlugin(Star):
         return json_dumps(result)
 
     @filter.llm_tool(name="memory_companion_navigate")
-    async def memory_companion_navigate_tool(self, event: AstrMessageEvent, **kwargs: Any) -> str:
+    async def memory_companion_navigate_tool(
+        self,
+        event: AstrMessageEvent,
+        action: str = "",
+        query: str = "",
+        cue: str = "",
+        tag: str = "",
+        memory_ids: list[str] | None = None,
+        node_type: str = "",
+        limit: int = 0,
+    ) -> str:
         """在普通召回证据不足时，按当前证据继续导航一小步。
 
         只用于明确回忆、时间、个性化或多跳记忆问题。先使用已注入证据，每次只选择一个动作；
@@ -133,25 +143,25 @@ class MemoryCompanionPlugin(Star):
             query(string): 当前要补齐的自然语言证据问题，可选。
             cue(string): 从问题或上一步证据提炼的线索，可选。
             tag(string): 关联维度或方面，可选。
-            memory_ids(array): 上一步返回的记忆 ID，可选。
+            memory_ids(array[string]): 上一步返回的记忆 ID，可选。
             node_type(string): 可选图节点类型，如 cue/person/topic。
             limit(number): 本步最多返回几条，不会超过配置上限。
         """
         if not self.service.config.bool("memory_tools.enable_reconstruction_tool", True):
             return json_dumps({"ok": False, "error": "reconstruction tool disabled"})
         try:
-            requested_limit = int(kwargs.get("limit") or 0)
+            requested_limit = int(limit or 0)
         except (TypeError, ValueError):
             requested_limit = 0
         try:
             result = await self.service.tool_navigate(
                 event,
-                str(kwargs.get("action") or ""),
-                query=str(kwargs.get("query") or ""),
-                cue=str(kwargs.get("cue") or ""),
-                tag=str(kwargs.get("tag") or ""),
-                memory_ids=kwargs.get("memory_ids"),
-                node_type=str(kwargs.get("node_type") or ""),
+                str(action or ""),
+                query=str(query or ""),
+                cue=str(cue or ""),
+                tag=str(tag or ""),
+                memory_ids=memory_ids,
+                node_type=str(node_type or ""),
                 limit=requested_limit,
             )
         except Exception as exc:

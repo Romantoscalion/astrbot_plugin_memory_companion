@@ -422,6 +422,12 @@ class ActiveReconstructionTests(unittest.IsolatedAsyncioTestCase):
         main = (ROOT / "main.py").read_text(encoding="utf-8")
         schema = (ROOT / "_conf_schema.json").read_text(encoding="utf-8")
         self.assertIn('@filter.llm_tool(name="memory_companion_navigate")', main)
+        self.assertIn("memory_ids: list[str] | None = None", main)
+        self.assertIn("memory_ids(array[string])", main)
+        self.assertNotIn(
+            "memory_companion_navigate_tool(self, event: AstrMessageEvent, **kwargs",
+            main,
+        )
         self.assertIn("memory_tools.enable_reconstruction_tool", main)
         self.assertIn('"memory_reconstruction"', schema)
 
