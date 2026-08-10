@@ -16,6 +16,7 @@ import time
 from typing import Any, Iterator
 
 from .namespace import AssurancePolicy, NamespaceContext
+from .scoped_domain_contract import SCHEMA_VERSION, ScopedDomainContractError, validate_scoped_domain_payload
 
 
 MAX_RECORD_BYTES = 262144
@@ -247,6 +248,7 @@ class ScopedStore:
         # redacted, revision-aware cache key.
         return _canonical({
             "kind": context.kind,
+            "persona_id": context.persona_id,
             "identity_id": context.identity_id,
             "group_id": context.group_id,
         })
@@ -266,6 +268,13 @@ class ScopedStore:
         event = _token(event_id)
         if not identifier or not event or revision < 1:
             raise ScopedStoreError("scoped_envelope_invalid")
+        if str(record_id or "").startswith("req041-") or (
+            isinstance(payload, dict) and payload.get("schema_version") == SCHEMA_VERSION
+        ):
+            try:
+                validate_scoped_domain_payload(context, record_kind, payload)
+            except ScopedDomainContractError as exc:
+                raise ScopedStoreError(str(exc)) from exc
         encoded, digest = _payload(payload)
         scope = self._scope(context)
         request_hash = hashlib.sha256(

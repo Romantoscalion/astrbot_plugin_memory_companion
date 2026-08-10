@@ -112,6 +112,14 @@ class ScopedBridgeTests(unittest.TestCase):
                 self.capability, missing, record_kind="memory", record_id="x"
             )["code"],
         )
+        missing_persona = _context()
+        missing_persona.pop("persona_id")
+        self.assertEqual(
+            "namespace_context_fields_invalid",
+            self.bridge.read_scoped_record(
+                self.capability, missing_persona, record_kind="memory", record_id="x"
+            )["code"],
+        )
         pending = _context(kind="pending", assurance="unverified")
         self.assertEqual(
             "namespace_pending_denied",

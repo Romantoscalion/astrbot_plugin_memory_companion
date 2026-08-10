@@ -54,6 +54,23 @@ class ScopedStoreTests(unittest.TestCase):
         self.store.upsert(self.group_a, record_kind="profile_fact", record_id="nickname", revision=1, payload={"value": "A"}, event_id="a-1")
         self.assertIsNone(self.store.read(other, record_kind="profile_fact", record_id="nickname"))
 
+    def test_same_identity_and_group_are_isolated_between_personas(self) -> None:
+        other_persona = NamespaceContext(
+            kind="private", identity_id="person-a", group_id="", assurance="verified",
+            profile_status="active", policy_version="req041-v1", migration_epoch="shadow-20260810",
+            persona_id="persona-b",
+        )
+        self.store.upsert(
+            self.private, record_kind="memory", record_id="same-id", revision=1,
+            payload={"marker": "default"}, event_id="persona-default",
+        )
+        self.store.upsert(
+            other_persona, record_kind="memory", record_id="same-id", revision=1,
+            payload={"marker": "persona-b"}, event_id="persona-b",
+        )
+        self.assertEqual("default", self.store.read(self.private, record_kind="memory", record_id="same-id")["payload"]["marker"])
+        self.assertEqual("persona-b", self.store.read(other_persona, record_kind="memory", record_id="same-id")["payload"]["marker"])
+
     def test_policy_and_epoch_changes_do_not_create_a_second_owner_namespace(self) -> None:
         self.store.upsert(
             self.private, record_kind="memory", record_id="m1", revision=1,
