@@ -15,7 +15,9 @@ from .capability_probe import CapabilityCache, PROFILE_NAMES as C4_PROFILE_NAMES
 from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
 from .namespace_capability import namespace_capability_descriptor
+from .namespace import build_namespace_context, validate_namespace_context
 from .person_projection import consume_person_projection
+from .scoped_store import ScopedStore, ScopedStoreError
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -449,6 +451,8 @@ class MemoryCompanionBridge:
 
     def __init__(self, plugin: Any):
         self._plugin = plugin
+        candidate_scoped_store = getattr(plugin, "scoped_store", None)
+        self._scoped_store = candidate_scoped_store if isinstance(candidate_scoped_store, ScopedStore) else None
         self._capability_cache = CapabilityCache()
         self._emotion_producer_token = object()
         self._emotion_page_admin_token = object()
@@ -1681,12 +1685,131 @@ class MemoryCompanionBridge:
         return result
 
     def probe_namespace_context_capabilities(self) -> dict[str, Any]:
-        """Advertise the strict contract without overstating unwired APIs."""
+        """Advertise ready only after the store and active epoch are bound."""
+        status = self._scoped_store.epoch_status() if self._scoped_store is not None else {"bound": False}
+        ready = status.get("bound") is True
         return namespace_capability_descriptor(
-            available=False,
-            methods=(),
-            error_code="namespace_scoped_api_not_bound",
+            available=ready,
+            methods=(
+                "list_scoped_records",
+                "read_scoped_record",
+                "tombstone_scoped_record",
+                "upsert_scoped_record",
+            ) if ready else (),
+            error_code="" if ready else "namespace_scoped_api_not_bound",
         )
+
+    def bind_namespace_migration_epoch(
+        self,
+        capability: Any,
+        *,
+        operation_id: str,
+        expected_previous_epoch: str,
+        migration_epoch: str,
+        policy_version: str,
+    ) -> dict[str, Any]:
+        if not self._is_valid_private_companion_capability(capability):
+            return {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
+        if self._scoped_store is None:
+            return {"ok": False, "state": "degraded", "code": "namespace_scoped_store_unavailable"}
+        try:
+            result = self._scoped_store.bind_epoch(
+                operation_id=operation_id,
+                expected_previous_epoch=expected_previous_epoch,
+                migration_epoch=migration_epoch,
+                policy_version=policy_version,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {
+            "ok": True,
+            "state": "ready",
+            "code": result,
+            "epoch": self._scoped_store.epoch_status(),
+        }
+
+    def _authorized_scoped_context(
+        self, capability: Any, namespace: Any
+    ) -> tuple[Any | None, dict[str, Any] | None]:
+        if not self._is_valid_private_companion_capability(capability):
+            return None, {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
+        if self._scoped_store is None:
+            return None, {"ok": False, "state": "degraded", "code": "namespace_scoped_store_unavailable"}
+        errors = validate_namespace_context(namespace)
+        if errors:
+            return None, {"ok": False, "state": "rejected", "code": errors[0]}
+        context = build_namespace_context(namespace)
+        if context is None:
+            return None, {"ok": False, "state": "rejected", "code": "namespace_context_invalid"}
+        return context, None
+
+    def upsert_scoped_record(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        payload: dict[str, Any],
+        event_id: str,
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.upsert(
+                context, record_kind=record_kind, record_id=record_id, revision=revision,
+                payload=payload, event_id=event_id,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": result}
+
+    def read_scoped_record(
+        self, capability: Any, namespace: Any, *, record_kind: str, record_id: str
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            record = self._scoped_store.read(context, record_kind=record_kind, record_id=record_id)
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": "found" if record is not None else "not_found", "record": record}
+
+    def list_scoped_records(
+        self, capability: Any, namespace: Any, *, record_kind: str, limit: int = 100
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            records = self._scoped_store.list_records(context, record_kind=record_kind, limit=limit)
+        except (ScopedStoreError, TypeError, ValueError, OverflowError) as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": "listed", "records": records}
+
+    def tombstone_scoped_record(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        event_id: str,
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.tombstone(
+                context, record_kind=record_kind, record_id=record_id, revision=revision, event_id=event_id,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": result}
 
     def capability_status(self) -> dict[str, Any]:
         """Return the bounded C4 cache state without probing storage."""

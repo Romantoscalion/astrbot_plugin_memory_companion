@@ -72,6 +72,9 @@ class ScopedStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock if callable(clock) else time.time
         self._lock = threading.RLock()
+        self._active_epoch = ""
+        self._active_policy_version = ""
+        self._epoch_revision = 0
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -132,17 +135,108 @@ class ScopedStore:
                     created_at REAL NOT NULL,
                     PRIMARY KEY(event_id, migration_epoch)
                 );
+                CREATE TABLE IF NOT EXISTS scoped_epoch_state (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    migration_epoch TEXT NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS scoped_epoch_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    result_code TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    created_at REAL NOT NULL
+                );
                 """
             )
+            state = conn.execute(
+                "SELECT migration_epoch,policy_version,revision FROM scoped_epoch_state WHERE singleton=1"
+            ).fetchone()
+            if state is not None:
+                self._active_epoch = state["migration_epoch"]
+                self._active_policy_version = state["policy_version"]
+                self._epoch_revision = int(state["revision"])
 
-    @staticmethod
-    def _authorize(context: NamespaceContext | None, record_kind: str, *, write: bool) -> None:
+    def _authorize(self, context: NamespaceContext | None, record_kind: str, *, write: bool) -> None:
         if record_kind not in RECORD_KINDS:
             raise ScopedStoreError("scoped_record_kind_invalid")
         purpose = _PURPOSE_BY_KIND[record_kind][1 if write else 0]
         decision = AssurancePolicy.authorize(context, purpose)
         if not decision.allowed:
             raise ScopedStoreError(decision.code)
+        if self._active_epoch:
+            assert context is not None
+            if context.migration_epoch != self._active_epoch:
+                raise ScopedStoreError("scoped_migration_epoch_stale")
+            if context.policy_version != self._active_policy_version:
+                raise ScopedStoreError("scoped_policy_version_stale")
+
+    def epoch_status(self) -> dict[str, Any]:
+        return {
+            "bound": bool(self._active_epoch),
+            "migration_epoch": self._active_epoch,
+            "policy_version": self._active_policy_version,
+            "revision": self._epoch_revision,
+        }
+
+    def bind_epoch(
+        self,
+        *,
+        operation_id: str,
+        expected_previous_epoch: str,
+        migration_epoch: str,
+        policy_version: str,
+    ) -> str:
+        operation = _token(operation_id)
+        expected = _token(expected_previous_epoch) if expected_previous_epoch else ""
+        epoch = _token(migration_epoch)
+        policy = _token(policy_version, 64)
+        if not operation or not epoch or not policy or epoch == expected:
+            raise ScopedStoreError("scoped_epoch_binding_invalid")
+        request_hash = hashlib.sha256(
+            _canonical({"expected": expected, "epoch": epoch, "policy": policy}).encode("utf-8")
+        ).hexdigest()
+        now = float(self._clock())
+        with self._transaction() as conn:
+            prior = conn.execute(
+                "SELECT request_hash,result_code FROM scoped_epoch_operations WHERE operation_id=?",
+                (operation,),
+            ).fetchone()
+            if prior is not None:
+                if prior["request_hash"] != request_hash:
+                    raise ScopedRecordConflict("scoped_epoch_operation_conflict")
+                return "duplicate"
+            state = conn.execute(
+                "SELECT migration_epoch,policy_version,revision FROM scoped_epoch_state WHERE singleton=1"
+            ).fetchone()
+            current = state["migration_epoch"] if state is not None else ""
+            current_policy = state["policy_version"] if state is not None else ""
+            current_revision = int(state["revision"]) if state is not None else 0
+            if current == epoch and current_policy == policy:
+                result = "current"
+                revision = current_revision
+            else:
+                if current != expected:
+                    raise ScopedRecordConflict("scoped_epoch_compare_and_swap_failed")
+                revision = current_revision + 1
+                conn.execute(
+                    """INSERT INTO scoped_epoch_state(singleton,migration_epoch,policy_version,revision,updated_at)
+                       VALUES(1,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET
+                       migration_epoch=excluded.migration_epoch,policy_version=excluded.policy_version,
+                       revision=excluded.revision,updated_at=excluded.updated_at""",
+                    (epoch, policy, revision, now),
+                )
+                result = "bound" if current_revision == 0 else "rotated"
+            conn.execute(
+                "INSERT INTO scoped_epoch_operations(operation_id,request_hash,result_code,revision,created_at) VALUES(?,?,?,?,?)",
+                (operation, request_hash, result, revision, now),
+            )
+        self._active_epoch = epoch
+        self._active_policy_version = policy
+        self._epoch_revision = revision
+        return result
 
     @staticmethod
     def _scope(context: NamespaceContext) -> str:
