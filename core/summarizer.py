@@ -275,7 +275,8 @@ class MemorySummarizer:
             "2. summary 要优先记录未来陪伴中真正有用的信息：关系变化、用户偏好、创作内容、约定、Bot 已经做过的事、群聊里谁说过什么。\n"
             "3. 对普通闲聊只提炼可复用的脉络和氛围，不要把每一句都写进长期记忆。\n"
             "4. canonical_summary 是事实中性摘要，用于检索；可以比 summary 更克制，但必须覆盖同一批核心事实。\n"
-            "5. key_facts 是可单独引用的关键事实列表，每条必须有具体昵称、对象或稳定 ID。\n"
+            "5. key_facts 是可单独引用的关键事实列表。每项必须包含 fact 和 refs：fact 写明具体昵称、对象或稳定 ID，"
+            "refs 只填写直接支持该事实的真实 event_id；没有直接证据的内容不要输出。\n"
             "6. 必须使用消息前缀里的具体昵称或稳定 ID，禁止用“用户、某用户、某人、有人、群成员、对方”替代。\n"
             "7. 每条消息的 time 字段都是 Asia/Shanghai 本地绝对时间；总结时必须按各条消息自己的 time 判断上午/中午/晚上，不能只按总结触发时间判断。\n"
             "8. 长期记忆正文、canonical_summary 和 key_facts 禁止使用“今天、昨天、明天、今晚、昨晚、刚才、现在”等相对时间词；必须写成“YYYY-MM-DD 中午/晚上”这类绝对日期表达。\n"
@@ -298,7 +299,7 @@ class MemorySummarizer:
             '  "summary": "第一人称、自然完整、可直接展示的长期记忆正文",\n'
             '  "canonical_summary": "事实中性、便于检索的一句话或短段落",\n'
             '  "topics": ["主题1", "主题2"],\n'
-            '  "key_facts": ["具体昵称/ID 提到的关键事实1", "事实2"],'
+            '  "key_facts": [{"fact": "具体昵称/ID 提到的关键事实", "refs": ["直接支持该事实的 event_id"]}],'
             '\n  "associations": [{"cue": "自然联想线索", "tag": "关联维度", "content": "有原文依据的简洁陈述", "layer": "episodic|semantic|abstraction"}],'
             '\n  "routine_check_notes": ["如果本窗口包含例行检查后的具体内容，写检查项、结果、异常或待办；没有则留空数组"],'
             f"{bot_self_fact_field}"
@@ -350,18 +351,10 @@ class MemorySummarizer:
             self.max_summary_chars,
         )
         summary = self._normalize_relative_time_mentions(summary, rows)
-        key_facts = self._clean_list(
+        key_facts, key_facts_with_refs = self._normalize_key_facts(
             payload.get("key_facts") or payload.get("facts"),
-            8,
-            160,
+            rows,
         )
-        key_facts = [
-            self._normalize_relative_time_mentions(
-                self._sanitize_generated_memory_text(item, 160),
-                rows,
-            )
-            for item in key_facts
-        ]
         topics = self._clean_list(payload.get("topics"), 6, 80)
         associations = self._normalize_associations(payload.get("associations"), rows)
         participants = self._clean_list(payload.get("participants"), 10, 80)
@@ -408,6 +401,7 @@ class MemorySummarizer:
                 "canonical_summary": canonical,
                 "topics": topics,
                 "key_facts": key_facts,
+                "key_facts_with_refs": key_facts_with_refs,
                 "associations": associations,
                 "routine_check_notes": routine_check_notes,
                 "bot_self_facts": bot_self_facts,
@@ -417,6 +411,91 @@ class MemorySummarizer:
             }
         )
         return payload
+
+    def _normalize_key_facts(
+        self,
+        value: Any,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Keep legacy text facts, but only mark evidence-backed objects as traceable."""
+        if isinstance(value, (str, dict)):
+            value = [value]
+        if not isinstance(value, list):
+            return [], []
+
+        row_by_id = {
+            clean_text(row.get("id"), 160): row
+            for row in rows
+            if clean_text(row.get("id"), 160)
+        }
+        facts: list[str] = []
+        traced: list[dict[str, Any]] = []
+        seen_facts: set[str] = set()
+        for item in value:
+            if isinstance(item, str):
+                raw_fact = item
+                raw_refs: Any = []
+            elif isinstance(item, dict):
+                raw_fact = item.get("fact") or item.get("text") or item.get("content")
+                raw_refs = item.get("refs") or item.get("event_ids") or item.get("source_event_ids") or []
+            else:
+                continue
+            fact = self._normalize_relative_time_mentions(
+                self._sanitize_generated_memory_text(clean_text(raw_fact, 160), 160),
+                rows,
+            )
+            if len(fact) < 2 or self._looks_like_prompt_injection(fact):
+                continue
+            if not isinstance(item, dict):
+                fact_key = fact.casefold()
+                if fact_key not in seen_facts:
+                    seen_facts.add(fact_key)
+                    facts.append(fact)
+                if len(facts) >= 8:
+                    break
+                continue
+            if isinstance(raw_refs, str):
+                raw_refs = [raw_refs]
+            if not isinstance(raw_refs, list):
+                continue
+            refs = list(
+                dict.fromkeys(
+                    clean_text(ref, 160)
+                    for ref in raw_refs
+                    if clean_text(ref, 160) in row_by_id
+                )
+            )[:6]
+            evidence_rows = [row_by_id[ref] for ref in refs]
+            if not refs or not self.fact_supported_by_rows(fact, evidence_rows):
+                continue
+            fact_key = fact.casefold()
+            if fact_key not in seen_facts:
+                seen_facts.add(fact_key)
+                facts.append(fact)
+            traced.append({"fact": fact, "refs": refs})
+            if len(facts) >= 8:
+                break
+        return facts[:8], traced[:8]
+
+    @staticmethod
+    def fact_supported_by_rows(fact: Any, rows: list[dict[str, Any]]) -> bool:
+        source = re.sub(
+            r"\s+",
+            "",
+            " ".join(clean_text(row.get("content"), 1000) for row in rows),
+        ).casefold()
+        if not source:
+            return False
+        compact_fact = re.sub(r"\s+", "", clean_text(fact, 300)).casefold()
+        if len(compact_fact) >= 4 and compact_fact in source:
+            return True
+        generic_terms = {
+            "事情", "内容", "消息", "聊天", "对话", "表示", "提到", "认为", "觉得",
+            "用户", "对方", "某人", "某个", "相关", "已经", "还是", "然后", "这个", "那个",
+        }
+        terms = [term for term in message_terms(clean_text(fact, 300), limit=80) if term not in generic_terms]
+        matched = {term for term in terms if term in source}
+        return len(matched) >= 2
 
     def _normalize_associations(
         self,

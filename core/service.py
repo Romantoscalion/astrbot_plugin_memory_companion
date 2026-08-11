@@ -24,6 +24,7 @@ from .astrbot_compat import (
     remove_temp_text,
     sanitize_request_history,
 )
+from .audit import MemoryAuditManager
 from .bridge import (
     consume_authenticated_companion_projection,
     serialize_memory,
@@ -252,6 +253,7 @@ class MemoryCompanionService:
         self._RECONSTRUCTION_STATE_MAX: int = 512
         self.migrator = LivingMemoryMigrator(self.store, self.plugin_root, self.data_dir)
         self.portable_archive = PortableMemoryArchive(self.store, self.data_dir)
+        self.memory_audit = MemoryAuditManager(self, self.data_dir / "memory_audits")
         self.chat_importer = HistoricalChatImporter(self)
         self.qq_history_reader = QQHistoryReader(self)
         self.sleep_state_path = self.data_dir / "memory_companion_sleep_state.json"
@@ -3625,6 +3627,7 @@ class MemoryCompanionService:
                     "persona_summary": clean_text((payload or {}).get("persona_summary") or (payload or {}).get("summary"), 2000),
                     "topics": (payload or {}).get("topics", []),
                     "key_facts": (payload or {}).get("key_facts", []),
+                    "key_facts_with_refs": (payload or {}).get("key_facts_with_refs", []),
                     "associations": (payload or {}).get("associations", []),
                     "routine_check_notes": (payload or {}).get("routine_check_notes", []),
                     "bot_self_fact_count": len((payload or {}).get("bot_self_facts", []) or []),
@@ -5137,6 +5140,19 @@ class MemoryCompanionService:
         result = await self.portable_archive.import_data(path)
         self._retrieval_result_cache.clear()
         return result
+
+    async def preview_memory_audit(self, event: Any | None = None, limit: int = 0) -> dict[str, Any]:
+        ctx = await self.identity.resolve_event_context(event) if event is not None else SessionContext()
+        return await self.memory_audit.preview(ctx, limit)
+
+    async def memory_audit_status(self, batch_id: str) -> dict[str, Any]:
+        return await self.memory_audit.status(batch_id)
+
+    async def apply_memory_audit(self, batch_id: str, confirm: str) -> dict[str, Any]:
+        return await self.memory_audit.apply(batch_id, confirm)
+
+    async def rollback_memory_audit(self, batch_id: str, confirm: str) -> dict[str, Any]:
+        return await self.memory_audit.rollback(batch_id, confirm)
 
     async def clear_all_memory_data(self) -> dict[str, Any]:
         await self._cancel_background_tasks_for_clear()

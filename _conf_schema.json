@@ -1018,6 +1018,43 @@
       }
     }
   },
+  "maintenance_audit": {
+    "description": "可回滚记忆审计",
+    "hint": "根据摘要保存的原始事件引用生成修正建议。只生成预览，不会随睡眠维护自动执行；应用和回滚都需要明确确认。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用记忆审计",
+        "hint": "默认关闭。开启后管理员可手动生成审计预览，模型仍不能直接修改数据库。",
+        "type": "bool",
+        "default": false
+      },
+      "max_candidates": {
+        "description": "单次候选上限",
+        "hint": "每次预览最多检查多少条带原始事件引用的会话摘要。",
+        "type": "int",
+        "default": 20
+      },
+      "max_items_per_preview": {
+        "description": "单次建议上限",
+        "hint": "一次预览最多保留多少条通过本地证据校验的修改建议。",
+        "type": "int",
+        "default": 8
+      },
+      "provider_timeout_seconds": {
+        "description": "审计模型超时秒数",
+        "hint": "审计复用记忆总结模型，并按该时间限制单次请求。",
+        "type": "int",
+        "default": 60
+      },
+      "preview_expire_hours": {
+        "description": "预览有效小时数",
+        "hint": "超过有效期必须重新生成，避免应用已经过时的建议。",
+        "type": "int",
+        "default": 24
+      }
+    }
+  },
   "maintenance_decay": {
     "description": "自然衰减高级参数",
     "hint": "衰减年龄、未访问天数、重要度阈值、候选上限和摘要字数等高级调优参数。日常使用可保持默认。",

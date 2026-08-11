@@ -4543,6 +4543,32 @@ class MemoryStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    async def get_timeline_by_ids(self, event_ids: list[str]) -> dict[str, dict[str, Any]]:
+        return await self._run_recoverable_database_operation(self._get_timeline_by_ids_sync, event_ids)
+
+    def _get_timeline_by_ids_sync(self, event_ids: list[str]) -> dict[str, dict[str, Any]]:
+        ids = list(
+            dict.fromkeys(
+                clean_text(event_id, 160)
+                for event_id in event_ids
+                if clean_text(event_id, 160)
+            )
+        )
+        if not ids:
+            return {}
+        rows: list[Any] = []
+        with self._lock:
+            for index in range(0, len(ids), 500):
+                chunk = ids[index:index + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(
+                    self._conn.execute(
+                        f"SELECT * FROM timeline WHERE id IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                )
+        return {clean_text(row["id"], 160): dict(row) for row in rows}
+
     async def unsummarized_timeline_window(
         self,
         *,
@@ -6308,6 +6334,8 @@ class MemoryStore:
         confidence: Any | None = None,
         visibility: str | None = None,
         lifecycle: str | None = None,
+        review_status: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> bool:
         return await self._run_recoverable_database_operation(
             self._update_memory_payload_sync,
@@ -6319,6 +6347,8 @@ class MemoryStore:
             confidence,
             visibility,
             lifecycle,
+            review_status,
+            metadata,
         )
 
     def _update_memory_payload_sync(
@@ -6331,6 +6361,8 @@ class MemoryStore:
         confidence: Any | None,
         visibility: str | None,
         lifecycle: str | None,
+        review_status: str | None,
+        metadata: dict[str, Any] | None,
     ) -> bool:
         memory_id = clean_text(memory_id, 120)
         with self._lock:
@@ -6343,6 +6375,13 @@ class MemoryStore:
                 next_evidence = clean_text(evidence if evidence is not None else row["evidence"], 4000)
                 next_visibility = clean_text(visibility if visibility is not None else row["visibility"], 40) or row["visibility"]
                 next_lifecycle = clean_text(lifecycle if lifecycle is not None else row["lifecycle"], 40) or row["lifecycle"]
+                next_review_status = clean_text(
+                    review_status if review_status is not None else row["review_status"],
+                    40,
+                ) or row["review_status"]
+                next_metadata = metadata if isinstance(metadata, dict) else json_loads(row["metadata"], {})
+                if not isinstance(next_metadata, dict):
+                    next_metadata = {}
                 try:
                     next_importance = max(0.0, min(1.0, float(importance if importance is not None else row["importance"])))
                 except Exception:
@@ -6374,6 +6413,8 @@ class MemoryStore:
                         confidence=?,
                         visibility=?,
                         lifecycle=?,
+                        review_status=?,
+                        metadata=?,
                         content_fingerprint=?,
                         updated_at=?
                     WHERE id=?
@@ -6386,6 +6427,8 @@ class MemoryStore:
                         next_confidence,
                         next_visibility,
                         next_lifecycle,
+                        next_review_status,
+                        json_dumps(next_metadata),
                         fingerprint,
                         utc_now(),
                         memory_id,

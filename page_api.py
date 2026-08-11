@@ -121,6 +121,10 @@ class PluginPageApi:
             ("/companion/personal-photo-data", self.companion_personal_photo_data, ["GET"], "MemoryCompanion Page companion personal photo data"),
             ("/maintenance", self.maintenance, ["POST"], "MemoryCompanion Page maintenance"),
             ("/maintenance/sleep", self.sleep_maintenance, ["GET", "POST"], "MemoryCompanion Page sleep maintenance"),
+            ("/maintenance/audit/preview", self.audit_preview, ["POST"], "MemoryCompanion memory audit preview"),
+            ("/maintenance/audit/status", self.audit_status, ["GET"], "MemoryCompanion memory audit status"),
+            ("/maintenance/audit/apply", self.audit_apply, ["POST"], "MemoryCompanion memory audit apply"),
+            ("/maintenance/audit/rollback", self.audit_rollback, ["POST"], "MemoryCompanion memory audit rollback"),
             ("/maintenance/repair_livingmemory_content", self.repair_livingmemory_content, ["POST"], "MemoryCompanion Page repair LivingMemory content"),
             ("/maintenance/clear_all", self.clear_all, ["POST"], "MemoryCompanion Page clear all memory data"),
             ("/maintenance/clear_scope", self.clear_scope, ["POST"], "MemoryCompanion Page clear scoped memory data"),
@@ -2451,6 +2455,47 @@ class PluginPageApi:
             result = await self.plugin.service.sleep_maintenance(reason="page_sleep")
         else:
             result = self.plugin.service.sleep_status()
+        return self._ok({"result": result})
+
+    async def audit_preview(self):
+        payload = await self._json()
+        try:
+            result = await self.plugin.service.preview_memory_audit(
+                limit=max(0, min(100, self._int(payload.get("limit"), 0)))
+            )
+        except (ValueError, RuntimeError) as exc:
+            return self._err(clean_text(exc, 300), 400)
+        return self._ok({"result": result})
+
+    async def audit_status(self):
+        try:
+            result = await self.plugin.service.memory_audit_status(
+                clean_text(request.args.get("batch_id"), 80)
+            )
+        except ValueError as exc:
+            return self._err(clean_text(exc, 300), 400)
+        return self._ok({"result": result})
+
+    async def audit_apply(self):
+        payload = await self._json()
+        try:
+            result = await self.plugin.service.apply_memory_audit(
+                clean_text(payload.get("batch_id"), 80),
+                clean_text(payload.get("confirm"), 20),
+            )
+        except ValueError as exc:
+            return self._err(clean_text(exc, 300), 400)
+        return self._ok({"result": result})
+
+    async def audit_rollback(self):
+        payload = await self._json()
+        try:
+            result = await self.plugin.service.rollback_memory_audit(
+                clean_text(payload.get("batch_id"), 80),
+                clean_text(payload.get("confirm"), 20),
+            )
+        except ValueError as exc:
+            return self._err(clean_text(exc, 300), 400)
         return self._ok({"result": result})
 
     async def repair_livingmemory_content(self):

@@ -2182,6 +2182,11 @@ class MemoryCompanionBridge:
 def serialize_memory(record: MemoryRecord, score: float | None = None, reason: str = "") -> dict[str, Any]:
     metadata = record.metadata if isinstance(record.metadata, dict) else {}
     key_facts = metadata.get("key_facts") if isinstance(metadata.get("key_facts"), list) else []
+    key_facts_with_refs = (
+        metadata.get("key_facts_with_refs")
+        if isinstance(metadata.get("key_facts_with_refs"), list)
+        else []
+    )
     routine_check_notes = metadata.get("routine_check_notes") if isinstance(metadata.get("routine_check_notes"), list) else []
     topics = metadata.get("topics") if isinstance(metadata.get("topics"), list) else []
     participants = metadata.get("participants") if isinstance(metadata.get("participants"), list) else []
@@ -2219,6 +2224,18 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
         "evidence_preview": clean_text(record.evidence, 520),
         "canonical_summary": clean_text(metadata.get("canonical_summary"), 420),
         "key_facts": [clean_text(item, 180) for item in key_facts if clean_text(item, 180)][:4],
+        "key_facts_with_refs": [
+            {
+                "fact": clean_text(item.get("fact"), 180),
+                "refs": [
+                    clean_text(ref, 160)
+                    for ref in item.get("refs", [])
+                    if clean_text(ref, 160)
+                ][:6],
+            }
+            for item in key_facts_with_refs
+            if isinstance(item, dict) and clean_text(item.get("fact"), 180)
+        ][:8],
         "routine_check_notes": [clean_text(item, 180) for item in routine_check_notes if clean_text(item, 180)][:4],
         "topics": [clean_text(item, 80) for item in topics if clean_text(item, 80)][:5],
         "participants": [clean_text(item, 80) for item in participants if clean_text(item, 80)][:5],

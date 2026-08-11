@@ -16,7 +16,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "1.7.2"
+PLUGIN_VERSION = "1.7.3"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -363,6 +363,21 @@ class MemoryCompanionPlugin(Star):
     @mcomp.command("maintenance", priority=10)
     async def cmd_mcomp_maintenance(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
         yield event.plain_result(await self.commands.maintenance())
+
+    @permission_type(PermissionType.ADMIN)
+    @mcomp.command("audit", priority=10)
+    async def cmd_mcomp_audit(
+        self,
+        event: AstrMessageEvent,
+        action: str = "preview",
+        batch_id: str = "",
+        confirm: str = "",
+        limit: int = 0,
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        if action in {"preview", "check"} and batch_id.isdigit() and not limit:
+            limit = int(batch_id)
+            batch_id = ""
+        yield event.plain_result(await self.commands.audit(event, action, batch_id, confirm, limit))
 
     @permission_type(PermissionType.ADMIN)
     @mcomp.command("diagnostics", priority=10)

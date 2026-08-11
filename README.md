@@ -4,7 +4,7 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`1.7.2`
+- 版本：`1.7.3`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.22.0`
 - 编码要求：UTF-8
@@ -255,6 +255,10 @@ internal       内部记录
 | `/mcomp threads close <thread_id>` | 关闭跨窗口线程 |
 | `/mcomp logs [数量]` | 查看最近注入日志 |
 | `/mcomp maintenance` | 运行维护 |
+| `/mcomp audit preview [数量]` | 生成带原始事件证据的记忆审计预览，不修改数据库 |
+| `/mcomp audit status <batch_id>` | 查看审计批次和建议 |
+| `/mcomp audit apply <batch_id> 确认` | 备份后应用仍然有效的修正或归档建议 |
+| `/mcomp audit rollback <batch_id> 确认` | 校验当前状态后回滚已应用的审计变更 |
 | `/mcomp diagnostics` | 查看检索、缓存、Token、耗时和插件共存风险 |
 | `/mcomp preset status` | 查看当前运行预设 |
 | `/mcomp preset apply light\|standard\|companion` | 应用轻量、标准或陪伴预设 |
@@ -417,6 +421,14 @@ python benchmarks/run_memory_benchmark.py --size 1000 --repeats 5
 - 将即将衰退的一组记忆压缩为更高层摘要。
 
 高重要度、高访问频率、Bot 自我核心线索和近期记忆默认更不容易衰减。
+
+### 可回滚记忆审计
+
+新生成的阶段摘要会在 `key_facts_with_refs` 中保存每条关键事实及其原始时间线事件 ID。本地会同时校验引用存在和正文支持关系；旧版字符串 `key_facts` 仍可检索，但不会被伪装成已经验证的引用。
+
+审计默认关闭，先开启 `maintenance_audit.enabled`，再执行 `/mcomp audit preview`。预览只让模型提出 `replace` 或 `archive` 建议，建议必须再次通过本地事件范围和内容支持校验。应用时必须输入 `确认`，插件会先备份数据库并检查记忆指纹；期间被人工修改的记忆会标记为 `stale` 并跳过。归档不会硬删除，已应用批次可用 `/mcomp audit rollback <batch_id> 确认` 恢复。
+
+记忆审计不会加入睡眠维护，也不会自动应用模型建议。
 
 ## 调试日志
 

@@ -254,6 +254,66 @@ class MemoryCompanionCommandHandler:
             f"睡眠维护时间 {state.get('ran_at', '-')}"
         )
 
+    async def audit(
+        self,
+        event: Any,
+        action: str = "preview",
+        batch_id: str = "",
+        confirm: str = "",
+        limit: int = 0,
+    ) -> str:
+        action = clean_text(action, 24).lower() or "preview"
+        try:
+            if action in {"preview", "check"}:
+                result = await self.service.preview_memory_audit(event, limit)
+            elif action == "status":
+                if not clean_text(batch_id, 80):
+                    return "用法：/mcomp audit status <batch_id>"
+                result = await self.service.memory_audit_status(batch_id)
+            elif action == "apply":
+                if not clean_text(batch_id, 80):
+                    return "用法：/mcomp audit apply <batch_id> 确认"
+                result = await self.service.apply_memory_audit(batch_id, confirm)
+            elif action == "rollback":
+                if not clean_text(batch_id, 80):
+                    return "用法：/mcomp audit rollback <batch_id> 确认"
+                result = await self.service.rollback_memory_audit(batch_id, confirm)
+            else:
+                return self._audit_usage()
+        except (ValueError, RuntimeError) as exc:
+            return f"记忆审计未执行：{clean_text(exc, 300)}"
+        return self._format_audit_result(result)
+
+    @staticmethod
+    def _format_audit_result(result: dict[str, Any]) -> str:
+        items = result.get("items") if isinstance(result.get("items"), list) else []
+        applied = result.get("applied_results") if isinstance(result.get("applied_results"), list) else []
+        rolled_back = result.get("rollback_results") if isinstance(result.get("rollback_results"), list) else []
+        lines = [
+            f"记忆审计批次：{result.get('batch_id', '-')}",
+            f"状态：{result.get('status', '-')}｜候选 {result.get('candidate_count', 0)}｜建议 {len(items)}",
+        ]
+        for item in items[:10]:
+            lines.append(
+                f"- {item.get('memory_id')}｜{item.get('action')}｜{clean_text(item.get('reason'), 120)}"
+            )
+        if applied:
+            lines.append("应用结果：" + "，".join(f"{item.get('memory_id')}={item.get('status')}" for item in applied))
+        if rolled_back:
+            lines.append("回滚结果：" + "，".join(f"{item.get('memory_id')}={item.get('status')}" for item in rolled_back))
+        if result.get("status") == "preview" and items:
+            lines.append(f"确认应用：/mcomp audit apply {result.get('batch_id')} 确认")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _audit_usage() -> str:
+        return (
+            "/mcomp audit preview [数量]\n"
+            "/mcomp audit status <batch_id>\n"
+            "/mcomp audit apply <batch_id> 确认\n"
+            "/mcomp audit rollback <batch_id> 确认"
+        )
+
     async def diagnostics(self) -> str:
         report = await self.service.operational_report()
         cache = report.get("cache") or {}
@@ -430,6 +490,7 @@ class MemoryCompanionCommandHandler:
             "/mcomp threads list|close <thread_id>\n"
             "/mcomp logs 5\n"
             "/mcomp maintenance\n"
+            "/mcomp audit preview|status|apply|rollback\n"
             "/mcomp diagnostics\n"
             "/mcomp preset status|apply light|standard|companion\n"
             "/mcomp data export|preview|import [jsonl_path]\n"
