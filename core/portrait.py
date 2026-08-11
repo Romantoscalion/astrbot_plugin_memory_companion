@@ -111,7 +111,11 @@ def cross_scene_whitelisted_fact(
     alone is insufficient because work, schedule, location, and relationship
     details can be low-labelled yet still violate the frozen cross-scene policy.
     """
-    if _text(sensitivity, 24) != LOW_SENSITIVITY or _text(source_scope, 80) != "private":
+    normalized_scope = _text(source_scope, 80)
+    if (
+        _text(sensitivity, 24) != LOW_SENSITIVITY
+        or not (normalized_scope == "private" or normalized_scope.startswith("private@"))
+    ):
         return False
     normalized_dimension = _text(dimension, 80).lower()
     summary = _text(claim_summary, 180).lower()

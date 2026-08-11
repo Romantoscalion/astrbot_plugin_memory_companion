@@ -14,6 +14,7 @@ from typing import Any
 from .identity import parse_scope_from_session
 from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads, new_id, stable_fingerprint, utc_now
 from .portrait import cross_scene_whitelisted_fact
+from .portrait_namespace import portrait_scope_kind, portrait_scope_persona
 
 
 class MemoryStore:
@@ -551,6 +552,15 @@ class MemoryStore:
                     updated_at TEXT NOT NULL DEFAULT ''
                 );
 
+                CREATE TABLE IF NOT EXISTS portrait_scope_capabilities (
+                    person_id TEXT NOT NULL DEFAULT '',
+                    source_scope TEXT NOT NULL DEFAULT '',
+                    capability_summary TEXT NOT NULL DEFAULT '{}',
+                    projection_revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(person_id, source_scope)
+                );
+
                 CREATE TABLE IF NOT EXISTS portrait_evidence (
                     evidence_hash TEXT PRIMARY KEY,
                     person_id TEXT NOT NULL DEFAULT '',
@@ -715,6 +725,10 @@ class MemoryStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_portrait_facts_person ON portrait_facts(person_id, status, sensitivity, updated_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portrait_scope_capabilities_person "
+                "ON portrait_scope_capabilities(person_id, updated_at DESC)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_portrait_suppressions_person ON portrait_suppressions(person_id, status)"
@@ -995,23 +1009,28 @@ class MemoryStore:
         self,
         person_ref: dict[str, Any],
         capability_summary: dict[str, Any],
+        *,
+        source_scope: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._upsert_portrait_person_projection_sync,
             deepcopy(person_ref),
             deepcopy(capability_summary),
+            source_scope,
         )
 
     def _upsert_portrait_person_projection_sync(
         self,
         person_ref: dict[str, Any],
         capability_summary: dict[str, Any],
+        source_scope: str,
     ) -> dict[str, Any]:
         person_id = clean_text(person_ref.get("person_id"), 80)
         identity_key = clean_text(person_ref.get("resolved_identity_key"), 96)
         revision = int(person_ref.get("projection_revision") or 0)
         assurance = clean_text(person_ref.get("identity_assurance"), 40)
         status = clean_text(person_ref.get("profile_status"), 40)
+        source_scope = clean_text(source_scope, 80)
         if (
             not person_id
             or not identity_key
@@ -1032,6 +1051,11 @@ class MemoryStore:
                 if old_revision == revision and previous["resolved_identity_key"] != identity_key:
                     return {"ok": False, "code": "bridge_person_mismatch", "state": "invalid"}
             portrait_revision = int(previous["portrait_revision"] or 0) if previous is not None else 0
+            durable_capability_summary = capability_summary
+            if previous is not None and source_scope and not (
+                source_scope == "private" or source_scope.startswith("private@")
+            ):
+                durable_capability_summary = json_loads(previous["capability_summary"], {})
             self._conn.execute(
                 """
                 INSERT INTO portrait_people(
@@ -1053,12 +1077,25 @@ class MemoryStore:
                     revision,
                     clean_text(person_ref.get("identity_assurance"), 40),
                     clean_text(person_ref.get("profile_status"), 40),
-                    json_dumps(capability_summary),
+                    json_dumps(durable_capability_summary),
                     portrait_revision,
                     now,
                     now,
                 ),
             )
+            if source_scope:
+                self._conn.execute(
+                    """
+                    INSERT INTO portrait_scope_capabilities(
+                        person_id, source_scope, capability_summary, projection_revision, updated_at
+                    ) VALUES(?,?,?,?,?)
+                    ON CONFLICT(person_id, source_scope) DO UPDATE SET
+                        capability_summary=excluded.capability_summary,
+                        projection_revision=excluded.projection_revision,
+                        updated_at=excluded.updated_at
+                    """,
+                    (person_id, source_scope, json_dumps(capability_summary), revision, now),
+                )
             self._conn.commit()
         return {"ok": True, "code": "profile_exact", "state": "ready", "portrait_revision": portrait_revision}
 
@@ -1155,12 +1192,50 @@ class MemoryStore:
         return age.total_seconds() <= max(1, freshness_days) * 86400
 
     @staticmethod
-    def _portrait_scope_allows_row(row: sqlite3.Row, requested_scope: str) -> bool:
+    def _portrait_scope_allows_row(
+        row: sqlite3.Row,
+        requested_scope: str,
+        legacy_scope: str = "",
+    ) -> bool:
         usable_scope = clean_text(row["usable_scope"], 80)
         source_scope = clean_text(row["source_scope"], 80)
         if usable_scope == "self_low_global":
-            return True
-        return usable_scope == "source_only" and bool(requested_scope) and source_scope == requested_scope
+            source_persona = portrait_scope_persona(source_scope)
+            requested_persona = portrait_scope_persona(requested_scope)
+            return not source_persona or (
+                bool(requested_persona) and source_persona == requested_persona
+            )
+        return usable_scope == "source_only" and bool(requested_scope) and source_scope in {
+            requested_scope,
+            legacy_scope,
+        }
+
+    def _portrait_scope_capability_sync(
+        self,
+        person_id: str,
+        source_scope: str,
+        *,
+        legacy_scope: str = "",
+    ) -> dict[str, Any]:
+        source_scope = clean_text(source_scope, 80)
+        row = self._conn.execute(
+            "SELECT capability_summary FROM portrait_scope_capabilities WHERE person_id=? AND source_scope=?",
+            (person_id, source_scope),
+        ).fetchone()
+        if row is not None:
+            value = json_loads(row["capability_summary"], {})
+            return value if isinstance(value, dict) else {}
+        if (
+            source_scope == "private"
+            or source_scope.startswith("group:")
+        ):
+            person = self._conn.execute(
+                "SELECT capability_summary FROM portrait_people WHERE person_id=?",
+                (person_id,),
+            ).fetchone()
+            value = json_loads(person["capability_summary"], {}) if person is not None else {}
+            return value if isinstance(value, dict) else {}
+        return {}
 
     def _bump_portrait_revision_sync(self, person_id: str) -> int:
         self._conn.execute(
@@ -1378,9 +1453,6 @@ class MemoryStore:
             person = self._conn.execute("SELECT * FROM portrait_people WHERE person_id=?", (person_id,)).fetchone()
             if person is None:
                 return {"ok": False, "code": "bridge_unavailable"}
-            capabilities = json_loads(person["capability_summary"], {})
-            if not bool(capabilities.get("portrait_learning_enabled")):
-                return {"ok": False, "code": "portrait_learning_disabled"}
             run = self._conn.execute(
                 "SELECT * FROM portrait_daily_runs WHERE person_id=? AND run_day=?", (person_id, run_day)
             ).fetchone()
@@ -1390,6 +1462,30 @@ class MemoryStore:
                 return {"ok": False, "code": "portrait_daily_limit", "attempts": attempts, "successes": successes}
             if attempts >= attempt_limit:
                 return {"ok": False, "code": "portrait_daily_limit", "attempts": attempts, "successes": successes}
+            pending_scopes = self._conn.execute(
+                """
+                SELECT DISTINCT f.source_scope
+                FROM portrait_learning_queue q
+                JOIN portrait_facts f ON f.id=q.fact_id
+                WHERE q.person_id=? AND q.state='pending' AND f.status='active'
+                """,
+                (person_id,),
+            ).fetchall()
+            if not any(
+                bool(
+                    self._portrait_scope_capability_sync(
+                        person_id,
+                        clean_text(row["source_scope"], 80),
+                        legacy_scope=(
+                            "private"
+                            if clean_text(row["source_scope"], 80) == "private"
+                            else ""
+                        ),
+                    ).get("portrait_learning_enabled")
+                )
+                for row in pending_scopes
+            ):
+                return {"ok": False, "code": "portrait_learning_disabled"}
             attempts += 1
             self._conn.execute(
                 """
@@ -1410,6 +1506,14 @@ class MemoryStore:
             ).fetchall()
             created = 0
             for row in rows:
+                row_scope = clean_text(row["source_scope"], 80)
+                row_capabilities = self._portrait_scope_capability_sync(
+                    person_id,
+                    row_scope,
+                    legacy_scope="private" if row_scope == "private" else "",
+                )
+                if not bool(row_capabilities.get("portrait_learning_enabled")):
+                    continue
                 evidence_hashes = json_loads(row["evidence_hashes"], [])
                 if self._portrait_distinct_statement_count_sync(evidence_hashes) < min_independent_evidence:
                     continue
@@ -1431,7 +1535,11 @@ class MemoryStore:
                     "derivation_kind": "independent_evidence_aggregate",
                     "epistemic_status": "inferred",
                     "source_scope": row["source_scope"],
-                    "usable_scope": "source_only" if row["source_scope"] != "private" else "self_low_global",
+                    "usable_scope": (
+                        "self_low_global"
+                        if portrait_scope_kind(row["source_scope"]) == "private"
+                        else "source_only"
+                    ),
                     "confidence": min(0.95, max(0.75, float(row["confidence"] or 0.0))),
                     "sensitivity": row["sensitivity"],
                     "evidence_hashes": evidence_hashes,
@@ -1461,6 +1569,7 @@ class MemoryStore:
         person_id: str,
         *,
         scope: str = "",
+        legacy_scope: str = "",
         limit: int = 8,
         low_only: bool = True,
         usage_min_confidence: float = 0.75,
@@ -1470,6 +1579,7 @@ class MemoryStore:
             self._portrait_summary_sync,
             person_id,
             scope,
+            legacy_scope,
             limit,
             low_only,
             usage_min_confidence,
@@ -1480,6 +1590,7 @@ class MemoryStore:
         self,
         person_id: str,
         scope: str,
+        legacy_scope: str,
         limit: int,
         low_only: bool,
         usage_min_confidence: float,
@@ -1487,6 +1598,7 @@ class MemoryStore:
     ) -> dict[str, Any]:
         person_id = clean_text(person_id, 80)
         scope = clean_text(scope, 80)
+        legacy_scope = clean_text(legacy_scope, 80)
         confidence_floor = max(0.0, min(1.0, float(usage_min_confidence or 0.75)))
         freshness_days = max(1, min(3650, int(inferred_freshness_days or 90)))
         with self._lock:
@@ -1502,7 +1614,9 @@ class MemoryStore:
                     "items": [],
                     "portrait_revision": int(person["portrait_revision"] or 0),
                 }
-            capabilities = json_loads(person["capability_summary"], {})
+            capabilities = self._portrait_scope_capability_sync(
+                person_id, scope, legacy_scope=legacy_scope
+            )
             if not bool(capabilities.get("portrait_usage_enabled")):
                 return {"ok": False, "code": "portrait_usage_disabled", "items": [], "portrait_revision": int(person["portrait_revision"] or 0)}
             query = "SELECT * FROM portrait_facts WHERE person_id=? AND status='active'"
@@ -1516,7 +1630,7 @@ class MemoryStore:
             rows = self._conn.execute(query, params).fetchall()
             items: list[dict[str, Any]] = []
             for row in rows:
-                if not self._portrait_scope_allows_row(row, scope):
+                if not self._portrait_scope_allows_row(row, scope, legacy_scope):
                     continue
                 if self._portrait_suppressed_sync(person_id, row["dimension"], row["normalized_claim_hash"], row["source_scope"]):
                     continue
