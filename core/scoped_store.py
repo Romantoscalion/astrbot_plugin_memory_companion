@@ -492,6 +492,99 @@ class ScopedStore:
             )
         return result
 
+    def tombstone_identity_scopes(
+        self,
+        context: NamespaceContext,
+        *,
+        operation_id: str,
+        reason_code: str,
+        record_prefix: str = "req041-",
+    ) -> dict[str, Any]:
+        """Permanently tombstone one person's private/member projections atomically.
+
+        The caller must authorize with the person's formal private context.  We
+        intentionally discover every historical group-member scope inside the
+        same transaction so stale groups cannot be orphaned by a caller's
+        incomplete context list.  Group-shared and persona-global ownership is
+        never part of an individual archive.
+        """
+        decision = AssurancePolicy.authorize(context, "memory_write")
+        if not decision.allowed:
+            raise ScopedStoreError(decision.code)
+        if context.kind != "private" or context.group_id or not context.identity_id:
+            raise ScopedStoreError("scoped_identity_archive_context_invalid")
+        if self._active_epoch:
+            if context.migration_epoch != self._active_epoch:
+                raise ScopedStoreError("scoped_migration_epoch_stale")
+            if context.policy_version != self._active_policy_version:
+                raise ScopedStoreError("scoped_policy_version_stale")
+        operation = _token(operation_id)
+        reason = _token(reason_code, 80)
+        prefix = _token(record_prefix, 40)
+        if not operation or not reason or not prefix:
+            raise ScopedStoreError("scoped_identity_archive_invalid")
+        target = _canonical({
+            "kind": "identity_scopes",
+            "persona_id": context.persona_id,
+            "identity_id": context.identity_id,
+        })
+        request_hash = hashlib.sha256(
+            _canonical({"target": target, "reason": reason, "prefix": prefix}).encode("utf-8")
+        ).hexdigest()
+        now = float(self._clock())
+        with self._transaction() as conn:
+            prior = conn.execute(
+                "SELECT request_hash,result_json FROM scoped_namespace_operations WHERE operation_id=? AND migration_epoch=?",
+                (operation, context.migration_epoch),
+            ).fetchone()
+            if prior is not None:
+                if prior["request_hash"] != request_hash:
+                    raise ScopedRecordConflict("scoped_namespace_operation_conflict")
+                return json.loads(prior["result_json"])
+            candidates = conn.execute(
+                """SELECT namespace_scope,record_kind,record_id,revision FROM scoped_records
+                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
+                (f"{prefix}%",),
+            ).fetchall()
+            rows: list[sqlite3.Row] = []
+            scopes: set[str] = set()
+            for row in candidates:
+                try:
+                    owner = json.loads(row["namespace_scope"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if not isinstance(owner, dict):
+                    continue
+                if (
+                    owner.get("kind") in {"private", "group_member"}
+                    and owner.get("persona_id") == context.persona_id
+                    and owner.get("identity_id") == context.identity_id
+                ):
+                    rows.append(row)
+                    scopes.add(str(row["namespace_scope"]))
+            for row in rows:
+                conn.execute(
+                    """UPDATE scoped_records SET revision=?,deleted=1,updated_at=?
+                       WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
+                    (
+                        int(row["revision"]) + 1, now, row["namespace_scope"],
+                        row["record_kind"], row["record_id"],
+                    ),
+                )
+            result = {
+                "code": "identity_scopes_tombstoned" if rows else "identity_scopes_already_empty",
+                "count": len(rows),
+                "namespace_count": len(scopes),
+                "reason_code": reason,
+            }
+            conn.execute(
+                """INSERT INTO scoped_namespace_operations(
+                       operation_id,migration_epoch,namespace_scope,request_hash,result_json,created_at
+                   ) VALUES(?,?,?,?,?,?)""",
+                (operation, context.migration_epoch, target, request_hash, _canonical(result), now),
+            )
+        return result
+
 
 __all__ = [
     "MAX_RECORD_BYTES", "RECORD_KINDS", "ScopedRecordConflict", "ScopedRevisionGap", "ScopedStore",

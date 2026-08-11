@@ -168,6 +168,45 @@ class ScopedStoreTests(unittest.TestCase):
                 self.private, operation_id="archive-1", reason_code="different_reason",
             )
 
+    def test_identity_archive_tombstones_private_and_all_member_scopes_only(self) -> None:
+        shared = _context("group_shared", identity="", group="group-a")
+        other = _context("private", identity="person-b")
+        contexts = (
+            (self.private, "req041-private-memory", "private"),
+            (self.group_a, "req041-group-a-member", "group_member"),
+            (self.group_b, "req041-group-b-member", "group_member"),
+            (shared, "req041-group-shared", "group_shared"),
+            (other, "req041-other-private", "private"),
+        )
+        for index, (context, record_id, source_kind) in enumerate(contexts, start=1):
+            self.store.upsert(
+                context, record_kind="memory", record_id=record_id, revision=1,
+                payload=build_scoped_domain_payload(
+                    domain="memory", source_kind=source_kind,
+                    content={"marker": record_id}, source_revision=1,
+                ), event_id=f"identity-archive-write-{index}",
+            )
+        result = self.store.tombstone_identity_scopes(
+            self.private, operation_id="person-archive-1", reason_code="person_archive",
+        )
+        self.assertEqual(3, result["count"])
+        self.assertEqual(3, result["namespace_count"])
+        self.assertEqual(result, self.store.tombstone_identity_scopes(
+            self.private, operation_id="person-archive-1", reason_code="person_archive",
+        ))
+        for context, record_id, _source_kind in contexts[:3]:
+            self.assertIsNone(self.store.read(context, record_kind="memory", record_id=record_id))
+        self.assertIsNotNone(self.store.read(shared, record_kind="memory", record_id="req041-group-shared"))
+        self.assertIsNotNone(self.store.read(other, record_kind="memory", record_id="req041-other-private"))
+        with self.assertRaisesRegex(ScopedStoreError, "scoped_identity_archive_context_invalid"):
+            self.store.tombstone_identity_scopes(
+                self.group_a, operation_id="bad-member-context", reason_code="person_archive",
+            )
+        with self.assertRaisesRegex(ScopedRecordConflict, "scoped_namespace_operation_conflict"):
+            self.store.tombstone_identity_scopes(
+                self.private, operation_id="person-archive-1", reason_code="different_reason",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

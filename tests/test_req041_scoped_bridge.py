@@ -222,6 +222,36 @@ class ScopedBridgeTests(unittest.TestCase):
             self.capability, context, record_kind="memory", record_id="req041-private-memory-a"
         )["code"])
 
+    def test_bridge_exposes_atomic_identity_scope_tombstone(self) -> None:
+        self._bind()
+        private = _context()
+        member = _context(kind="group_member", group="group-a")
+        shared = _context(kind="group_shared", identity="", group="group-a")
+        for index, (context, record_id, source_kind) in enumerate((
+            (private, "req041-private-memory", "private"),
+            (member, "req041-member-memory", "group_member"),
+            (shared, "req041-shared-memory", "group_shared"),
+        ), start=1):
+            written = self.bridge.upsert_scoped_record(
+                self.capability, context, record_kind="memory", record_id=record_id, revision=1,
+                payload=build_scoped_domain_payload(
+                    domain="memory", source_kind=source_kind,
+                    content={"marker": record_id}, source_revision=1,
+                ), event_id=f"archive-write-{index}",
+            )
+            self.assertTrue(written["ok"])
+        result = self.bridge.tombstone_scoped_identity_scopes(
+            self.capability, private, operation_id="archive-person-1", reason_code="person_archive",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, result["count"])
+        self.assertEqual("not_found", self.bridge.read_scoped_record(
+            self.capability, member, record_kind="memory", record_id="req041-member-memory",
+        )["code"])
+        self.assertEqual("ready", self.bridge.read_scoped_record(
+            self.capability, shared, record_kind="memory", record_id="req041-shared-memory",
+        )["state"])
+
 
 if __name__ == "__main__":
     unittest.main()
