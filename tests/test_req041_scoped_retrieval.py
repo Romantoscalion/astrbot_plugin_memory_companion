@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -116,6 +118,12 @@ class ScopedStoreTests(unittest.TestCase):
         self.assertEqual("duplicate", self.store.tombstone(self.private, record_kind="memory", record_id="m1", revision=2, event_id="delete-1"))
         with self.assertRaisesRegex(ScopedRecordConflict, "scoped_record_tombstoned"):
             self.store.upsert(self.private, record_kind="memory", record_id="m1", revision=3, payload={"value": 3}, event_id="event-3")
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            payload_json, payload_hash = connection.execute(
+                "SELECT payload_json,payload_hash FROM scoped_records WHERE record_id='m1'"
+            ).fetchone()
+        self.assertEqual("{}", payload_json)
+        self.assertEqual(64, len(payload_hash))
 
     def test_group_shared_cannot_store_subject_profile(self) -> None:
         shared = _context("group_shared", identity="", group="group-a")
@@ -196,6 +204,11 @@ class ScopedStoreTests(unittest.TestCase):
         ))
         for context, record_id, _source_kind in contexts[:3]:
             self.assertIsNone(self.store.read(context, record_kind="memory", record_id=record_id))
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            erased = connection.execute(
+                "SELECT payload_json FROM scoped_records WHERE deleted=1 ORDER BY record_id"
+            ).fetchall()
+        self.assertEqual([("{}",), ("{}",), ("{}",)], erased)
         self.assertIsNotNone(self.store.read(shared, record_kind="memory", record_id="req041-group-shared"))
         self.assertIsNotNone(self.store.read(other, record_kind="memory", record_id="req041-other-private"))
         with self.assertRaisesRegex(ScopedStoreError, "scoped_identity_archive_context_invalid"):

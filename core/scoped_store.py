@@ -20,6 +20,8 @@ from .scoped_domain_contract import SCHEMA_VERSION, ScopedDomainContractError, v
 
 
 MAX_RECORD_BYTES = 262144
+_ERASED_PAYLOAD_JSON = "{}"
+_ERASED_PAYLOAD_HASH = hashlib.sha256(_ERASED_PAYLOAD_JSON.encode("utf-8")).hexdigest()
 RECORD_KINDS = frozenset({"profile_fact", "memory", "rule", "evidence", "summary"})
 _PURPOSE_BY_KIND = {
     "profile_fact": ("profile_read", "profile_write"),
@@ -83,7 +85,12 @@ class ScopedStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA secure_delete=ON")
         return conn
+
+    def _truncate_wal(self) -> None:
+        with self._connection() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -423,13 +430,15 @@ class ScopedStore:
             if int(row["deleted"]) == 1:
                 raise ScopedRecordConflict("scoped_record_tombstoned")
             conn.execute(
-                "UPDATE scoped_records SET revision=?,deleted=1,updated_at=? WHERE namespace_scope=? AND record_kind=? AND record_id=?",
-                (revision, now, scope, record_kind, identifier),
+                """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
+                   WHERE namespace_scope=? AND record_kind=? AND record_id=?""",
+                (revision, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH, now, scope, record_kind, identifier),
             )
             conn.execute(
                 "INSERT INTO scoped_operations(event_id,migration_epoch,request_hash,result_code,created_at) VALUES(?,?,?,?,?)",
                 (event, context.migration_epoch, request_hash, "tombstoned", now),
             )
+        self._truncate_wal()
         return "tombstoned"
 
     def tombstone_namespace(
@@ -475,9 +484,12 @@ class ScopedStore:
             ).fetchall()
             for row in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,deleted=1,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
-                    (int(row["revision"]) + 1, now, scope, row["record_kind"], row["record_id"]),
+                    (
+                        int(row["revision"]) + 1, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH,
+                        now, scope, row["record_kind"], row["record_id"],
+                    ),
                 )
             result = {
                 "code": "namespace_tombstoned" if rows else "namespace_already_empty",
@@ -490,6 +502,7 @@ class ScopedStore:
                    ) VALUES(?,?,?,?,?,?)""",
                 (operation, context.migration_epoch, scope, request_hash, _canonical(result), now),
             )
+        self._truncate_wal()
         return result
 
     def tombstone_identity_scopes(
@@ -564,10 +577,11 @@ class ScopedStore:
                     scopes.add(str(row["namespace_scope"]))
             for row in rows:
                 conn.execute(
-                    """UPDATE scoped_records SET revision=?,deleted=1,updated_at=?
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,deleted=1,updated_at=?
                        WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
                     (
-                        int(row["revision"]) + 1, now, row["namespace_scope"],
+                        int(row["revision"]) + 1, _ERASED_PAYLOAD_JSON, _ERASED_PAYLOAD_HASH,
+                        now, row["namespace_scope"],
                         row["record_kind"], row["record_id"],
                     ),
                 )
@@ -583,6 +597,7 @@ class ScopedStore:
                    ) VALUES(?,?,?,?,?,?)""",
                 (operation, context.migration_epoch, target, request_hash, _canonical(result), now),
             )
+        self._truncate_wal()
         return result
 
 
