@@ -11,7 +11,9 @@ from core.scoped_domain_contract import build_scoped_domain_payload
 from core.scoped_store import ScopedRecordConflict, ScopedRevisionGap, ScopedStore, ScopedStoreError
 
 
-def _context(kind: str, *, identity: str = "person-a", group: str = "") -> NamespaceContext:
+def _context(
+    kind: str, *, identity: str = "person-a", group: str = "", persona: str = "default"
+) -> NamespaceContext:
     return NamespaceContext(
         kind=kind,
         identity_id=identity,
@@ -20,6 +22,7 @@ def _context(kind: str, *, identity: str = "person-a", group: str = "") -> Names
         profile_status="active",
         policy_version="req041-v1",
         migration_epoch="shadow-20260810",
+        persona_id=persona,
     )
 
 
@@ -267,6 +270,52 @@ class ScopedStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ScopedStoreError, "scoped_group_erase_context_invalid"):
             self.store.erase_group_scopes(
                 self.group_a, operation_id="bad-group-reset", reason_code="group_reset",
+            )
+
+    def test_persona_reset_erases_all_four_scoped_kinds_and_preserves_other_persona(self) -> None:
+        persona = "persona-a"
+        private = _context("private", persona=persona)
+        member = _context("group_member", group="group-a", persona=persona)
+        shared = _context("group_shared", identity="", group="group-a", persona=persona)
+        global_rules = _context("persona_global", identity="", persona=persona)
+        other = _context("private", persona="persona-b")
+        writes = (
+            (private, "memory", "req041-private", "memory", "private", "not_applicable", ""),
+            (member, "profile_fact", "req041-member", "profile", "group_member", "not_applicable", ""),
+            (shared, "memory", "req041-shared", "memory", "group_shared", "not_applicable", ""),
+            (global_rules, "rule", "req041-global", "learning", "persona_global", "approved", "administrator"),
+            (other, "memory", "req041-other", "memory", "private", "not_applicable", ""),
+        )
+        for index, (context, record_kind, record_id, domain, source, approval, approved_by) in enumerate(writes, start=1):
+            self.store.upsert(
+                context, record_kind=record_kind, record_id=record_id, revision=1,
+                payload=build_scoped_domain_payload(
+                    domain=domain, source_kind=source, content={"sentinel": record_id},
+                    source_revision=1, approval_state=approval, approved_by=approved_by,
+                ), event_id=f"persona-reset-write-{index}",
+            )
+        result = self.store.erase_persona_scopes(
+            global_rules, operation_id="persona-reset-1", reason_code="persona_reset",
+        )
+        self.assertEqual(4, result["count"])
+        self.assertEqual({"group_member", "group_shared", "persona_global", "private"}, set(result["namespace_kinds"]))
+        for context, record_kind, record_id, *_rest in writes[:4]:
+            record = self.store.read(context, record_kind=record_kind, record_id=record_id)
+            self.assertEqual({}, record["payload"]["content"])
+            self.assertEqual(2, record["revision"])
+        self.assertEqual("req041-other", self.store.read(
+            other, record_kind="memory", record_id="req041-other",
+        )["payload"]["content"]["sentinel"])
+        self.assertEqual("updated", self.store.upsert(
+            private, record_kind="memory", record_id="req041-private", revision=3,
+            payload=build_scoped_domain_payload(
+                domain="memory", source_kind="private", content={"sentinel": "relearned"},
+                source_revision=3,
+            ), event_id="persona-relearn",
+        ))
+        with self.assertRaisesRegex(ScopedStoreError, "scoped_persona_erase_context_invalid"):
+            self.store.erase_persona_scopes(
+                private, operation_id="bad-persona-reset", reason_code="persona_reset",
             )
 
 

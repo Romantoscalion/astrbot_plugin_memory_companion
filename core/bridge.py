@@ -1694,6 +1694,7 @@ class MemoryCompanionBridge:
                 "list_scoped_records",
                 "read_scoped_record",
                 "erase_scoped_group_scopes",
+                "erase_scoped_persona_scopes",
                 "tombstone_scoped_identity_scopes",
                 "tombstone_scoped_namespace",
                 "tombstone_scoped_record",
@@ -1865,6 +1866,25 @@ class MemoryCompanionBridge:
             return denied
         try:
             result = self._scoped_store.erase_group_scopes(
+                context, operation_id=operation_id, reason_code=reason_code,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", **result}
+
+    def erase_scoped_persona_scopes(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str = "persona_reset",
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.erase_persona_scopes(
                 context, operation_id=operation_id, reason_code=reason_code,
             )
         except ScopedStoreError as exc:

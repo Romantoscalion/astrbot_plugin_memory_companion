@@ -277,6 +277,35 @@ class ScopedBridgeTests(unittest.TestCase):
         )
         self.assertEqual({}, read["record"]["payload"]["content"])
 
+    def test_bridge_exposes_atomic_persona_scope_erase(self) -> None:
+        self._bind()
+        private = _context(persona_id="persona-a")
+        global_rules = _context(
+            kind="persona_global", identity="", group="", persona_id="persona-a",
+        )
+        self.assertTrue(self.bridge.upsert_scoped_record(
+            self.capability, private, record_kind="memory", record_id="req041-private", revision=1,
+            payload=build_scoped_domain_payload(
+                domain="memory", source_kind="private", content={"marker": "private"}, source_revision=1,
+            ), event_id="persona-erase-write-1",
+        )["ok"])
+        self.assertTrue(self.bridge.upsert_scoped_record(
+            self.capability, global_rules, record_kind="rule", record_id="req041-global", revision=1,
+            payload=build_scoped_domain_payload(
+                domain="learning", source_kind="persona_global", content={"rules": ["safe"]},
+                source_revision=1, approval_state="approved", approved_by="administrator",
+            ), event_id="persona-erase-write-2",
+        )["ok"])
+        result = self.bridge.erase_scoped_persona_scopes(
+            self.capability, global_rules, operation_id="persona-erase-1", reason_code="persona_reset",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, result["count"])
+        read = self.bridge.read_scoped_record(
+            self.capability, private, record_kind="memory", record_id="req041-private",
+        )
+        self.assertEqual({}, read["record"]["payload"]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
