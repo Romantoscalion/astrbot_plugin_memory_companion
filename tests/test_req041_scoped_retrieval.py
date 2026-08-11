@@ -220,6 +220,55 @@ class ScopedStoreTests(unittest.TestCase):
                 self.private, operation_id="person-archive-1", reason_code="different_reason",
             )
 
+    def test_group_reset_erases_shared_and_all_members_but_allows_relearning(self) -> None:
+        shared_a = _context("group_shared", identity="", group="group-a")
+        member_a_other = _context("group_member", identity="person-b", group="group-a")
+        shared_b = _context("group_shared", identity="", group="group-b")
+        contexts = (
+            (shared_a, "req041-shared-a", "group_shared"),
+            (self.group_a, "req041-member-a", "group_member"),
+            (member_a_other, "req041-member-a-other", "group_member"),
+            (shared_b, "req041-shared-b", "group_shared"),
+            (self.private, "req041-private", "private"),
+        )
+        for index, (context, record_id, source_kind) in enumerate(contexts, start=1):
+            self.store.upsert(
+                context, record_kind="memory", record_id=record_id, revision=1,
+                payload=build_scoped_domain_payload(
+                    domain="memory", source_kind=source_kind,
+                    content={"sentinel": record_id}, source_revision=1,
+                ), event_id=f"group-reset-write-{index}",
+            )
+        result = self.store.erase_group_scopes(
+            shared_a, operation_id="group-reset-1", reason_code="group_reset",
+        )
+        self.assertEqual(3, result["count"])
+        self.assertEqual(3, result["namespace_count"])
+        for context, record_id, _source_kind in contexts[:3]:
+            record = self.store.read(context, record_kind="memory", record_id=record_id)
+            self.assertEqual({}, record["payload"]["content"])
+            self.assertEqual(2, record["revision"])
+        self.assertEqual("req041-shared-b", self.store.read(
+            shared_b, record_kind="memory", record_id="req041-shared-b"
+        )["payload"]["content"]["sentinel"])
+        self.assertEqual("req041-private", self.store.read(
+            self.private, record_kind="memory", record_id="req041-private"
+        )["payload"]["content"]["sentinel"])
+        self.assertEqual("updated", self.store.upsert(
+            self.group_a, record_kind="memory", record_id="req041-member-a", revision=3,
+            payload=build_scoped_domain_payload(
+                domain="memory", source_kind="group_member", content={"sentinel": "relearned"},
+                source_revision=3,
+            ), event_id="group-relearn",
+        ))
+        self.assertEqual("relearned", self.store.read(
+            self.group_a, record_kind="memory", record_id="req041-member-a"
+        )["payload"]["content"]["sentinel"])
+        with self.assertRaisesRegex(ScopedStoreError, "scoped_group_erase_context_invalid"):
+            self.store.erase_group_scopes(
+                self.group_a, operation_id="bad-group-reset", reason_code="group_reset",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

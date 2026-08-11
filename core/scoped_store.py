@@ -16,7 +16,12 @@ import time
 from typing import Any, Iterator
 
 from .namespace import AssurancePolicy, NamespaceContext
-from .scoped_domain_contract import SCHEMA_VERSION, ScopedDomainContractError, validate_scoped_domain_payload
+from .scoped_domain_contract import (
+    SCHEMA_VERSION,
+    ScopedDomainContractError,
+    build_scoped_domain_payload,
+    validate_scoped_domain_payload,
+)
 
 
 MAX_RECORD_BYTES = 262144
@@ -590,6 +595,111 @@ class ScopedStore:
                 "count": len(rows),
                 "namespace_count": len(scopes),
                 "reason_code": reason,
+            }
+            conn.execute(
+                """INSERT INTO scoped_namespace_operations(
+                       operation_id,migration_epoch,namespace_scope,request_hash,result_json,created_at
+                   ) VALUES(?,?,?,?,?,?)""",
+                (operation, context.migration_epoch, target, request_hash, _canonical(result), now),
+            )
+        self._truncate_wal()
+        return result
+
+    def erase_group_scopes(
+        self,
+        context: NamespaceContext,
+        *,
+        operation_id: str,
+        reason_code: str = "group_reset",
+        record_prefix: str = "req041-",
+    ) -> dict[str, Any]:
+        """Atomically empty one group's shared/member projections without banning reuse."""
+        decision = AssurancePolicy.authorize(context, "memory_write")
+        if not decision.allowed:
+            raise ScopedStoreError(decision.code)
+        if context.kind != "group_shared" or context.identity_id or not context.group_id:
+            raise ScopedStoreError("scoped_group_erase_context_invalid")
+        if self._active_epoch:
+            if context.migration_epoch != self._active_epoch:
+                raise ScopedStoreError("scoped_migration_epoch_stale")
+            if context.policy_version != self._active_policy_version:
+                raise ScopedStoreError("scoped_policy_version_stale")
+        operation = _token(operation_id)
+        reason = _token(reason_code, 80)
+        prefix = _token(record_prefix, 40)
+        if not operation or not reason or not prefix:
+            raise ScopedStoreError("scoped_group_erase_invalid")
+        target = _canonical({
+            "kind": "group_scopes", "persona_id": context.persona_id, "group_id": context.group_id,
+        })
+        request_hash = hashlib.sha256(
+            _canonical({"target": target, "reason": reason, "prefix": prefix}).encode("utf-8")
+        ).hexdigest()
+        now = float(self._clock())
+        with self._transaction() as conn:
+            prior = conn.execute(
+                "SELECT request_hash,result_json FROM scoped_namespace_operations WHERE operation_id=? AND migration_epoch=?",
+                (operation, context.migration_epoch),
+            ).fetchone()
+            if prior is not None:
+                if prior["request_hash"] != request_hash:
+                    raise ScopedRecordConflict("scoped_namespace_operation_conflict")
+                return json.loads(prior["result_json"])
+            candidates = conn.execute(
+                """SELECT namespace_scope,record_kind,record_id,revision,payload_json FROM scoped_records
+                   WHERE deleted=0 AND record_id LIKE ? ORDER BY namespace_scope,record_kind,record_id""",
+                (f"{prefix}%",),
+            ).fetchall()
+            rows: list[tuple[sqlite3.Row, str, str]] = []
+            scopes: set[str] = set()
+            for row in candidates:
+                try:
+                    owner = json.loads(row["namespace_scope"])
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ScopedStoreError("scoped_group_erase_record_invalid") from exc
+                if not isinstance(owner, dict) or not isinstance(payload, dict):
+                    raise ScopedStoreError("scoped_group_erase_record_invalid")
+                if not (
+                    owner.get("kind") in {"group_shared", "group_member"}
+                    and owner.get("persona_id") == context.persona_id
+                    and owner.get("group_id") == context.group_id
+                ):
+                    continue
+                try:
+                    cleared = build_scoped_domain_payload(
+                        domain=str(payload.get("domain") or ""),
+                        source_kind=str(payload.get("source_kind") or owner.get("kind") or ""),
+                        content={}, source_revision=int(payload.get("source_revision") or 0) + 1,
+                        approval_state=str(payload.get("approval_state") or "not_applicable"),
+                        approved_by=str(payload.get("approved_by") or ""),
+                    )
+                    validate_scoped_domain_payload(
+                        NamespaceContext(
+                            kind=str(owner.get("kind") or ""), persona_id=str(owner.get("persona_id") or ""),
+                            identity_id=str(owner.get("identity_id") or ""), group_id=str(owner.get("group_id") or ""),
+                            assurance=context.assurance, profile_status=context.profile_status,
+                            policy_version=context.policy_version, migration_epoch=context.migration_epoch,
+                        ),
+                        str(row["record_kind"]), cleared,
+                    )
+                    encoded, digest = _payload(cleared)
+                except (TypeError, ValueError, ScopedDomainContractError, ScopedStoreError) as exc:
+                    raise ScopedStoreError("scoped_group_erase_record_invalid") from exc
+                rows.append((row, encoded, digest))
+                scopes.add(str(row["namespace_scope"]))
+            for row, encoded, digest in rows:
+                conn.execute(
+                    """UPDATE scoped_records SET revision=?,payload_json=?,payload_hash=?,updated_at=?
+                       WHERE namespace_scope=? AND record_kind=? AND record_id=? AND deleted=0""",
+                    (
+                        int(row["revision"]) + 1, encoded, digest, now, row["namespace_scope"],
+                        row["record_kind"], row["record_id"],
+                    ),
+                )
+            result = {
+                "code": "group_scopes_erased" if rows else "group_scopes_already_empty",
+                "count": len(rows), "namespace_count": len(scopes), "reason_code": reason,
             }
             conn.execute(
                 """INSERT INTO scoped_namespace_operations(

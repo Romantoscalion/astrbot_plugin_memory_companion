@@ -252,6 +252,31 @@ class ScopedBridgeTests(unittest.TestCase):
             self.capability, shared, record_kind="memory", record_id="req041-shared-memory",
         )["state"])
 
+    def test_bridge_exposes_atomic_group_scope_erase(self) -> None:
+        self._bind()
+        shared = _context(kind="group_shared", identity="", group="group-a")
+        member = _context(kind="group_member", group="group-a")
+        for index, (context, record_id, source_kind) in enumerate((
+            (shared, "req041-shared-memory", "group_shared"),
+            (member, "req041-member-memory", "group_member"),
+        ), start=1):
+            self.assertTrue(self.bridge.upsert_scoped_record(
+                self.capability, context, record_kind="memory", record_id=record_id, revision=1,
+                payload=build_scoped_domain_payload(
+                    domain="memory", source_kind=source_kind,
+                    content={"marker": record_id}, source_revision=1,
+                ), event_id=f"group-erase-write-{index}",
+            )["ok"])
+        result = self.bridge.erase_scoped_group_scopes(
+            self.capability, shared, operation_id="group-erase-1", reason_code="group_reset",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(2, result["count"])
+        read = self.bridge.read_scoped_record(
+            self.capability, member, record_kind="memory", record_id="req041-member-memory",
+        )
+        self.assertEqual({}, read["record"]["payload"]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
