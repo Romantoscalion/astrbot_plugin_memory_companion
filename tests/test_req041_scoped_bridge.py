@@ -81,6 +81,63 @@ class ScopedBridgeTests(unittest.TestCase):
         self.assertTrue(ready["available"])
         self.assertEqual([], validate_namespace_capability(ready))
 
+    def test_all_scoped_methods_reject_before_epoch_binding(self) -> None:
+        private = _context()
+        group = _context(kind="group_shared", identity="", group="group-a")
+        persona = _context(kind="persona_global", identity="")
+        calls = (
+            lambda: self.bridge.read_scoped_record(
+                self.capability, private, record_kind="memory", record_id="x"
+            ),
+            lambda: self.bridge.list_scoped_records(
+                self.capability, private, record_kind="memory"
+            ),
+            lambda: self.bridge.upsert_scoped_record(
+                self.capability, private, record_kind="memory", record_id="x", revision=1,
+                payload={"value": "must-not-write"}, event_id="prebind-write",
+            ),
+            lambda: self.bridge.tombstone_scoped_record(
+                self.capability, private, record_kind="memory", record_id="x", revision=1,
+                event_id="prebind-delete",
+            ),
+            lambda: self.bridge.tombstone_scoped_namespace(
+                self.capability, private, operation_id="prebind-namespace", reason_code="test"
+            ),
+            lambda: self.bridge.tombstone_scoped_identity_scopes(
+                self.capability, private, operation_id="prebind-identity", reason_code="test"
+            ),
+            lambda: self.bridge.erase_scoped_group_scopes(
+                self.capability, group, operation_id="prebind-group", reason_code="test"
+            ),
+            lambda: self.bridge.erase_scoped_persona_scopes(
+                self.capability, persona, operation_id="prebind-persona", reason_code="test"
+            ),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                self.assertEqual("namespace_scoped_api_not_bound", call()["code"])
+        self.assertIsNone(self.store.read(
+            NamespaceContext(**{key: value for key, value in private.items() if not key.startswith("contract_")}),
+            record_kind="memory", record_id="x",
+        ))
+
+    def test_deactivate_revokes_old_capability_and_probe_immediately(self) -> None:
+        self._bind()
+        self.assertTrue(self.bridge.bridge_lifecycle_status()["active"])
+        self.bridge.deactivate()
+        self.assertFalse(self.bridge.bridge_lifecycle_status()["active"])
+        namespace_probe = self.bridge.probe_namespace_context_capabilities()
+        self.assertFalse(namespace_probe["available"])
+        self.assertEqual("bridge_inactive", namespace_probe["error_code"])
+        personal_probe = self.bridge.probe_bot_personal_memory_capabilities()
+        self.assertFalse(personal_probe["available"])
+        self.assertIn("bridge_inactive", personal_probe["warnings"])
+        denied = self.bridge.read_scoped_record(
+            self.capability, _context(), record_kind="memory", record_id="x"
+        )
+        self.assertEqual("bridge_inactive", denied["code"])
+        self.assertIsNone(self.bridge.register_private_companion(self.companion))
+
     def test_private_group_and_identity_sentinels_are_isolated_through_bridge(self) -> None:
         self._bind()
         contexts = (
@@ -154,6 +211,11 @@ class ScopedBridgeTests(unittest.TestCase):
         reopened_bridge = MemoryCompanionBridge(reopened_service)
         reopened_capability = reopened_bridge.register_private_companion(self.companion)
         self.assertTrue(reopened_bridge.probe_namespace_context_capabilities()["available"])
+        current = reopened_bridge.bind_namespace_migration_epoch(
+            reopened_capability, operation_id="bind-reload", expected_previous_epoch="",
+            migration_epoch=EPOCH, policy_version=POLICY,
+        )
+        self.assertEqual("current", current["code"])
         failed = reopened_bridge.bind_namespace_migration_epoch(
             reopened_capability, operation_id="rotate-bad", expected_previous_epoch="wrong",
             migration_epoch="req041-20260811-001", policy_version="req041-v2",

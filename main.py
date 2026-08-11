@@ -419,6 +419,7 @@ class MemoryCompanionPlugin(Star):
 
     async def terminate(self):
         global _ACTIVE_BRIDGE
+        self.memory_companion.deactivate()
         if _ACTIVE_BRIDGE is self.memory_companion:
             _ACTIVE_BRIDGE = None
         await self.service.aclose()

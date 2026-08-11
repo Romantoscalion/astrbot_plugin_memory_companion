@@ -456,11 +456,22 @@ class MemoryCompanionBridge:
         self._capability_cache = CapabilityCache()
         self._emotion_producer_token = object()
         self._emotion_page_admin_token = object()
+        self._active = True
+
+    def bridge_lifecycle_status(self) -> dict[str, Any]:
+        """Expose only whether this in-process bridge can still serve calls."""
+        return {"active": self._active}
+
+    def deactivate(self) -> None:
+        """Revoke all issued capabilities before plugin service shutdown."""
+        self._active = False
+        self._emotion_producer_token = object()
+        self._emotion_page_admin_token = object()
 
     def register_emotion_producer(self, producer: Any) -> Any | None:
         """Issue a private Companion capability only to a live registered plugin."""
 
-        if not self._is_registered_private_companion(producer):
+        if not self._active or not self._is_registered_private_companion(producer):
             return None
         return _EmotionProducerCapability(self, producer, self._emotion_producer_token)
 
@@ -541,6 +552,8 @@ class MemoryCompanionBridge:
     def bind_emotion_page_api(self, page_api: Any) -> Any | None:
         """Issue a private diagnostic capability to this Memory plugin's Page API."""
 
+        if not self._active:
+            return None
         page_plugin = getattr(page_api, "plugin", None)
         if page_plugin is not self._plugin and getattr(page_plugin, "service", None) is not self._plugin:
             return None
@@ -611,7 +624,8 @@ class MemoryCompanionBridge:
 
     def _is_valid_emotion_producer_capability(self, capability: Any) -> bool:
         return (
-            type(capability) is _EmotionProducerCapability
+            self._active
+            and type(capability) is _EmotionProducerCapability
             and capability._bridge is self
             and capability._token is self._emotion_producer_token
             and self._is_registered_private_companion(capability._producer)
@@ -642,7 +656,8 @@ class MemoryCompanionBridge:
 
     def _is_valid_emotion_page_admin_capability(self, capability: Any) -> bool:
         return (
-            type(capability) is _EmotionPageAdminCapability
+            self._active
+            and type(capability) is _EmotionPageAdminCapability
             and capability._bridge is self
             and capability._token is self._emotion_page_admin_token
             and (
@@ -1603,6 +1618,8 @@ class MemoryCompanionBridge:
         must remain safe to call from ordinary chat paths even when the contract
         is stale or the local module is otherwise malformed.
         """
+        if not self._active:
+            return self._negative_personal_capability_probe("bridge_inactive")
         if self._capability_cache.snapshot().get("state") == "negative":
             return self.capability_status()
         try:
@@ -1687,7 +1704,7 @@ class MemoryCompanionBridge:
     def probe_namespace_context_capabilities(self) -> dict[str, Any]:
         """Advertise ready only after the store and active epoch are bound."""
         status = self._scoped_store.epoch_status() if self._scoped_store is not None else {"bound": False}
-        ready = status.get("bound") is True
+        ready = self._active and status.get("bound") is True
         return namespace_capability_descriptor(
             available=ready,
             methods=(
@@ -1700,7 +1717,11 @@ class MemoryCompanionBridge:
                 "tombstone_scoped_record",
                 "upsert_scoped_record",
             ) if ready else (),
-            error_code="" if ready else "namespace_scoped_api_not_bound",
+            error_code=(
+                "" if ready
+                else "bridge_inactive" if not self._active
+                else "namespace_scoped_api_not_bound"
+            ),
         )
 
     def bind_namespace_migration_epoch(
@@ -1712,6 +1733,8 @@ class MemoryCompanionBridge:
         migration_epoch: str,
         policy_version: str,
     ) -> dict[str, Any]:
+        if not self._active:
+            return {"ok": False, "state": "degraded", "code": "bridge_inactive"}
         if not self._is_valid_private_companion_capability(capability):
             return {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
         if self._scoped_store is None:
@@ -1735,10 +1758,14 @@ class MemoryCompanionBridge:
     def _authorized_scoped_context(
         self, capability: Any, namespace: Any
     ) -> tuple[Any | None, dict[str, Any] | None]:
+        if not self._active:
+            return None, {"ok": False, "state": "degraded", "code": "bridge_inactive"}
         if not self._is_valid_private_companion_capability(capability):
             return None, {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
         if self._scoped_store is None:
             return None, {"ok": False, "state": "degraded", "code": "namespace_scoped_store_unavailable"}
+        if self._scoped_store.epoch_status().get("bound") is not True:
+            return None, {"ok": False, "state": "degraded", "code": "namespace_scoped_api_not_bound"}
         errors = validate_namespace_context(namespace)
         if errors:
             return None, {"ok": False, "state": "rejected", "code": errors[0]}
