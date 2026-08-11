@@ -1348,7 +1348,7 @@ class MemoryCompanionService:
         if requested_session and session_target_id(requested_session, "private") != identity:
             return {**base, "error_code": "session_identity_mismatch"}
         try:
-            bridge_enabled = self.config.bridge_enabled()
+            bridge_enabled = self.config.bool("private_companion_bridge.enabled", True)
         except Exception:
             return {**base, "error_code": "bridge_config_unavailable"}
         if bridge_enabled is not True:

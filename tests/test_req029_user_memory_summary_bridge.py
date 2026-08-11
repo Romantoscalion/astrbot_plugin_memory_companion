@@ -21,8 +21,10 @@ class _Config:
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
 
-    def bridge_enabled(self) -> bool:
-        return self.enabled
+    def bool(self, dotted: str, default: bool) -> bool:
+        if dotted == "private_companion_bridge.enabled":
+            return self.enabled
+        return default
 
 
 class Req029UserMemorySummaryBridgeTests(unittest.IsolatedAsyncioTestCase):
