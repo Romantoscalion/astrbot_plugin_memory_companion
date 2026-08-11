@@ -451,12 +451,26 @@ class MemoryCompanionBridge:
 
     def __init__(self, plugin: Any):
         self._plugin = plugin
-        candidate_scoped_store = getattr(plugin, "scoped_store", None)
-        self._scoped_store = candidate_scoped_store if isinstance(candidate_scoped_store, ScopedStore) else None
+        self.__scoped_store: ScopedStore | None = None
+        self.__scoped_store_resolved = False
         self._capability_cache = CapabilityCache()
         self._emotion_producer_token = object()
         self._emotion_page_admin_token = object()
         self._active = True
+
+    @property
+    def _scoped_store(self) -> ScopedStore | None:
+        """Resolve the namespace store only when a namespace API is used.
+
+        Bot-personal capability probes are pure contract probes and must not
+        touch plugin services or databases merely because a Bridge object was
+        constructed.
+        """
+        if not self.__scoped_store_resolved:
+            candidate = getattr(self._plugin, "scoped_store", None)
+            self.__scoped_store = candidate if isinstance(candidate, ScopedStore) else None
+            self.__scoped_store_resolved = True
+        return self.__scoped_store
 
     def bridge_lifecycle_status(self) -> dict[str, Any]:
         """Expose only whether this in-process bridge can still serve calls."""
