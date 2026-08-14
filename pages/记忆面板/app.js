@@ -47,7 +47,7 @@ const SECONDARY_NAV = {
     { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
     { id: "conversation-import", label: "历史聊天导入", sublabel: "QQ 直读、文件与最近任务", badge: "导入" },
     { id: "config:memory_capture", label: "记忆捕获", sublabel: "记录用户消息与稳定事实", badge: "捕获" },
-    { id: "config:memory_summary", label: "长期总结", sublabel: "阶段总结模型与阈值", badge: "总结" },
+    { id: "config:memory_summary", label: "长期总结", sublabel: "私聊 / 群聊模型与阈值", badge: "总结" },
     { id: "config:historical_chat_import", label: "导入参数", sublabel: "QQ 分页与分段上限", badge: "参数" },
     { id: "config:conversation_memory", label: "连续对话", sublabel: "群聊片段与低信息保护", badge: "连续" },
     { id: "retrieval", label: "检索召回", sublabel: "候选、Embedding、Rerank", badge: "召回" },
@@ -91,7 +91,7 @@ const CONFIG_MODULE_GUIDES = {
   },
   memory_summary: {
     purpose: "把时间线整理成长期可召回的阶段性记忆，是从流水到长期记忆的主要入口。",
-    tune: "总结太慢时提高触发阈值；总结不及时或连续性弱时降低最少事件数和触发条数。",
+    tune: "可为私聊和群聊分别选择总结 Provider；总结太慢时提高触发阈值，总结不及时或连续性弱时降低最少事件数和触发条数。",
     avoid: "不要把单次总结事件上限调得过大，输入太长会降低总结质量。",
   },
   historical_chat_import: {
@@ -4070,12 +4070,17 @@ function renderSchemaConfigField(module, key, item = {}, value, data = {}) {
     if (current && !options.some((option) => option.id === current)) {
       options.push({ id: current, label: `${current}（当前配置）` });
     }
+    const providerPlaceholder = key === "private_provider_id" || key === "group_provider_id"
+      ? "留空沿用通用总结模型"
+      : key === "private_fallback_provider_id" || key === "group_fallback_provider_id"
+        ? "留空沿用通用备用模型"
+        : "留空使用当前会话模型";
     control = `
       <div class="provider-inline retrieval-provider-picker">
         <select data-config-provider-select="${escapeHtml(key)}">
           ${options.map((option) => `<option value="${escapeHtml(option.id || "")}"${String(option.id || "") === String(current || "") ? " selected" : ""}>${escapeHtml(option.label || option.id || "不指定")}</option>`).join("")}
         </select>
-        <input name="${escapeHtml(key)}" type="text" value="${escapeHtml(current)}" placeholder="留空使用当前会话模型" />
+        <input name="${escapeHtml(key)}" type="text" value="${escapeHtml(current)}" placeholder="${providerPlaceholder}" />
       </div>
     `;
   } else {

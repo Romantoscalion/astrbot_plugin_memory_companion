@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -9,6 +10,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PanelRegressionTests(unittest.TestCase):
+    def test_summary_models_have_private_and_group_configuration(self) -> None:
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        summary_items = schema["memory_summary"]["items"]
+        for key in (
+            "private_provider_id",
+            "private_fallback_provider_id",
+            "group_provider_id",
+            "group_fallback_provider_id",
+        ):
+            self.assertEqual("select_provider", summary_items[key]["_special"])
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('sublabel: "私聊 / 群聊模型与阈值"', script)
+        self.assertIn('key === "private_provider_id" || key === "group_provider_id"', script)
+
     def test_webview_actions_do_not_depend_on_native_dialogs(self) -> None:
         script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
 

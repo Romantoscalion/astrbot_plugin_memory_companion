@@ -4030,25 +4030,37 @@ class MemoryCompanionService:
         return result
 
     async def _summary_provider_attempts(self, ctx: SessionContext) -> list[dict[str, Any]]:
-        scoped_provider_key = {
-            "private": "private_provider_id",
-            "group": "group_provider_id",
-        }.get(clean_text(ctx.scope, 40).lower(), "")
-        preferred: list[tuple[str, str]] = []
-        if scoped_provider_key:
-            scoped_provider_id = clean_text(
-                self.config.get(f"memory_summary.{scoped_provider_key}", ""),
-                120,
+        """Resolve summary providers with private/group-specific overrides.
+
+        The original ``provider_id``/``fallback_provider_id`` pair remains a
+        shared compatibility fallback.  A scene-specific pair takes
+        precedence when configured, while the generic pair is still tried
+        before falling back to the provider currently active for the session.
+        This keeps existing installations working and lets private and group
+        timelines use independent models.
+        """
+        scope = clean_text(getattr(ctx, "scope", ""), 40).lower()
+        scene = "group" if scope == "group" else "private" if scope == "private" else ""
+        if not scene:
+            return await self._provider_attempts(
+                ctx,
+                prefix="memory_summary",
+                provider_key="provider_id",
+                fallback_provider_key="fallback_provider_id",
+                include_current=True,
             )
-            if scoped_provider_id:
-                preferred.append((f"{ctx.scope}_primary", scoped_provider_id))
+
+        # Resolve scene-specific providers first, then preserve the legacy
+        # generic pair as a second chance. The helper de-duplicates provider
+        # IDs/objects so equal scene and generic settings are only called once.
         return await self._provider_attempts(
             ctx,
             prefix="memory_summary",
-            provider_key="provider_id",
-            fallback_provider_key="fallback_provider_id",
+            provider_key=f"{scene}_provider_id",
+            fallback_provider_key=f"{scene}_fallback_provider_id",
             include_current=True,
-            preferred=preferred,
+            compatibility_provider_key="provider_id",
+            compatibility_fallback_provider_key="fallback_provider_id",
         )
 
     async def _provider_attempts(
@@ -4059,21 +4071,34 @@ class MemoryCompanionService:
         provider_key: str,
         fallback_provider_key: str,
         include_current: bool,
-        preferred: list[tuple[str, str]] | None = None,
+        compatibility_provider_key: str = "",
+        compatibility_fallback_provider_key: str = "",
     ) -> list[dict[str, Any]]:
         attempts: list[dict[str, Any]] = []
         seen: set[str] = set()
         seen_provider_objects: set[int] = set()
-        configured = list(preferred or []) + [
-            (
-                "primary",
-                clean_text(self.config.get(f"{prefix}.{provider_key}", ""), 120),
-            ),
-            (
-                "fallback",
-                clean_text(self.config.get(f"{prefix}.{fallback_provider_key}", ""), 120),
-            ),
-        ]
+        configured: list[tuple[str, str]] = []
+        primary_id = clean_text(self.config.get(f"{prefix}.{provider_key}", ""), 120)
+        fallback_id = clean_text(self.config.get(f"{prefix}.{fallback_provider_key}", ""), 120)
+        compatibility_primary_id = clean_text(
+            self.config.get(f"{prefix}.{compatibility_provider_key}", ""),
+            120,
+        ) if compatibility_provider_key else ""
+        compatibility_fallback_id = clean_text(
+            self.config.get(f"{prefix}.{compatibility_fallback_provider_key}", ""),
+            120,
+        ) if compatibility_fallback_provider_key else ""
+        # Keep each scene's primary/fallback together, then use the legacy
+        # generic pair. This makes a dedicated fallback meaningful while
+        # preserving old configurations during gradual migration.
+        if primary_id:
+            configured.append(("primary" if not compatibility_provider_key else "scene_primary", primary_id))
+        if fallback_id:
+            configured.append(("fallback" if not compatibility_provider_key else "scene_fallback", fallback_id))
+        if compatibility_primary_id:
+            configured.append(("primary", compatibility_primary_id))
+        if compatibility_fallback_id:
+            configured.append(("fallback", compatibility_fallback_id))
         for source, provider_id in configured:
             if not provider_id:
                 continue
