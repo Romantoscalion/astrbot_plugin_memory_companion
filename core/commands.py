@@ -169,9 +169,8 @@ class MemoryCompanionCommandHandler:
     async def promote(self, memory_id: str = "") -> str:
         if not memory_id:
             return "用法：/mcomp promote <memory_id>"
-        ok_review = await self.service.store.update_review_status(memory_id, "auto")
-        ok_lifecycle = await self.service.store.update_memory_lifecycle(memory_id, "stable_memory")
-        return "已提升为稳定记忆。" if ok_review or ok_lifecycle else "没有找到这条记忆。"
+        ok = await self.service.store.update_review_status(memory_id, "auto")
+        return "已提升为稳定记忆。" if ok else "没有找到这条记忆。"
 
     async def archive(self, memory_id: str = "") -> str:
         if not memory_id:

@@ -104,6 +104,115 @@ class Req036PortraitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["ok"])
         self.assertTrue(any("烤肉" in item["summary"] for item in summary["items"]))
 
+    async def test_new_single_value_portrait_fact_supersedes_previous_value(
+        self,
+    ) -> None:
+        store = self.make_store()
+        service = PortraitService(store, _Config())
+        event = types.SimpleNamespace(
+            private_companion_unified_profile_context=self.dto()
+        )
+        for message_id, text in (
+            ("address-old", "以后叫我宝宝"),
+            ("address-new", "以后叫我主人"),
+        ):
+            result = await service.capture_user_message(
+                SessionContext(
+                    session_id="onebot:FriendMessage:10001",
+                    scope="private",
+                    platform="onebot",
+                    user_id="10001",
+                    message_id=message_id,
+                    message_text=text,
+                ),
+                event=event,
+            )
+            self.assertTrue(result["ok"])
+
+        summary = await service.read_summary(self.request())
+        addresses = [
+            item["summary"]
+            for item in summary["items"]
+            if item["dimension"] == "preferred_address"
+        ]
+        self.assertEqual(["希望被称为 主人"], addresses)
+        rows = store._conn.execute(
+            "SELECT status, supersedes_id FROM portrait_facts "
+            "WHERE person_id=? AND dimension='preferred_address' "
+            "ORDER BY created_at",
+            (PERSON_REF["person_id"],),
+        ).fetchall()
+        self.assertEqual(["superseded", "active"], [row["status"] for row in rows])
+        self.assertTrue(rows[0]["supersedes_id"])
+
+    async def test_single_value_portrait_supersedes_across_tiers_and_queue(
+        self,
+    ) -> None:
+        store = self.make_store()
+        first = await store.upsert_portrait_fact(
+            {
+                "person_id": PERSON_REF["person_id"],
+                "dimension": "preferred_address",
+                "profile_cardinality": "single",
+                "normalized_claim_hash": "a" * 64,
+                "claim_summary": "希望被称为 宝宝",
+                "portrait_tier": "base",
+                "producer_kind": "rule_explicit",
+                "producer_version": "req036.rule.v2",
+                "derivation_kind": "explicit_statement",
+                "epistemic_status": "explicit",
+                "source_scope": "private",
+                "usable_scope": "self_low_global",
+                "confidence": 0.95,
+                "sensitivity": "low",
+                "status": "active",
+                "evidence_hashes": ["c" * 64],
+                "operation_id": "cross-tier-base",
+            }
+        )
+        await store.enqueue_portrait_learning(
+            person_id=PERSON_REF["person_id"],
+            fact_id=first["fact_id"],
+            evidence_hash="c" * 64,
+        )
+        second = await store.upsert_portrait_fact(
+            {
+                "person_id": PERSON_REF["person_id"],
+                "dimension": "preferred_address",
+                "profile_cardinality": "single",
+                "normalized_claim_hash": "b" * 64,
+                "claim_summary": "希望被称为 主人",
+                "portrait_tier": "intelligent",
+                "producer_kind": "daily_evidence_batch",
+                "producer_version": "req036.batch.v1",
+                "derivation_kind": "independent_evidence_aggregate",
+                "epistemic_status": "inferred",
+                "source_scope": "private",
+                "usable_scope": "self_low_global",
+                "confidence": 0.96,
+                "sensitivity": "low",
+                "status": "active",
+                "evidence_hashes": ["d" * 64],
+                "operation_id": "cross-tier-intelligent",
+            }
+        )
+
+        old = store._conn.execute(
+            "SELECT status, supersedes_id FROM portrait_facts WHERE id=?",
+            (first["fact_id"],),
+        ).fetchone()
+        new = store._conn.execute(
+            "SELECT status FROM portrait_facts WHERE id=?", (second["fact_id"],)
+        ).fetchone()
+        queue = store._conn.execute(
+            "SELECT state FROM portrait_learning_queue WHERE fact_id=?",
+            (first["fact_id"],),
+        ).fetchone()
+        self.assertEqual("superseded", old["status"])
+        self.assertEqual(second["fact_id"], old["supersedes_id"])
+        self.assertEqual("active", new["status"])
+        self.assertEqual("superseded", queue["state"])
+
     async def test_mechanical_repeats_do_not_satisfy_independent_evidence_threshold(self) -> None:
         store = self.make_store()
         service = PortraitService(store, _Config())
@@ -227,6 +336,49 @@ class Req036PortraitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], private["items"])
         self.assertEqual(1, len(group_a["items"]))
         self.assertEqual([], group_b["items"])
+
+    async def test_legacy_rule_v1_fact_is_not_returned_before_governance(
+        self,
+    ) -> None:
+        store = self.make_store()
+        await store.upsert_portrait_person_projection(
+            PERSON_REF,
+            build_capability_summary(
+                {
+                    "private_companion_enabled": True,
+                    "proactive_private_enabled": False,
+                    "portrait_mode": "use_existing",
+                }
+            ),
+        )
+        inserted = await store.upsert_portrait_fact(
+            {
+                "person_id": PERSON_REF["person_id"],
+                "dimension": "preferred_address",
+                "profile_cardinality": "single",
+                "normalized_claim_hash": "d" * 64,
+                "claim_summary": "希望被称为 错误旧称呼",
+                "portrait_tier": "base",
+                "producer_kind": "rule_explicit",
+                "producer_version": "req036.rule.v1",
+                "derivation_kind": "explicit_statement",
+                "epistemic_status": "explicit",
+                "source_scope": "private",
+                "usable_scope": "self_low_global",
+                "confidence": 0.99,
+                "sensitivity": "low",
+                "status": "active",
+                "evidence_hashes": ["e" * 64],
+                "operation_id": "legacy-v1-fact",
+            }
+        )
+        self.assertTrue(inserted["ok"])
+
+        summary = await store.portrait_summary(
+            PERSON_REF["person_id"], scope="private"
+        )
+
+        self.assertEqual([], summary["items"])
 
     async def test_cross_scene_allowlist_keeps_schedule_like_habits_in_source_scope(self) -> None:
         store = self.make_store()

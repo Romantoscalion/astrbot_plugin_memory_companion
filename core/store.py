@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import math
+
 from contextlib import closing, contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -14,14 +17,46 @@ from typing import Any
 from .identity import parse_scope_from_session
 from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads, new_id, stable_fingerprint, utc_now
 from .portrait import cross_scene_whitelisted_fact
+from .profile_quality import normalize_profile_value, profile_quality_decision
 
 
 class MemoryStore:
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
 
-    def __init__(self, db_path: Path):
+    PROFILE_MEMORY_TYPES = frozenset({"user_profile", "user_preference", "user_habit"})
+
+    PROFILE_RULE_EXTRACTORS = frozenset({"rule_v1", "rule_v2"})
+
+    PROFILE_RULE_PORTRAIT_VERSIONS = frozenset(
+        {"req036.rule.v1", "req036.rule.v2"}
+    )
+
+    PROFILE_SINGLE_VALUE_DIMENSIONS = frozenset(
+        {
+            "preferred_address",
+            "name",
+            "birthday",
+            "birth_date",
+            "occupation",
+            "profession",
+            "education",
+            "major",
+            "zodiac",
+            "zodiac_or_blood_type",
+            "blood_type",
+        }
+    )
+
+    def __init__(self, db_path: Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = bool(read_only)
+        if self._read_only:
+            if not self.db_path.is_file():
+                raise FileNotFoundError(
+                    f"memory database does not exist: {self.db_path}"
+                )
+        else:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = self._open_connection()
         self._lock = threading.RLock()
         self._closed = False
@@ -38,15 +73,22 @@ class MemoryStore:
         self._database_recovery_successes = 0
 
     def _open_connection(self) -> sqlite3.Connection:
+        database = str(self.db_path)
+        uri = False
+        if self._read_only:
+            database = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            uri = True
         connection = sqlite3.connect(
-            str(self.db_path),
+            database,
             timeout=3.0,
             check_same_thread=False,
+            uri=uri,
         )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=3000")
-        connection.execute("PRAGMA wal_autocheckpoint=500")
+        if not self._read_only:
+            connection.execute("PRAGMA wal_autocheckpoint=500")
         return connection
 
     @staticmethod
@@ -196,6 +238,21 @@ class MemoryStore:
             self._conn.commit()
 
     def initialize(self) -> None:
+        if self._read_only:
+            with self._lock:
+                memories = self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'"
+                ).fetchone()
+                if memories is None:
+                    raise sqlite3.DatabaseError(
+                        "memory database schema is missing the memories table"
+                    )
+                self._fts_enabled = bool(
+                    self._conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_fts'"
+                    ).fetchone()
+                )
+            return
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
@@ -616,6 +673,18 @@ class MemoryStore:
                     payload_hash TEXT NOT NULL DEFAULT '',
                     snapshot TEXT NOT NULL DEFAULT '{}',
                     state TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS profile_repair_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    rule_version TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT '',
+                    backup_path TEXT NOT NULL DEFAULT '',
+                    plan_fingerprint TEXT NOT NULL DEFAULT '',
+                    snapshot TEXT NOT NULL DEFAULT '{}',
+                    result TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT ''
                 );
@@ -1188,79 +1257,122 @@ class MemoryStore:
             clean_text(item, 80) for item in (fact.get("evidence_hashes") or [])
             if re.fullmatch(r"[0-9a-f]{64}", clean_text(item, 80))
         ][:16]
+        status = clean_text(fact.get("status"), 40) or "active"
+        cardinality = clean_text(fact.get("profile_cardinality"), 20).lower()
+        single_value = (
+            cardinality == "single"
+            or dimension in self.PROFILE_SINGLE_VALUE_DIMENSIONS
+        )
         with self._lock:
-            if self._portrait_suppressed_sync(person_id, dimension, claim_hash, source_scope):
-                return {"ok": False, "code": "portrait_suppressed", "created": False}
-            previous = self._conn.execute(
-                """
-                SELECT * FROM portrait_facts WHERE person_id=? AND dimension=?
-                  AND normalized_claim_hash=? AND portrait_tier=? AND source_scope=?
-                """,
-                (person_id, dimension, claim_hash, tier, source_scope),
-            ).fetchone()
-            previous_hashes = json_loads(previous["evidence_hashes"], []) if previous is not None else []
-            merged_hashes = list(dict.fromkeys([
-                clean_text(item, 80) for item in previous_hashes + evidence_hashes if clean_text(item, 80)
-            ]))[:16]
-            fact_id = clean_text(previous["id"], 120) if previous is not None else f"portrait_{stable_fingerprint(person_id, dimension, claim_hash, tier, source_scope)[:24]}"
-            revision = int(previous["revision"] or 0) + 1 if previous is not None else 1
-            first_at = clean_text(previous["first_evidence_at"], 80) if previous is not None else now
-            sensitivity = clean_text(fact.get("sensitivity"), 24)
-            if sensitivity not in {"low", "sensitive", "high"}:
-                sensitivity = "high"
-            usable_scope = clean_text(fact.get("usable_scope"), 80)
-            if usable_scope == "self_low_global" and cross_scene_whitelisted_fact(
-                dimension=dimension,
-                claim_summary=fact.get("claim_summary"),
-                sensitivity=sensitivity,
-                source_scope=source_scope,
-            ):
-                usable_scope = "self_low_global"
-            else:
-                usable_scope = "source_only"
-            self._conn.execute(
-                """
-                INSERT INTO portrait_facts(
-                    id, person_id, dimension, normalized_claim_hash, claim_summary, portrait_tier,
-                    producer_kind, producer_version, derivation_kind, epistemic_status, source_scope,
-                    usable_scope, confidence, sensitivity, status, evidence_hashes, context_refs,
-                    first_evidence_at, last_evidence_at, expires_at, supersedes_id, revision,
-                    operation_id, created_at, updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(person_id, dimension, normalized_claim_hash, portrait_tier, source_scope) DO UPDATE SET
-                    claim_summary=excluded.claim_summary,
-                    producer_kind=excluded.producer_kind,
-                    producer_version=excluded.producer_version,
-                    derivation_kind=excluded.derivation_kind,
-                    epistemic_status=excluded.epistemic_status,
-                    usable_scope=excluded.usable_scope,
-                    confidence=max(portrait_facts.confidence, excluded.confidence),
-                    sensitivity=excluded.sensitivity,
-                    status=excluded.status,
-                    evidence_hashes=excluded.evidence_hashes,
-                    context_refs=excluded.context_refs,
-                    last_evidence_at=excluded.last_evidence_at,
-                    expires_at=excluded.expires_at,
-                    supersedes_id=excluded.supersedes_id,
-                    revision=excluded.revision,
-                    operation_id=excluded.operation_id,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    fact_id, person_id, dimension, claim_hash, clean_text(fact.get("claim_summary"), 180), tier,
-                    clean_text(fact.get("producer_kind"), 80), clean_text(fact.get("producer_version"), 80),
-                    clean_text(fact.get("derivation_kind"), 80), clean_text(fact.get("epistemic_status"), 80),
-                    source_scope, usable_scope, max(0.0, min(1.0, float(fact.get("confidence") or 0.0))),
-                    sensitivity, clean_text(fact.get("status"), 40) or "active", json_dumps(merged_hashes),
-                    json_dumps([clean_text(item, 160) for item in (fact.get("context_refs") or []) if clean_text(item, 160)][:8]),
-                    first_at, now, clean_text(fact.get("expires_at"), 80), clean_text(fact.get("supersedes_id"), 120),
-                    revision, clean_text(fact.get("operation_id"), 120),
-                    clean_text(previous["created_at"], 80) if previous is not None else now, now,
-                ),
-            )
-            portrait_revision = self._bump_portrait_revision_sync(person_id)
-            self._conn.commit()
-        return {"ok": True, "code": "portrait_fact_upserted", "created": previous is None, "fact_id": fact_id, "portrait_revision": portrait_revision}
+            with self._transaction_sync():
+                if self._portrait_suppressed_sync(person_id, dimension, claim_hash, source_scope):
+                    return {"ok": False, "code": "portrait_suppressed", "created": False}
+                previous = self._conn.execute(
+                    """
+                    SELECT * FROM portrait_facts WHERE person_id=? AND dimension=?
+                      AND normalized_claim_hash=? AND portrait_tier=? AND source_scope=?
+                    """,
+                    (person_id, dimension, claim_hash, tier, source_scope),
+                ).fetchone()
+                previous_hashes = json_loads(previous["evidence_hashes"], []) if previous is not None else []
+                merged_hashes = list(dict.fromkeys([
+                    clean_text(item, 80) for item in previous_hashes + evidence_hashes if clean_text(item, 80)
+                ]))[:16]
+                fact_id = clean_text(previous["id"], 120) if previous is not None else f"portrait_{stable_fingerprint(person_id, dimension, claim_hash, tier, source_scope)[:24]}"
+                revision = int(previous["revision"] or 0) + 1 if previous is not None else 1
+                first_at = clean_text(previous["first_evidence_at"], 80) if previous is not None else now
+                sensitivity = clean_text(fact.get("sensitivity"), 24)
+                if sensitivity not in {"low", "sensitive", "high"}:
+                    sensitivity = "high"
+                usable_scope = clean_text(fact.get("usable_scope"), 80)
+                if usable_scope == "self_low_global" and cross_scene_whitelisted_fact(
+                    dimension=dimension,
+                    claim_summary=fact.get("claim_summary"),
+                    sensitivity=sensitivity,
+                    source_scope=source_scope,
+                ):
+                    usable_scope = "self_low_global"
+                else:
+                    usable_scope = "source_only"
+                self._conn.execute(
+                    """
+                    INSERT INTO portrait_facts(
+                        id, person_id, dimension, normalized_claim_hash, claim_summary, portrait_tier,
+                        producer_kind, producer_version, derivation_kind, epistemic_status, source_scope,
+                        usable_scope, confidence, sensitivity, status, evidence_hashes, context_refs,
+                        first_evidence_at, last_evidence_at, expires_at, supersedes_id, revision,
+                        operation_id, created_at, updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(person_id, dimension, normalized_claim_hash, portrait_tier, source_scope) DO UPDATE SET
+                        claim_summary=excluded.claim_summary,
+                        producer_kind=excluded.producer_kind,
+                        producer_version=excluded.producer_version,
+                        derivation_kind=excluded.derivation_kind,
+                        epistemic_status=excluded.epistemic_status,
+                        usable_scope=excluded.usable_scope,
+                        confidence=max(portrait_facts.confidence, excluded.confidence),
+                        sensitivity=excluded.sensitivity,
+                        status=excluded.status,
+                        evidence_hashes=excluded.evidence_hashes,
+                        context_refs=excluded.context_refs,
+                        last_evidence_at=excluded.last_evidence_at,
+                        expires_at=excluded.expires_at,
+                        supersedes_id=excluded.supersedes_id,
+                        revision=excluded.revision,
+                        operation_id=excluded.operation_id,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        fact_id, person_id, dimension, claim_hash, clean_text(fact.get("claim_summary"), 180), tier,
+                        clean_text(fact.get("producer_kind"), 80), clean_text(fact.get("producer_version"), 80),
+                        clean_text(fact.get("derivation_kind"), 80), clean_text(fact.get("epistemic_status"), 80),
+                        source_scope, usable_scope, max(0.0, min(1.0, float(fact.get("confidence") or 0.0))),
+                        sensitivity, status, json_dumps(merged_hashes),
+                        json_dumps([clean_text(item, 160) for item in (fact.get("context_refs") or []) if clean_text(item, 160)][:8]),
+                        first_at, now, clean_text(fact.get("expires_at"), 80), clean_text(fact.get("supersedes_id"), 120),
+                        revision, clean_text(fact.get("operation_id"), 120),
+                        clean_text(previous["created_at"], 80) if previous is not None else now, now,
+                    ),
+                )
+                superseded_ids: list[str] = []
+                if status == "active" and single_value:
+                    superseded_rows = self._conn.execute(
+                        """
+                        SELECT id FROM portrait_facts
+                        WHERE person_id=? AND dimension=?
+                          AND source_scope=? AND status='active' AND id!=?
+                        """,
+                        (person_id, dimension, source_scope, fact_id),
+                    ).fetchall()
+                    superseded_ids = [clean_text(row["id"], 120) for row in superseded_rows]
+                    if superseded_ids:
+                        placeholders = ",".join("?" for _ in superseded_ids)
+                        self._conn.execute(
+                            f"""
+                            UPDATE portrait_facts
+                            SET status='superseded', supersedes_id=?, revision=revision+1,
+                                operation_id=?, updated_at=?
+                            WHERE id IN ({placeholders})
+                            """,
+                            [fact_id, clean_text(fact.get("operation_id"), 120), now, *superseded_ids],
+                        )
+                        self._conn.execute(
+                            f"""
+                            UPDATE portrait_learning_queue
+                            SET state='superseded', updated_at=?
+                            WHERE fact_id IN ({placeholders}) AND state='pending'
+                            """,
+                            [now, *superseded_ids],
+                        )
+                portrait_revision = self._bump_portrait_revision_sync(person_id)
+        return {
+            "ok": True,
+            "code": "portrait_fact_upserted",
+            "created": previous is None,
+            "fact_id": fact_id,
+            "portrait_revision": portrait_revision,
+            "superseded": len(superseded_ids),
+        }
 
     async def list_portrait_evidence(self, person_id: str, *, limit: int = 64) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._list_portrait_evidence_sync, person_id, limit)
@@ -1505,7 +1617,11 @@ class MemoryStore:
             capabilities = json_loads(person["capability_summary"], {})
             if not bool(capabilities.get("portrait_usage_enabled")):
                 return {"ok": False, "code": "portrait_usage_disabled", "items": [], "portrait_revision": int(person["portrait_revision"] or 0)}
-            query = "SELECT * FROM portrait_facts WHERE person_id=? AND status='active'"
+            query = (
+                "SELECT * FROM portrait_facts "
+                "WHERE person_id=? AND status='active' "
+                "AND producer_version!='req036.rule.v1'"
+            )
             params: list[Any] = [person_id]
             if low_only:
                 query += " AND sensitivity='low'"
@@ -2188,6 +2304,2156 @@ class MemoryStore:
         from_where, from_params = self._session_target_where("from_session", scope, value)
         to_where, to_params = self._session_target_where("to_session", scope, value)
         return (f"{from_where} OR {to_where}", [*from_params, *to_params])
+
+    @staticmethod
+    def profile_memory_fingerprint(record: MemoryRecord) -> str:
+        """Fingerprint fields governed by profile repair, excluding access counters."""
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        payload = {
+            "id": record.id,
+            "memory_type": record.memory_type,
+            "subject": {
+                "kind": record.subject.kind,
+                "id": record.subject.id,
+                "name": record.subject.name,
+                "role": record.subject.role,
+            },
+            "object": {
+                "kind": record.object.kind,
+                "id": record.object.id,
+                "name": record.object.name,
+                "role": record.object.role,
+            },
+            "scope": record.scope,
+            "session_id": record.session_id,
+            "platform": record.platform,
+            "message_id": record.message_id,
+            "group_id": record.group_id,
+            "visibility": record.visibility,
+            "sayability": record.sayability,
+            "reality_level": record.reality_level,
+            "lifecycle": record.lifecycle,
+            "content": record.content,
+            "evidence": record.evidence,
+            "confidence": record.confidence,
+            "importance": record.importance,
+            "review_status": record.review_status,
+            "tags": list(record.tags or []),
+            "metadata": metadata,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "occurred_at": record.occurred_at,
+            "source_plugin": record.source_plugin,
+            "import_batch_id": record.import_batch_id,
+            "content_fingerprint": record.content_fingerprint,
+            "merged_count": record.merged_count,
+            "supersedes_id": record.supersedes_id,
+        }
+        raw = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def profile_repair_plan_fingerprint(actions: list[dict[str, Any]]) -> str:
+        """Return a deterministic fingerprint for an ordered repair action plan."""
+        raw = json.dumps(
+            actions, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def profile_repair_group_id(record_id: Any) -> str:
+        record_id = clean_text(record_id, 120)
+        return (
+            "profile_group_"
+            + stable_fingerprint("profile_repair_group", record_id)[:24]
+            if record_id
+            else ""
+        )
+
+    @staticmethod
+    def profile_portrait_fact_fingerprint(fact: Any) -> str:
+        data = dict(fact) if fact is not None else {}
+        fields = (
+            "id",
+            "person_id",
+            "dimension",
+            "normalized_claim_hash",
+            "claim_summary",
+            "portrait_tier",
+            "producer_kind",
+            "producer_version",
+            "derivation_kind",
+            "epistemic_status",
+            "source_scope",
+            "usable_scope",
+            "confidence",
+            "sensitivity",
+            "status",
+            "evidence_hashes",
+            "context_refs",
+            "first_evidence_at",
+            "last_evidence_at",
+            "expires_at",
+            "supersedes_id",
+            "revision",
+            "operation_id",
+            "created_at",
+            "updated_at",
+        )
+        payload = {field: data.get(field) for field in fields}
+        raw = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def profile_portrait_queue_fingerprint(rows: Any) -> str:
+        normalized = sorted(
+            (dict(row) for row in (rows or [])),
+            key=lambda item: (
+                clean_text(item.get("queue_id"), 120),
+                clean_text(item.get("evidence_hash"), 80),
+            ),
+        )
+        raw = json.dumps(
+            normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _memory_db_snapshot(record: MemoryRecord) -> dict[str, Any]:
+        return dict(record.to_db())
+
+    @staticmethod
+    def _memory_from_db_snapshot(snapshot: dict[str, Any]) -> MemoryRecord:
+        return MemoryRecord.from_row(snapshot)
+
+    def _write_memory_record_sync(self, record: MemoryRecord) -> sqlite3.Row:
+        record.ensure_defaults()
+        data = record.to_db()
+        columns = ", ".join(data.keys())
+        placeholders = ", ".join(f":{key}" for key in data)
+        updates = ", ".join(f"{key}=excluded.{key}" for key in data if key != "id")
+        self._conn.execute(
+            f"INSERT INTO memories ({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT(id) DO UPDATE SET {updates}",
+            data,
+        )
+        row = self._conn.execute(
+            "SELECT * FROM memories WHERE id=?", (record.id,)
+        ).fetchone()
+        self._upsert_memory_fts_row(row)
+        return row
+
+    @staticmethod
+    def _profile_evidence_refs(record: MemoryRecord) -> list[str]:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        raw_refs: list[Any] = []
+        for key in ("profile_evidence_refs", "source_memory_ids", "evidence_refs"):
+            value = metadata.get(key)
+            if isinstance(value, list):
+                raw_refs.extend(value)
+        source_memory_id = clean_text(metadata.get("source_memory_id"), 160)
+        if source_memory_id:
+            raw_refs.append(source_memory_id)
+        elif not raw_refs and record.message_id:
+            raw_refs.append(record.message_id)
+        refs = [clean_text(value, 160) for value in raw_refs if clean_text(value, 160)]
+        if not refs:
+            refs = [
+                "fallback:"
+                + stable_fingerprint(
+                    record.scope,
+                    record.session_id,
+                    record.subject.id,
+                    record.evidence,
+                )
+            ]
+        return list(dict.fromkeys(refs))[:256]
+
+    @staticmethod
+    def _profile_incoming_evidence_refs(record: MemoryRecord) -> list[str]:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        source_memory_id = clean_text(metadata.get("source_memory_id"), 160)
+        if source_memory_id:
+            return [source_memory_id]
+        message_id = clean_text(record.message_id, 160)
+        if message_id:
+            return [message_id]
+        return [
+            "fallback:"
+            + stable_fingerprint(
+                record.scope,
+                record.session_id,
+                record.subject.id,
+                record.evidence,
+            )
+        ]
+
+    @staticmethod
+    def _profile_evidence_text(records: list[MemoryRecord]) -> str:
+        parts: list[str] = []
+        for record in records:
+            for part in clean_text(record.evidence, 4000).split("\n---\n"):
+                cleaned = clean_text(part, 1200)
+                if cleaned and cleaned not in parts:
+                    parts.append(cleaned)
+        return clean_text("\n---\n".join(parts), 4000)
+
+    @staticmethod
+    def _profile_statement_fingerprints(record: MemoryRecord) -> list[str]:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        raw = metadata.get("profile_statement_fingerprints")
+        values = (
+            [clean_text(item, 80) for item in raw if clean_text(item, 80)]
+            if isinstance(raw, list)
+            else []
+        )
+        if not values and clean_text(record.evidence, 4000):
+            values.append(
+                stable_fingerprint("profile_statement", record.evidence.casefold())
+            )
+        return list(dict.fromkeys(values))[:256]
+
+    @staticmethod
+    def _profile_incoming_statement_fingerprints(
+        record: MemoryRecord,
+    ) -> list[str]:
+        evidence = clean_text(record.evidence, 4000)
+        if not evidence:
+            return []
+        return [stable_fingerprint("profile_statement", evidence.casefold())]
+
+    @staticmethod
+    def _profile_evidence_passes_quality_gate(record: MemoryRecord) -> bool:
+        metadata = dict(record.metadata) if isinstance(record.metadata, dict) else {}
+        metadata["profile_state"] = "active"
+        metadata["profile_status"] = "active"
+        metadata["independent_evidence_count"] = 2
+        allowed, _reason = profile_quality_decision(
+            {"memory_type": record.memory_type, "metadata": metadata},
+            require_active=True,
+        )
+        return allowed
+
+    @staticmethod
+    def _profile_domain(record: MemoryRecord) -> tuple[str, ...]:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        return (
+            clean_text(record.platform, 80).lower(),
+            clean_text(record.subject.kind, 40).lower(),
+            clean_text(record.subject.id, 120),
+            clean_text(record.object.kind, 40).lower(),
+            clean_text(record.object.id, 120),
+            clean_text(record.scope, 40).lower(),
+            clean_text(record.group_id, 120),
+            clean_text(record.visibility, 40).lower(),
+            clean_text(metadata.get("owner_bot_id"), 120),
+        )
+
+    def _profile_domain_rows_sync(self, record: MemoryRecord) -> list[sqlite3.Row]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE memory_type IN ('user_profile', 'user_preference', 'user_habit')
+              AND platform=? AND subject_kind=? AND subject_id=?
+              AND object_kind=? AND object_id=? AND scope=? AND group_id=? AND visibility=?
+              AND lifecycle!='archived'
+            """,
+            (
+                clean_text(record.platform, 80),
+                clean_text(record.subject.kind, 40),
+                clean_text(record.subject.id, 120),
+                clean_text(record.object.kind, 40),
+                clean_text(record.object.id, 120),
+                clean_text(record.scope, 40),
+                clean_text(record.group_id, 120),
+                clean_text(record.visibility, 40),
+            ),
+        ).fetchall()
+        domain = self._profile_domain(record)
+        return [
+            row
+            for row in rows
+            if self._profile_domain(MemoryRecord.from_row(row)) == domain
+        ]
+
+    def _profile_single_value_domain_conflict_sync(
+        self, record: MemoryRecord
+    ) -> bool:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        extractor = clean_text(metadata.get("extractor"), 40).lower()
+        dimension = clean_text(metadata.get("profile_dimension"), 80).lower()
+        cardinality = (
+            "single"
+            if dimension in self.PROFILE_SINGLE_VALUE_DIMENSIONS
+            else clean_text(metadata.get("profile_cardinality"), 20).lower()
+            or "multi"
+        )
+        if not (
+            record.memory_type in self.PROFILE_MEMORY_TYPES
+            and extractor in self.PROFILE_RULE_EXTRACTORS
+            and dimension
+            and cardinality == "single"
+            and self._profile_state(record) == "active"
+        ):
+            return False
+        for domain_row in self._profile_domain_rows_sync(record):
+            other = MemoryRecord.from_row(domain_row)
+            other_metadata = (
+                other.metadata if isinstance(other.metadata, dict) else {}
+            )
+            if (
+                other.id != record.id
+                and self._profile_state(other) == "active"
+                and clean_text(
+                    other_metadata.get("profile_dimension"), 80
+                ).lower()
+                == dimension
+            ):
+                return True
+        return False
+
+    def _profile_single_value_invariant_signature(
+        self, record: MemoryRecord
+    ) -> tuple[Any, ...]:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        dimension = clean_text(metadata.get("profile_dimension"), 80).lower()
+        cardinality = (
+            "single"
+            if dimension in self.PROFILE_SINGLE_VALUE_DIMENSIONS
+            else clean_text(metadata.get("profile_cardinality"), 20).lower()
+            or "multi"
+        )
+        return (
+            clean_text(record.memory_type, 80),
+            self._profile_domain(record),
+            self._profile_state(record),
+            clean_text(record.lifecycle, 40),
+            clean_text(record.review_status, 40),
+            clean_text(metadata.get("extractor"), 40).lower(),
+            dimension,
+            cardinality,
+            normalize_profile_value(metadata.get("normalized_value")),
+        )
+
+    @staticmethod
+    def _profile_state(record: MemoryRecord) -> str:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        state = clean_text(
+            metadata.get("profile_state") or metadata.get("profile_status"),
+            32,
+        ).lower()
+        if state in {"candidate", "active", "rejected", "superseded"}:
+            return state
+        if record.lifecycle == "archived":
+            return "superseded" if record.supersedes_id else "rejected"
+        if record.review_status == "pending":
+            return "candidate"
+        return "active"
+
+    async def upsert_profile_candidate(self, record: MemoryRecord) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._upsert_profile_candidate_sync,
+            deepcopy(record),
+        )
+
+    def _upsert_profile_candidate_sync(self, record: MemoryRecord) -> dict[str, Any]:
+        record.ensure_defaults()
+        metadata = dict(record.metadata) if isinstance(record.metadata, dict) else {}
+        extractor = clean_text(metadata.get("extractor"), 40).lower()
+        dimension = clean_text(metadata.get("profile_dimension"), 80).lower()
+        profile_value = clean_text(metadata.get("profile_value"), 240)
+        normalized = normalize_profile_value(metadata.get("normalized_value"))
+        polarity = clean_text(metadata.get("profile_polarity"), 40).lower()
+        if (
+            record.memory_type not in self.PROFILE_MEMORY_TYPES
+            or extractor not in self.PROFILE_RULE_EXTRACTORS
+            or not dimension
+            or not profile_value
+            or not normalized
+            or normalize_profile_value(profile_value) != normalized
+        ):
+            return {"ok": False, "code": "profile_candidate_invalid", "memory_id": ""}
+        try:
+            raw_quality_score = float(metadata.get("extraction_quality_score"))
+        except (TypeError, ValueError):
+            return {"ok": False, "code": "profile_candidate_invalid", "memory_id": ""}
+        if not math.isfinite(raw_quality_score):
+            return {"ok": False, "code": "profile_candidate_invalid", "memory_id": ""}
+        quality_score = max(0.0, min(1.0, raw_quality_score))
+
+        requested_state = clean_text(
+            metadata.get("profile_state") or metadata.get("profile_status"),
+            32,
+        ).lower()
+        explicit_active = bool(
+            requested_state == "active"
+            and clean_text(metadata.get("extraction_quality"), 40).lower() == "explicit"
+            and clean_text(metadata.get("evidence_strength"), 40).lower()
+            == "direct_statement"
+            and metadata.get("quality_gate_passed") is True
+            and quality_score >= 0.8
+        )
+        requested_state = "active" if explicit_active else "candidate"
+        try:
+            required_evidence = max(
+                1 if explicit_active else 2,
+                min(10, int(metadata.get("required_evidence_count") or 2)),
+            )
+        except (TypeError, ValueError):
+            required_evidence = 1 if explicit_active else 2
+        incoming_refs = self._profile_incoming_evidence_refs(record)
+        incoming_statement_fingerprints = (
+            self._profile_incoming_statement_fingerprints(record)
+        )
+        now = utc_now()
+
+        with self._lock:  # noqa: SIM117
+            with self._transaction_sync():
+                domain_rows = self._profile_domain_rows_sync(record)
+                exact_records: list[MemoryRecord] = []
+                for row in domain_rows:
+                    candidate = MemoryRecord.from_row(row)
+                    candidate_metadata = (
+                        candidate.metadata
+                        if isinstance(candidate.metadata, dict)
+                        else {}
+                    )
+                    if (
+                        clean_text(
+                            candidate_metadata.get("profile_dimension"), 80
+                        ).lower()
+                        != dimension
+                    ):
+                        continue
+                    candidate_polarity = clean_text(
+                        candidate_metadata.get("profile_polarity"),
+                        40,
+                    ).lower()
+                    if (
+                        normalize_profile_value(
+                            candidate_metadata.get("normalized_value")
+                        )
+                        == normalized
+                        and candidate_polarity == polarity
+                    ):
+                        exact_records.append(candidate)
+
+                exact_records.sort(
+                    key=lambda item: (
+                        self._profile_state(item) == "active",
+                        int(item.merged_count or 1),
+                        item.updated_at,
+                    ),
+                    reverse=True,
+                )
+                if exact_records:
+                    canonical = exact_records[0]
+                    existing_metadata = (
+                        dict(canonical.metadata)
+                        if isinstance(canonical.metadata, dict)
+                        else {}
+                    )
+                    existing_state = self._profile_state(canonical)
+                else:
+                    canonical = deepcopy(record)
+                    profile_key = stable_fingerprint(
+                        *self._profile_domain(record),
+                        dimension,
+                        polarity,
+                        normalized,
+                    )
+                    canonical.id = f"profile_{profile_key}"
+                    if self._conn.execute(
+                        "SELECT 1 FROM memories WHERE id=?", (canonical.id,)
+                    ).fetchone():
+                        collision_seed = stable_fingerprint(
+                            profile_key,
+                            record.id,
+                            *incoming_refs,
+                            *incoming_statement_fingerprints,
+                        )
+                        sequence = 1
+                        while True:
+                            candidate_id = f"profile_{stable_fingerprint(collision_seed, str(sequence))}"
+                            if self._conn.execute(
+                                "SELECT 1 FROM memories WHERE id=?", (candidate_id,)
+                            ).fetchone() is None:
+                                canonical.id = candidate_id
+                                break
+                            sequence += 1
+                    existing_metadata = {}
+                    existing_state = "candidate"
+
+                all_records = [*exact_records, record]
+                refs: list[str] = []
+                statement_fingerprints: list[str] = []
+                for item in exact_records:
+                    refs.extend(self._profile_evidence_refs(item))
+                    statement_fingerprints.extend(
+                        self._profile_statement_fingerprints(item)
+                    )
+                refs.extend(incoming_refs)
+                statement_fingerprints.extend(incoming_statement_fingerprints)
+                refs = list(dict.fromkeys(refs))[:256]
+                statement_fingerprints = list(dict.fromkeys(statement_fingerprints))[
+                    :256
+                ]
+                qualified_refs: list[str] = []
+                qualified_statement_fingerprints: list[str] = []
+                for item in exact_records:
+                    item_metadata = (
+                        item.metadata if isinstance(item.metadata, dict) else {}
+                    )
+                    stored_refs = item_metadata.get(
+                        "profile_qualified_evidence_refs"
+                    )
+                    stored_statements = item_metadata.get(
+                        "profile_qualified_statement_fingerprints"
+                    )
+                    if isinstance(stored_refs, list) and isinstance(
+                        stored_statements, list
+                    ):
+                        qualified_refs.extend(stored_refs)
+                        qualified_statement_fingerprints.extend(stored_statements)
+                    elif self._profile_evidence_passes_quality_gate(item):
+                        qualified_refs.extend(self._profile_evidence_refs(item))
+                        qualified_statement_fingerprints.extend(
+                            self._profile_statement_fingerprints(item)
+                        )
+                if self._profile_evidence_passes_quality_gate(record):
+                    qualified_refs.extend(incoming_refs)
+                    qualified_statement_fingerprints.extend(
+                        incoming_statement_fingerprints
+                    )
+                qualified_refs = list(dict.fromkeys(qualified_refs))[:256]
+                qualified_statement_fingerprints = list(
+                    dict.fromkeys(qualified_statement_fingerprints)
+                )[:256]
+                independent_evidence_count = min(
+                    len(qualified_refs),
+                    len(qualified_statement_fingerprints),
+                )
+                existing_refs: list[str] = []
+                for item in exact_records:
+                    existing_refs.extend(self._profile_evidence_refs(item))
+                existing_refs = list(dict.fromkeys(existing_refs))
+                evidence_added = any(ref not in existing_refs for ref in incoming_refs)
+
+                merged_metadata = dict(existing_metadata)
+                merged_metadata.update(metadata)
+                merged_metadata["extractor"] = extractor
+                merged_metadata["profile_dimension"] = dimension
+                merged_metadata["profile_polarity"] = polarity
+                merged_metadata["normalized_value"] = clean_text(
+                    metadata.get("normalized_value"), 240
+                )
+                merged_metadata["profile_value"] = profile_value
+                try:
+                    existing_quality_score = float(
+                        existing_metadata.get("extraction_quality_score") or 0.0
+                    )
+                except (TypeError, ValueError):
+                    existing_quality_score = 0.0
+                merged_metadata["extraction_quality_score"] = round(
+                    max(quality_score, existing_quality_score),
+                    4,
+                )
+                merged_metadata["profile_evidence_refs"] = refs
+                merged_metadata["profile_statement_fingerprints"] = (
+                    statement_fingerprints
+                )
+                merged_metadata["profile_qualified_evidence_refs"] = qualified_refs
+                merged_metadata["profile_qualified_statement_fingerprints"] = (
+                    qualified_statement_fingerprints
+                )
+                merged_metadata["evidence_count"] = len(refs)
+                merged_metadata["independent_evidence_count"] = (
+                    independent_evidence_count
+                )
+                merged_metadata["required_evidence_count"] = required_evidence
+                merged_metadata["profile_cardinality"] = (
+                    "single"
+                    if dimension in self.PROFILE_SINGLE_VALUE_DIMENSIONS
+                    else clean_text(metadata.get("profile_cardinality"), 20)
+                    or "multi"
+                )
+
+                activation_metadata = {
+                    **merged_metadata,
+                    "profile_state": "active",
+                    "profile_status": "active",
+                }
+                activation_allowed, _activation_reason = profile_quality_decision(
+                    activation_metadata,
+                    require_active=True,
+                )
+
+                next_state = (
+                    "active"
+                    if (
+                        existing_state == "active"
+                        or activation_allowed
+                        and (
+                            requested_state == "active"
+                            or independent_evidence_count >= required_evidence
+                        )
+                    )
+                    else "candidate"
+                )
+                merged_metadata["profile_state"] = next_state
+                merged_metadata["profile_status"] = next_state
+                merged_metadata["profile_status_updated_at"] = now
+                canonical.metadata = merged_metadata
+                if not exact_records or requested_state == "active":
+                    canonical.content = record.content
+                    canonical.memory_type = record.memory_type
+                    canonical.tags = list(
+                        dict.fromkeys([*(canonical.tags or []), *(record.tags or [])])
+                    )
+                canonical.evidence = self._profile_evidence_text(all_records)
+                canonical.confidence = max(
+                    float(canonical.confidence or 0.0), quality_score
+                )
+                canonical.importance = max(
+                    float(canonical.importance or 0.0), float(record.importance or 0.0)
+                )
+                canonical.merged_count = max(1, len(refs))
+                canonical.lifecycle = (
+                    "stable_memory" if next_state == "active" else "raw_event"
+                )
+                canonical.review_status = (
+                    "auto" if next_state == "active" else "pending"
+                )
+                canonical.updated_at = now
+                canonical.content_fingerprint = ""
+                canonical.ensure_defaults()
+                self._write_memory_record_sync(canonical)
+
+                superseded_ids: list[str] = []
+                duplicate_ids = [item.id for item in exact_records[1:]]
+                cardinality = clean_text(
+                    merged_metadata.get("profile_cardinality"), 20
+                ).lower()
+                if next_state == "active" and cardinality == "single":
+                    for row in domain_rows:
+                        other = MemoryRecord.from_row(row)
+                        other_metadata = (
+                            other.metadata if isinstance(other.metadata, dict) else {}
+                        )
+                        if other.id == canonical.id:
+                            continue
+                        if (
+                            clean_text(
+                                other_metadata.get("profile_dimension"), 80
+                            ).lower()
+                            != dimension
+                        ):
+                            continue
+                        if self._profile_state(other) == "active":
+                            duplicate_ids.append(other.id)
+                for memory_id in list(dict.fromkeys(duplicate_ids)):
+                    row = self._conn.execute(
+                        "SELECT * FROM memories WHERE id=?", (memory_id,)
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    other = MemoryRecord.from_row(row)
+                    other_metadata = (
+                        dict(other.metadata) if isinstance(other.metadata, dict) else {}
+                    )
+                    other_metadata["profile_state"] = "superseded"
+                    other_metadata["profile_status"] = "superseded"
+                    other_metadata["profile_superseded_by"] = canonical.id
+                    other_metadata["profile_status_updated_at"] = now
+                    other.metadata = other_metadata
+                    other.lifecycle = "archived"
+                    other.supersedes_id = canonical.id
+                    other.updated_at = now
+                    self._write_memory_record_sync(other)
+                    self._conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id=?", (other.id,)
+                    )
+                    self._conn.execute(
+                        "UPDATE review_queue SET status='superseded', updated_at=? WHERE memory_id=?",
+                        (now, other.id),
+                    )
+                    superseded_ids.append(other.id)
+
+                if next_state == "candidate":
+                    self._upsert_review_sync(
+                        canonical.id, "profile_candidate_requires_evidence"
+                    )
+                    self._conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id=?",
+                        (canonical.id,),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE review_queue SET status='auto', updated_at=? WHERE memory_id=? AND status='pending'",
+                        (now, canonical.id),
+                    )
+                self._embedding_candidate_cache.clear()
+                self._embedding_candidate_cache_revision = ""
+
+        return {
+            "ok": True,
+            "code": "profile_candidate_upserted",
+            "memory_id": canonical.id,
+            "profile_status": next_state,
+            "evidence_count": len(refs),
+            "independent_evidence_count": independent_evidence_count,
+            "evidence_added": evidence_added,
+            "superseded_ids": superseded_ids,
+        }
+
+    async def list_rule_profile_memories(
+        self,
+        *,
+        user_id: str = "",
+        scope: str = "",
+        memory_types: list[str] | None = None,
+        extractors: list[str] | None = None,
+        include_archived: bool = True,
+        limit: int = 5000,
+        offset: int = 0,
+    ) -> list[MemoryRecord]:
+        return await self._run_recoverable_database_operation(
+            self._list_rule_profile_memories_sync,
+            user_id,
+            scope,
+            list(memory_types or []),
+            list(extractors or []),
+            include_archived,
+            limit,
+            offset,
+        )
+
+    def _list_rule_profile_memories_sync(
+        self,
+        user_id: str,
+        scope: str,
+        memory_types: list[str],
+        extractors: list[str],
+        include_archived: bool,
+        limit: int,
+        offset: int,
+    ) -> list[MemoryRecord]:
+        requested_types = [clean_text(value, 80) for value in memory_types]
+        invalid_types = sorted(
+            {
+                value or "<empty>"
+                for value in requested_types
+                if value not in self.PROFILE_MEMORY_TYPES
+            }
+        )
+        if invalid_types:
+            raise ValueError(
+                "unsupported profile memory type filter: " + ", ".join(invalid_types)
+            )
+        selected_types = list(dict.fromkeys(requested_types)) or sorted(
+            self.PROFILE_MEMORY_TYPES
+        )
+
+        requested_extractors = [clean_text(value, 40).lower() for value in extractors]
+        invalid_extractors = sorted(
+            {
+                value or "<empty>"
+                for value in requested_extractors
+                if value not in self.PROFILE_RULE_EXTRACTORS
+            }
+        )
+        if invalid_extractors:
+            raise ValueError(
+                "unsupported profile extractor filter: " + ", ".join(invalid_extractors)
+            )
+        selected_extractors = list(dict.fromkeys(requested_extractors)) or sorted(
+            self.PROFILE_RULE_EXTRACTORS
+        )
+        type_marks = ",".join("?" for _ in selected_types)
+        extractor_marks = ",".join("?" for _ in selected_extractors)
+        where = [
+            f"memory_type IN ({type_marks})",
+            "json_valid(metadata)",
+            f"LOWER(COALESCE(CAST(json_extract(metadata, '$.extractor') AS TEXT), '')) IN ({extractor_marks})",
+        ]
+        params: list[Any] = [*selected_types, *selected_extractors]
+        if user_id:
+            where.append("subject_id=?")
+            params.append(clean_text(user_id, 120))
+        if scope:
+            where.append("scope=?")
+            params.append(clean_text(scope, 40))
+        if not include_archived:
+            where.append("lifecycle!='archived'")
+        safe_limit = max(1, min(100000, int(limit or 5000)))
+        safe_offset = max(0, int(offset or 0))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM memories
+                WHERE {" AND ".join(where)}
+                ORDER BY subject_id, scope, occurred_at, created_at, id
+                LIMIT ? OFFSET ?
+                """,
+                [*params, safe_limit, safe_offset],
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    async def list_rule_portrait_facts(
+        self,
+        *,
+        person_id: str = "",
+        source_scope: str = "",
+        include_inactive: bool = True,
+        limit: int = 5000,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._list_rule_portrait_facts_sync,
+            person_id,
+            source_scope,
+            include_inactive,
+            limit,
+            offset,
+        )
+
+    def _list_rule_portrait_facts_sync(
+        self,
+        person_id: str,
+        source_scope: str,
+        include_inactive: bool,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        versions = sorted(self.PROFILE_RULE_PORTRAIT_VERSIONS)
+        marks = ",".join("?" for _ in versions)
+        where = [
+            "producer_kind='rule_explicit'",
+            f"producer_version IN ({marks})",
+        ]
+        params: list[Any] = [*versions]
+        if person_id:
+            where.append("person_id=?")
+            params.append(clean_text(person_id, 80))
+        if source_scope:
+            where.append("source_scope=?")
+            params.append(clean_text(source_scope, 80))
+        if not include_inactive:
+            where.append("status='active'")
+        safe_limit = max(1, min(100000, int(limit or 5000)))
+        safe_offset = max(0, int(offset or 0))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM portrait_facts
+                WHERE {" AND ".join(where)}
+                ORDER BY person_id, source_scope, dimension,
+                         last_evidence_at, created_at, id
+                LIMIT ? OFFSET ?
+                """,
+                [*params, safe_limit, safe_offset],
+            ).fetchall()
+            results: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                queue_rows = self._conn.execute(
+                    """
+                    SELECT * FROM portrait_learning_queue
+                    WHERE fact_id=? ORDER BY queue_id
+                    """,
+                    (row["id"],),
+                ).fetchall()
+                item["queue_fingerprint"] = (
+                    self.profile_portrait_queue_fingerprint(queue_rows)
+                )
+                results.append(item)
+        return results
+
+    @staticmethod
+    def _valid_profile_operation_id(operation_id: Any) -> str:
+        value = clean_text(operation_id, 120)
+        return value if re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", value) else ""
+
+    def _profile_repair_record_snapshot_sync(
+        self,
+        record: MemoryRecord,
+        *,
+        group_id: str = "",
+        guard_only: bool = False,
+    ) -> dict[str, Any]:
+        review_rows = self._conn.execute(
+            "SELECT * FROM review_queue WHERE memory_id=? ORDER BY created_at, id",
+            (record.id,),
+        ).fetchall()
+        embedding_rows = self._conn.execute(
+            "SELECT * FROM memory_embeddings WHERE memory_id=? ORDER BY provider_id",
+            (record.id,),
+        ).fetchall()
+        return {
+            "record_kind": "memory",
+            "record_id": record.id,
+            "memory_id": record.id,
+            "group_id": clean_text(group_id, 120),
+            "guard_only": bool(guard_only),
+            "before": self._memory_db_snapshot(record),
+            "review_queue": [dict(row) for row in review_rows],
+            "embeddings": [dict(row) for row in embedding_rows],
+            "after_fingerprint": "",
+        }
+
+    def _profile_repair_portrait_snapshot_sync(
+        self,
+        fact: Any,
+        *,
+        group_id: str = "",
+        guard_only: bool = False,
+    ) -> dict[str, Any]:
+        fact_data = dict(fact)
+        fact_id = clean_text(fact_data.get("id"), 120)
+        queue_rows = self._conn.execute(
+            """
+            SELECT * FROM portrait_learning_queue
+            WHERE fact_id=? ORDER BY queue_id
+            """,
+            (fact_id,),
+        ).fetchall()
+        return {
+            "record_kind": "portrait_fact",
+            "record_id": fact_id,
+            "group_id": clean_text(group_id, 120),
+            "guard_only": bool(guard_only),
+            "person_id": clean_text(fact_data.get("person_id"), 80),
+            "before": fact_data,
+            "learning_queue": [dict(row) for row in queue_rows],
+            "after_fingerprint": "",
+            "after_queue_fingerprint": "",
+        }
+
+    def _write_portrait_fact_snapshot_sync(
+        self, snapshot: dict[str, Any]
+    ) -> bool:
+        columns = (
+            "id",
+            "person_id",
+            "dimension",
+            "normalized_claim_hash",
+            "claim_summary",
+            "portrait_tier",
+            "producer_kind",
+            "producer_version",
+            "derivation_kind",
+            "epistemic_status",
+            "source_scope",
+            "usable_scope",
+            "confidence",
+            "sensitivity",
+            "status",
+            "evidence_hashes",
+            "context_refs",
+            "first_evidence_at",
+            "last_evidence_at",
+            "expires_at",
+            "supersedes_id",
+            "revision",
+            "operation_id",
+            "created_at",
+            "updated_at",
+        )
+        if any(column not in snapshot for column in columns):
+            return False
+        names = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        updates = ", ".join(
+            f"{column}=excluded.{column}" for column in columns if column != "id"
+        )
+        self._conn.execute(
+            f"""
+            INSERT INTO portrait_facts ({names}) VALUES ({placeholders})
+            ON CONFLICT(id) DO UPDATE SET {updates}
+            """,
+            [snapshot[column] for column in columns],
+        )
+        return True
+
+    def _restore_portrait_queue_snapshot_sync(
+        self, fact_id: str, rows: list[Any]
+    ) -> bool:
+        columns = (
+            "queue_id",
+            "person_id",
+            "fact_id",
+            "evidence_hash",
+            "state",
+            "created_at",
+            "updated_at",
+        )
+        normalized: list[dict[str, Any]] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                return False
+            row = dict(raw)
+            if (
+                any(column not in row for column in columns)
+                or clean_text(row.get("fact_id"), 120) != fact_id
+            ):
+                return False
+            normalized.append(row)
+        self._conn.execute(
+            "DELETE FROM portrait_learning_queue WHERE fact_id=?", (fact_id,)
+        )
+        for row in normalized:
+            self._conn.execute(
+                """
+                INSERT INTO portrait_learning_queue(
+                    queue_id, person_id, fact_id, evidence_hash, state,
+                    created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?)
+                """,
+                [row[column] for column in columns],
+            )
+        return True
+
+    @staticmethod
+    def _profile_repair_history(
+        metadata: dict[str, Any],
+        *,
+        operation_id: str,
+        action: str,
+        reason: str,
+        now: str,
+    ) -> dict[str, Any]:
+        updated = dict(metadata)
+        history = updated.get("profile_repair_history")
+        history = list(history) if isinstance(history, list) else []
+        history.append(
+            {
+                "operation_id": operation_id,
+                "action": action,
+                "reason": clean_text(reason, 240),
+                "applied_at": now,
+            }
+        )
+        updated["profile_repair_history"] = history[-20:]
+        return updated
+
+    def _profile_repair_merge_sync(
+        self,
+        source: MemoryRecord,
+        canonical: MemoryRecord,
+        *,
+        operation_id: str,
+        reason: str,
+        now: str,
+    ) -> tuple[MemoryRecord, MemoryRecord] | None:
+        source_metadata = source.metadata if isinstance(source.metadata, dict) else {}
+        canonical_metadata = (
+            canonical.metadata if isinstance(canonical.metadata, dict) else {}
+        )
+        if self._profile_domain(source) != self._profile_domain(canonical):
+            return None
+        source_dimension = clean_text(
+            source_metadata.get("profile_dimension"), 80
+        ).lower()
+        canonical_dimension = clean_text(
+            canonical_metadata.get("profile_dimension"), 80
+        ).lower()
+        source_value = clean_text(
+            source_metadata.get("normalized_value"), 240
+        ).casefold()
+        canonical_value = clean_text(
+            canonical_metadata.get("normalized_value"), 240
+        ).casefold()
+        source_polarity = clean_text(
+            source_metadata.get("profile_polarity"), 40
+        ).lower()
+        canonical_polarity = clean_text(
+            canonical_metadata.get("profile_polarity"), 40
+        ).lower()
+        if (
+            not source_dimension
+            or source_dimension != canonical_dimension
+            or source_value != canonical_value
+            or source_polarity != canonical_polarity
+        ):
+            return None
+
+        refs = list(
+            dict.fromkeys(
+                [
+                    *self._profile_evidence_refs(canonical),
+                    *self._profile_evidence_refs(source),
+                ]
+            )
+        )[:256]
+        statement_fingerprints = list(
+            dict.fromkeys(
+                [
+                    *self._profile_statement_fingerprints(canonical),
+                    *self._profile_statement_fingerprints(source),
+                ]
+            )
+        )[:256]
+        next_state = (
+            "active"
+            if "active" in {self._profile_state(source), self._profile_state(canonical)}
+            else "candidate"
+        )
+        merged_metadata = self._profile_repair_history(
+            canonical_metadata,
+            operation_id=operation_id,
+            action="merge_target",
+            reason=reason,
+            now=now,
+        )
+        merged_metadata["profile_evidence_refs"] = refs
+        merged_metadata["profile_statement_fingerprints"] = statement_fingerprints
+        merged_metadata["evidence_count"] = len(refs)
+        merged_metadata["independent_evidence_count"] = min(
+            len(refs),
+            len(statement_fingerprints),
+        )
+        merged_metadata["profile_state"] = next_state
+        merged_metadata["profile_status"] = next_state
+        canonical.metadata = merged_metadata
+        canonical.evidence = self._profile_evidence_text([canonical, source])
+        canonical.confidence = max(canonical.confidence, source.confidence)
+        canonical.importance = max(canonical.importance, source.importance)
+        canonical.merged_count = max(1, len(refs))
+        canonical.lifecycle = "stable_memory" if next_state == "active" else "raw_event"
+        canonical.review_status = "auto" if next_state == "active" else "pending"
+        canonical.updated_at = now
+
+        superseded_metadata = self._profile_repair_history(
+            source_metadata,
+            operation_id=operation_id,
+            action="merge_source",
+            reason=reason,
+            now=now,
+        )
+        superseded_metadata["profile_state"] = "superseded"
+        superseded_metadata["profile_status"] = "superseded"
+        superseded_metadata["profile_superseded_by"] = canonical.id
+        source.metadata = superseded_metadata
+        source.lifecycle = "archived"
+        source.review_status = "auto"
+        source.supersedes_id = canonical.id
+        source.updated_at = now
+        return source, canonical
+
+    async def apply_profile_repairs(
+        self,
+        *,
+        operation_id: str,
+        rule_version: str,
+        actions: list[dict[str, Any]],
+        backup_path: str,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._apply_profile_repairs_sync,
+            operation_id,
+            rule_version,
+            deepcopy(actions),
+            backup_path,
+        )
+
+    def _apply_profile_repairs_sync(
+        self,
+        operation_id: str,
+        rule_version: str,
+        actions: list[dict[str, Any]],
+        backup_path: str,
+    ) -> dict[str, Any]:
+        operation_id = self._valid_profile_operation_id(operation_id)
+        rule_version = clean_text(rule_version, 80)
+        backup_path = clean_text(backup_path, 2000)
+        if not operation_id or not rule_version or not backup_path:
+            raise ValueError("profile repair operation metadata is invalid")
+        if len(actions) > 100000:
+            raise ValueError("profile repair action limit exceeded")
+        plan_fingerprint = self.profile_repair_plan_fingerprint(actions)
+        now = utc_now()
+
+        with self._lock:  # noqa: SIM117
+            with self._transaction_sync():
+                prior = self._conn.execute(
+                    "SELECT * FROM profile_repair_operations WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if prior is not None:
+                    if (
+                        clean_text(prior["rule_version"], 80) != rule_version
+                        or clean_text(prior["plan_fingerprint"], 80) != plan_fingerprint
+                    ):
+                        raise ValueError(
+                            "profile repair operation id already used with a different plan"
+                        )
+                    if clean_text(prior["state"], 40) == "rolled_back":
+                        raise ValueError(
+                            "profile repair operation has already been rolled back"
+                        )
+                    result = json_loads(prior["result"], {})
+                    return {
+                        **(result if isinstance(result, dict) else {}),
+                        "ok": True,
+                        "code": "profile_repair_idempotent_replay",
+                        "operation_id": operation_id,
+                    }
+
+                snapshots: dict[str, dict[str, Any]] = {}
+                validated_targets: set[str] = set()
+                validated_portrait_targets: set[str] = set()
+                changed_ids: set[str] = set()
+                affected_portrait_people: set[str] = set()
+                results: list[dict[str, Any]] = []
+                for raw_action in actions:
+                    if not isinstance(raw_action, dict):
+                        continue
+                    record_kind = clean_text(
+                        raw_action.get("record_kind"), 32
+                    ).lower() or "memory"
+                    memory_id = clean_text(
+                        raw_action.get("record_id")
+                        or raw_action.get("memory_id"),
+                        120,
+                    )
+                    action = clean_text(raw_action.get("action"), 24).lower()
+                    reason = clean_text(raw_action.get("reason"), 240)
+                    if record_kind == "portrait_fact":
+                        portrait_key = f"portrait_fact:{memory_id}"
+                        fact_row = self._conn.execute(
+                            "SELECT * FROM portrait_facts WHERE id=?",
+                            (memory_id,),
+                        ).fetchone()
+                        if fact_row is None:
+                            results.append(
+                                {
+                                    "record_kind": record_kind,
+                                    "record_id": memory_id,
+                                    "status": "missing",
+                                }
+                            )
+                            continue
+                        fact = dict(fact_row)
+                        if (
+                            clean_text(fact.get("producer_kind"), 80)
+                            != "rule_explicit"
+                            or clean_text(fact.get("producer_version"), 80)
+                            not in self.PROFILE_RULE_PORTRAIT_VERSIONS
+                        ):
+                            results.append(
+                                {
+                                    "record_kind": record_kind,
+                                    "record_id": memory_id,
+                                    "status": "unsupported",
+                                }
+                            )
+                            continue
+                        expected = clean_text(
+                            raw_action.get("expected_fingerprint"), 80
+                        )
+                        queue_rows = self._conn.execute(
+                            """
+                            SELECT * FROM portrait_learning_queue
+                            WHERE fact_id=? ORDER BY queue_id
+                            """,
+                            (memory_id,),
+                        ).fetchall()
+                        expected_queue = clean_text(
+                            raw_action.get("expected_queue_fingerprint"), 80
+                        )
+                        if (
+                            not expected
+                            or self.profile_portrait_fact_fingerprint(fact)
+                            != expected
+                            or (
+                                expected_queue
+                                and self.profile_portrait_queue_fingerprint(
+                                    queue_rows
+                                )
+                                != expected_queue
+                            )
+                        ):
+                            results.append(
+                                {
+                                    "record_kind": record_kind,
+                                    "record_id": memory_id,
+                                    "status": "skip-stale",
+                                }
+                            )
+                            continue
+                        if action == "keep":
+                            results.append(
+                                {
+                                    "record_kind": record_kind,
+                                    "record_id": memory_id,
+                                    "status": "kept",
+                                }
+                            )
+                            continue
+                        if action not in {"pending", "archive"}:
+                            results.append(
+                                {
+                                    "record_kind": record_kind,
+                                    "record_id": memory_id,
+                                    "status": "invalid-action",
+                                }
+                            )
+                            continue
+                        snapshots.setdefault(
+                            portrait_key,
+                            self._profile_repair_portrait_snapshot_sync(
+                                fact,
+                                group_id=self.profile_repair_group_id(memory_id),
+                            ),
+                        )
+                        target_state = "pending"
+                        canonical_id = ""
+                        queue_state = "pending_review"
+                        if action == "archive":
+                            target_state = clean_text(
+                                raw_action.get("target_state"), 32
+                            ).lower()
+                            if target_state not in {"rejected", "superseded"}:
+                                target_state = "rejected"
+                            queue_state = target_state
+                        if target_state == "superseded":
+                            canonical_id = clean_text(
+                                raw_action.get("canonical_id"), 120
+                            )
+                            group_id = self.profile_repair_group_id(canonical_id)
+                            snapshots[portrait_key]["group_id"] = group_id
+                            canonical_row = self._conn.execute(
+                                "SELECT * FROM portrait_facts WHERE id=?",
+                                (canonical_id,),
+                            ).fetchone()
+                            if canonical_row is None or canonical_id == memory_id:
+                                results.append(
+                                    {
+                                        "record_kind": record_kind,
+                                        "record_id": memory_id,
+                                        "status": "invalid-canonical",
+                                    }
+                                )
+                                continue
+                            canonical = dict(canonical_row)
+                            canonical_queue = self._conn.execute(
+                                """
+                                SELECT * FROM portrait_learning_queue
+                                WHERE fact_id=? ORDER BY queue_id
+                                """,
+                                (canonical_id,),
+                            ).fetchall()
+                            if canonical_id not in validated_portrait_targets:
+                                canonical_expected = clean_text(
+                                    raw_action.get(
+                                        "canonical_expected_fingerprint"
+                                    ),
+                                    80,
+                                )
+                                canonical_queue_expected = clean_text(
+                                    raw_action.get(
+                                        "canonical_expected_queue_fingerprint"
+                                    ),
+                                    80,
+                                )
+                                if (
+                                    not canonical_expected
+                                    or self.profile_portrait_fact_fingerprint(
+                                        canonical
+                                    )
+                                    != canonical_expected
+                                    or (
+                                        canonical_queue_expected
+                                        and self.profile_portrait_queue_fingerprint(
+                                            canonical_queue
+                                        )
+                                        != canonical_queue_expected
+                                    )
+                                ):
+                                    results.append(
+                                        {
+                                            "record_kind": record_kind,
+                                            "record_id": memory_id,
+                                            "status": "skip-stale",
+                                        }
+                                    )
+                                    continue
+                                validated_portrait_targets.add(canonical_id)
+                            if (
+                                clean_text(fact.get("person_id"), 80)
+                                != clean_text(canonical.get("person_id"), 80)
+                                or clean_text(fact.get("dimension"), 80).lower()
+                                != clean_text(
+                                    canonical.get("dimension"), 80
+                                ).lower()
+                                or clean_text(fact.get("source_scope"), 80)
+                                != clean_text(
+                                    canonical.get("source_scope"), 80
+                                )
+                                or clean_text(canonical.get("status"), 40)
+                                != "active"
+                            ):
+                                results.append(
+                                    {
+                                        "record_kind": record_kind,
+                                        "record_id": memory_id,
+                                        "status": "acl-domain-mismatch",
+                                    }
+                                )
+                                continue
+                            canonical_key = f"portrait_fact:{canonical_id}"
+                            snapshots.setdefault(
+                                canonical_key,
+                                self._profile_repair_portrait_snapshot_sync(
+                                    canonical,
+                                    group_id=group_id,
+                                    guard_only=True,
+                                ),
+                            )
+                            snapshots[canonical_key]["group_id"] = group_id
+
+                        self._conn.execute(
+                            """
+                            UPDATE portrait_facts
+                            SET status=?, supersedes_id=?, revision=revision+1,
+                                operation_id=?, updated_at=?
+                            WHERE id=?
+                            """,
+                            (
+                                target_state,
+                                canonical_id,
+                                operation_id,
+                                now,
+                                memory_id,
+                            ),
+                        )
+                        self._conn.execute(
+                            """
+                            UPDATE portrait_learning_queue
+                            SET state=?, updated_at=?
+                            WHERE fact_id=? AND state='pending'
+                            """,
+                            (queue_state, now, memory_id),
+                        )
+                        person_id = clean_text(fact.get("person_id"), 80)
+                        if person_id:
+                            affected_portrait_people.add(person_id)
+                        changed_ids.add(portrait_key)
+                        results.append(
+                            {
+                                "record_kind": record_kind,
+                                "record_id": memory_id,
+                                "status": "applied",
+                                "action": action,
+                                "canonical_id": canonical_id,
+                            }
+                        )
+                        continue
+                    if record_kind != "memory":
+                        results.append(
+                            {
+                                "record_kind": record_kind,
+                                "record_id": memory_id,
+                                "memory_id": memory_id,
+                                "status": "unsupported",
+                            }
+                        )
+                        continue
+                    row = self._conn.execute(
+                        "SELECT * FROM memories WHERE id=?", (memory_id,)
+                    ).fetchone()
+                    if row is None:
+                        results.append({"memory_id": memory_id, "status": "missing"})
+                        continue
+                    current = MemoryRecord.from_row(row)
+                    metadata = (
+                        current.metadata if isinstance(current.metadata, dict) else {}
+                    )
+                    if (
+                        current.memory_type not in self.PROFILE_MEMORY_TYPES
+                        or clean_text(metadata.get("extractor"), 40).lower()
+                        not in self.PROFILE_RULE_EXTRACTORS
+                    ):
+                        results.append(
+                            {"memory_id": memory_id, "status": "unsupported"}
+                        )
+                        continue
+                    expected = clean_text(raw_action.get("expected_fingerprint"), 80)
+                    if (
+                        not expected
+                        or self.profile_memory_fingerprint(current) != expected
+                    ):
+                        results.append({"memory_id": memory_id, "status": "skip-stale"})
+                        continue
+                    if action == "keep":
+                        results.append({"memory_id": memory_id, "status": "kept"})
+                        continue
+                    if action not in {"pending", "archive", "merge"}:
+                        results.append(
+                            {"memory_id": memory_id, "status": "invalid-action"}
+                        )
+                        continue
+                    snapshots.setdefault(
+                        memory_id,
+                        self._profile_repair_record_snapshot_sync(
+                            current,
+                            group_id=self.profile_repair_group_id(memory_id),
+                        ),
+                    )
+
+                    records_to_write: list[MemoryRecord] = []
+                    if action == "merge":
+                        canonical_id = clean_text(raw_action.get("canonical_id"), 120)
+                        group_id = self.profile_repair_group_id(canonical_id)
+                        snapshots[memory_id]["group_id"] = group_id
+                        canonical_row = self._conn.execute(
+                            "SELECT * FROM memories WHERE id=?",
+                            (canonical_id,),
+                        ).fetchone()
+                        if canonical_row is None or canonical_id == memory_id:
+                            results.append(
+                                {"memory_id": memory_id, "status": "invalid-canonical"}
+                            )
+                            continue
+                        canonical = MemoryRecord.from_row(canonical_row)
+                        if canonical_id not in validated_targets:
+                            canonical_expected = clean_text(
+                                raw_action.get("canonical_expected_fingerprint"),
+                                80,
+                            )
+                            if (
+                                not canonical_expected
+                                or self.profile_memory_fingerprint(canonical)
+                                != canonical_expected
+                            ):
+                                results.append(
+                                    {"memory_id": memory_id, "status": "skip-stale"}
+                                )
+                                continue
+                            validated_targets.add(canonical_id)
+                            snapshots.setdefault(
+                                canonical_id,
+                                self._profile_repair_record_snapshot_sync(
+                                    canonical,
+                                    group_id=group_id,
+                                ),
+                            )
+                        snapshots[canonical_id]["group_id"] = group_id
+                        merged = self._profile_repair_merge_sync(
+                            current,
+                            canonical,
+                            operation_id=operation_id,
+                            reason=reason,
+                            now=now,
+                        )
+                        if merged is None:
+                            results.append(
+                                {
+                                    "memory_id": memory_id,
+                                    "status": "acl-domain-mismatch",
+                                }
+                            )
+                            continue
+                        records_to_write.extend(merged)
+                    else:
+                        metadata_patch = raw_action.get("metadata_patch")
+                        if isinstance(metadata_patch, dict):
+                            allowed_patch_keys = {
+                                "profile_dimension",
+                                "profile_value",
+                                "normalized_value",
+                                "profile_polarity",
+                                "profile_cardinality",
+                                "extraction_quality",
+                                "extraction_quality_score",
+                                "evidence_strength",
+                                "quality_gate_passed",
+                            }
+                            metadata = {
+                                **metadata,
+                                **{
+                                    key: value
+                                    for key, value in metadata_patch.items()
+                                    if key in allowed_patch_keys
+                                },
+                            }
+                        next_metadata = self._profile_repair_history(
+                            metadata,
+                            operation_id=operation_id,
+                            action=action,
+                            reason=reason,
+                            now=now,
+                        )
+                        if action == "pending":
+                            next_metadata["profile_state"] = "candidate"
+                            next_metadata["profile_status"] = "candidate"
+                            current.lifecycle = "raw_event"
+                            current.review_status = "pending"
+                        else:
+                            target_state = clean_text(
+                                raw_action.get("target_state"),
+                                32,
+                            ).lower()
+                            if target_state not in {"rejected", "superseded"}:
+                                target_state = "rejected"
+                            if target_state == "superseded":
+                                canonical_id = clean_text(
+                                    raw_action.get("canonical_id"),
+                                    120,
+                                )
+                                group_id = self.profile_repair_group_id(canonical_id)
+                                snapshots[memory_id]["group_id"] = group_id
+                                canonical_row = self._conn.execute(
+                                    "SELECT * FROM memories WHERE id=?",
+                                    (canonical_id,),
+                                ).fetchone()
+                                if canonical_row is None or canonical_id == memory_id:
+                                    results.append(
+                                        {
+                                            "memory_id": memory_id,
+                                            "status": "invalid-canonical",
+                                        }
+                                    )
+                                    continue
+                                canonical = MemoryRecord.from_row(canonical_row)
+                                if canonical_id not in validated_targets:
+                                    canonical_expected = clean_text(
+                                        raw_action.get(
+                                            "canonical_expected_fingerprint"
+                                        ),
+                                        80,
+                                    )
+                                    if (
+                                        not canonical_expected
+                                        or self.profile_memory_fingerprint(canonical)
+                                        != canonical_expected
+                                    ):
+                                        results.append(
+                                            {
+                                                "memory_id": memory_id,
+                                                "status": "skip-stale",
+                                            }
+                                        )
+                                        continue
+                                    validated_targets.add(canonical_id)
+                                snapshots.setdefault(
+                                    canonical_id,
+                                    self._profile_repair_record_snapshot_sync(
+                                        canonical,
+                                        group_id=group_id,
+                                        guard_only=True,
+                                    ),
+                                )
+                                snapshots[canonical_id]["group_id"] = group_id
+                                canonical_metadata = (
+                                    canonical.metadata
+                                    if isinstance(canonical.metadata, dict)
+                                    else {}
+                                )
+                                if (
+                                    self._profile_domain(current)
+                                    != self._profile_domain(canonical)
+                                    or clean_text(
+                                        metadata.get("profile_dimension"),
+                                        80,
+                                    ).lower()
+                                    != clean_text(
+                                        canonical_metadata.get("profile_dimension"),
+                                        80,
+                                    ).lower()
+                                    or self._profile_state(canonical) != "active"
+                                ):
+                                    results.append(
+                                        {
+                                            "memory_id": memory_id,
+                                            "status": "acl-domain-mismatch",
+                                        }
+                                    )
+                                    continue
+                            next_metadata["profile_state"] = target_state
+                            next_metadata["profile_status"] = target_state
+                            next_metadata["profile_archive_reason"] = reason
+                            current.lifecycle = "archived"
+                            current.review_status = "auto"
+                            if target_state == "superseded":
+                                current.supersedes_id = canonical_id
+                                next_metadata["profile_superseded_by"] = (
+                                    current.supersedes_id
+                                )
+                        current.metadata = next_metadata
+                        current.updated_at = now
+                        records_to_write.append(current)
+
+                    for changed in records_to_write:
+                        self._write_memory_record_sync(changed)
+                        self._conn.execute(
+                            "DELETE FROM memory_embeddings WHERE memory_id=?",
+                            (changed.id,),
+                        )
+                        if changed.review_status == "pending":
+                            self._upsert_review_sync(
+                                changed.id,
+                                "profile_repair_pending",
+                            )
+                        else:
+                            self._conn.execute(
+                                "UPDATE review_queue SET status=?, updated_at=? WHERE memory_id=? AND status='pending'",
+                                (
+                                    "superseded" if changed.supersedes_id else "auto",
+                                    now,
+                                    changed.id,
+                                ),
+                            )
+                        changed_ids.add(changed.id)
+                    results.append(
+                        {
+                            "memory_id": memory_id,
+                            "status": "applied",
+                            "action": action,
+                            "canonical_id": clean_text(
+                                raw_action.get("canonical_id"), 120
+                            ),
+                        }
+                    )
+
+                for person_id in sorted(affected_portrait_people):
+                    self._bump_portrait_revision_sync(person_id)
+                for snapshot in snapshots.values():
+                    record_kind = clean_text(
+                        snapshot.get("record_kind"), 32
+                    ).lower() or "memory"
+                    record_id = clean_text(
+                        snapshot.get("record_id")
+                        or snapshot.get("memory_id"),
+                        120,
+                    )
+                    if record_kind == "portrait_fact":
+                        row = self._conn.execute(
+                            "SELECT * FROM portrait_facts WHERE id=?",
+                            (record_id,),
+                        ).fetchone()
+                        if row is not None:
+                            snapshot["after_fingerprint"] = (
+                                self.profile_portrait_fact_fingerprint(row)
+                            )
+                            queue_rows = self._conn.execute(
+                                """
+                                SELECT * FROM portrait_learning_queue
+                                WHERE fact_id=? ORDER BY queue_id
+                                """,
+                                (record_id,),
+                            ).fetchall()
+                            snapshot["after_queue_fingerprint"] = (
+                                self.profile_portrait_queue_fingerprint(
+                                    queue_rows
+                                )
+                            )
+                        continue
+                    row = self._conn.execute(
+                        "SELECT * FROM memories WHERE id=?", (record_id,)
+                    ).fetchone()
+                    if row is not None:
+                        snapshot["after_fingerprint"] = self.profile_memory_fingerprint(
+                            MemoryRecord.from_row(row)
+                        )
+                snapshot_payload = {
+                    "schema_version": "profile.repair.snapshot.v2",
+                    "records": list(snapshots.values()),
+                }
+                stale_count = sum(
+                    1 for item in results if item.get("status") == "skip-stale"
+                )
+                result = {
+                    "ok": True,
+                    "code": "profile_repair_applied",
+                    "operation_id": operation_id,
+                    "rule_version": rule_version,
+                    "plan_fingerprint": plan_fingerprint,
+                    "backup_path": backup_path,
+                    "results": results,
+                    "changed": len(changed_ids),
+                    "stale": stale_count,
+                }
+                state = (
+                    "partial"
+                    if any(
+                        item.get("status")
+                        in {
+                            "skip-stale",
+                            "missing",
+                            "unsupported",
+                            "invalid-action",
+                            "invalid-canonical",
+                            "acl-domain-mismatch",
+                        }
+                        for item in results
+                    )
+                    else "applied"
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO profile_repair_operations(
+                        operation_id, rule_version, state, backup_path, plan_fingerprint,
+                        snapshot, result, created_at, updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        operation_id,
+                        rule_version,
+                        state,
+                        backup_path,
+                        plan_fingerprint,
+                        json_dumps(snapshot_payload),
+                        json_dumps(result),
+                        now,
+                        now,
+                    ),
+                )
+                self._embedding_candidate_cache.clear()
+                self._embedding_candidate_cache_revision = ""
+        return result
+
+    async def get_profile_repair_operation(
+        self, operation_id: str
+    ) -> dict[str, Any] | None:
+        return await self._run_recoverable_database_operation(
+            self._get_profile_repair_operation_sync,
+            operation_id,
+        )
+
+    def _get_profile_repair_operation_sync(
+        self, operation_id: str
+    ) -> dict[str, Any] | None:
+        operation_id = self._valid_profile_operation_id(operation_id)
+        if not operation_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM profile_repair_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["snapshot"] = json_loads(result.get("snapshot"), {})
+        result["result"] = json_loads(result.get("result"), {})
+        return result
+
+    async def rollback_profile_repairs(
+        self,
+        *,
+        operation_id: str,
+        rollback_backup_path: str = "",
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._rollback_profile_repairs_sync,
+            operation_id,
+            rollback_backup_path,
+        )
+
+    def _rollback_profile_repairs_sync(
+        self,
+        operation_id: str,
+        rollback_backup_path: str,
+    ) -> dict[str, Any]:
+        operation_id = self._valid_profile_operation_id(operation_id)
+        if not operation_id:
+            raise ValueError("invalid profile repair operation id")
+        now = utc_now()
+        with self._lock:  # noqa: SIM117
+            with self._transaction_sync():
+                operation = self._conn.execute(
+                    "SELECT * FROM profile_repair_operations WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                if operation is None:
+                    raise ValueError("profile repair operation not found")
+                if clean_text(operation["state"], 40) == "rolled_back":
+                    previous = json_loads(operation["result"], {})
+                    return {
+                        **(previous if isinstance(previous, dict) else {}),
+                        "ok": True,
+                        "code": "profile_repair_rollback_idempotent",
+                        "operation_id": operation_id,
+                    }
+                if clean_text(operation["state"], 40) not in {"applied", "partial"}:
+                    raise ValueError("profile repair operation is not rollbackable")
+                snapshot = json_loads(operation["snapshot"], {})
+                records = snapshot.get("records") if isinstance(snapshot, dict) else []
+                records = records if isinstance(records, list) else []
+                results: list[dict[str, Any]] = []
+                groups: dict[str, list[dict[str, Any]]] = {}
+                for index, item in enumerate(records):
+                    if not isinstance(item, dict):
+                        continue
+                    record_kind = clean_text(
+                        item.get("record_kind"), 32
+                    ).lower() or "memory"
+                    record_id = clean_text(
+                        item.get("record_id") or item.get("memory_id"), 120
+                    )
+                    group_id = clean_text(item.get("group_id"), 120)
+                    if not group_id:
+                        group_id = f"legacy:{record_kind}:{record_id}:{index}"
+                    groups.setdefault(group_id, []).append(item)
+
+                restored_portrait_people: set[str] = set()
+                for group_id, group in groups.items():
+                    prepared: list[dict[str, Any]] = []
+                    failures: dict[tuple[str, str], str] = {}
+                    for item in group:
+                        record_kind = clean_text(
+                            item.get("record_kind"), 32
+                        ).lower() or "memory"
+                        record_id = clean_text(
+                            item.get("record_id") or item.get("memory_id"), 120
+                        )
+                        failure_key = (record_kind, record_id)
+                        before = (
+                            item.get("before")
+                            if isinstance(item.get("before"), dict)
+                            else {}
+                        )
+                        if record_kind == "portrait_fact":
+                            row = self._conn.execute(
+                                "SELECT * FROM portrait_facts WHERE id=?",
+                                (record_id,),
+                            ).fetchone()
+                            if row is None:
+                                failures[failure_key] = "missing"
+                                continue
+                            queue_rows = self._conn.execute(
+                                """
+                                SELECT * FROM portrait_learning_queue
+                                WHERE fact_id=? ORDER BY queue_id
+                                """,
+                                (record_id,),
+                            ).fetchall()
+                            if (
+                                self.profile_portrait_fact_fingerprint(row)
+                                != clean_text(
+                                    item.get("after_fingerprint"), 80
+                                )
+                                or self.profile_portrait_queue_fingerprint(
+                                    queue_rows
+                                )
+                                != clean_text(
+                                    item.get("after_queue_fingerprint"), 80
+                                )
+                            ):
+                                failures[failure_key] = "skip-stale"
+                                continue
+                            queue_snapshot = item.get("learning_queue")
+                            if (
+                                clean_text(before.get("id"), 120) != record_id
+                                or not isinstance(queue_snapshot, list)
+                                or any(
+                                    not isinstance(queue_item, dict)
+                                    or clean_text(
+                                        queue_item.get("fact_id"), 120
+                                    )
+                                    != record_id
+                                    for queue_item in queue_snapshot
+                                )
+                            ):
+                                failures[failure_key] = "invalid-snapshot"
+                                continue
+                            prepared.append(
+                                {
+                                    "item": item,
+                                    "record_kind": record_kind,
+                                    "record_id": record_id,
+                                    "restored": before,
+                                }
+                            )
+                            continue
+                        if record_kind != "memory":
+                            failures[failure_key] = "invalid-snapshot"
+                            continue
+                        row = self._conn.execute(
+                            "SELECT * FROM memories WHERE id=?", (record_id,)
+                        ).fetchone()
+                        if row is None:
+                            failures[failure_key] = "missing"
+                            continue
+                        current = MemoryRecord.from_row(row)
+                        if self.profile_memory_fingerprint(current) != clean_text(
+                            item.get("after_fingerprint"), 80
+                        ):
+                            failures[failure_key] = "skip-stale"
+                            continue
+                        try:
+                            restored = self._memory_from_db_snapshot(before)
+                        except (KeyError, TypeError, ValueError):
+                            failures[failure_key] = "invalid-snapshot"
+                            continue
+                        prepared.append(
+                            {
+                                "item": item,
+                                "record_kind": record_kind,
+                                "record_id": record_id,
+                                "restored": restored,
+                            }
+                        )
+
+                    if failures:
+                        for item in group:
+                            record_kind = clean_text(
+                                item.get("record_kind"), 32
+                            ).lower() or "memory"
+                            record_id = clean_text(
+                                item.get("record_id")
+                                or item.get("memory_id"),
+                                120,
+                            )
+                            result_item = {
+                                "record_kind": record_kind,
+                                "record_id": record_id,
+                                "group_id": group_id,
+                                "status": failures.get(
+                                    (record_kind, record_id),
+                                    "skip-group-stale",
+                                ),
+                            }
+                            if record_kind == "memory":
+                                result_item["memory_id"] = record_id
+                            results.append(result_item)
+                        continue
+
+                    for prepared_item in prepared:
+                        item = prepared_item["item"]
+                        record_kind = prepared_item["record_kind"]
+                        record_id = prepared_item["record_id"]
+                        result_item = {
+                            "record_kind": record_kind,
+                            "record_id": record_id,
+                            "group_id": group_id,
+                        }
+                        if record_kind == "memory":
+                            result_item["memory_id"] = record_id
+                        if bool(item.get("guard_only")):
+                            result_item["status"] = "guard-verified"
+                            results.append(result_item)
+                            continue
+                        if record_kind == "portrait_fact":
+                            restored_fact = prepared_item["restored"]
+                            if not self._write_portrait_fact_snapshot_sync(
+                                restored_fact
+                            ) or not self._restore_portrait_queue_snapshot_sync(
+                                record_id, item.get("learning_queue", [])
+                            ):
+                                raise ValueError(
+                                    "invalid portrait repair snapshot"
+                                )
+                            person_id = clean_text(
+                                restored_fact.get("person_id"), 80
+                            )
+                            if person_id:
+                                restored_portrait_people.add(person_id)
+                            result_item["status"] = "rolled-back"
+                            results.append(result_item)
+                            continue
+
+                        restored = prepared_item["restored"]
+                        self._write_memory_record_sync(restored)
+                        self._conn.execute(
+                            "DELETE FROM review_queue WHERE memory_id=?",
+                            (record_id,),
+                        )
+                        for review in item.get("review_queue", []):
+                            if not isinstance(review, dict):
+                                continue
+                            self._conn.execute(
+                                """
+                                INSERT INTO review_queue(id, memory_id, reason, status, created_at, updated_at)
+                                VALUES(?,?,?,?,?,?)
+                                """,
+                                (
+                                    clean_text(review.get("id"), 120),
+                                    record_id,
+                                    clean_text(review.get("reason"), 500),
+                                    clean_text(review.get("status"), 40),
+                                    clean_text(review.get("created_at"), 80),
+                                    clean_text(review.get("updated_at"), 80),
+                                ),
+                            )
+                        self._conn.execute(
+                            "DELETE FROM memory_embeddings WHERE memory_id=?",
+                            (record_id,),
+                        )
+                        for embedding in item.get("embeddings", []):
+                            if not isinstance(embedding, dict):
+                                continue
+                            self._conn.execute(
+                                """
+                                INSERT INTO memory_embeddings(
+                                    memory_id, provider_id, text_hash, dimension, vector, created_at, updated_at
+                                ) VALUES(?,?,?,?,?,?,?)
+                                """,
+                                (
+                                    record_id,
+                                    clean_text(embedding.get("provider_id"), 160),
+                                    clean_text(embedding.get("text_hash"), 80),
+                                    max(0, int(embedding.get("dimension") or 0)),
+                                    clean_text(embedding.get("vector"), 100000),
+                                    clean_text(embedding.get("created_at"), 80),
+                                    clean_text(embedding.get("updated_at"), 80),
+                                ),
+                            )
+                        result_item["status"] = "rolled-back"
+                        results.append(result_item)
+
+                for person_id in sorted(restored_portrait_people):
+                    self._bump_portrait_revision_sync(person_id)
+
+                rolled_back = sum(
+                    1 for item in results if item.get("status") == "rolled-back"
+                )
+                stale = sum(
+                    1
+                    for item in results
+                    if item.get("status")
+                    in {
+                        "skip-stale",
+                        "skip-group-stale",
+                        "missing",
+                        "invalid-snapshot",
+                    }
+                )
+                guards = sum(
+                    1 for item in results if item.get("status") == "guard-verified"
+                )
+                previous_result = json_loads(operation["result"], {})
+                result = (
+                    dict(previous_result) if isinstance(previous_result, dict) else {}
+                )
+                result.update(
+                    {
+                        "ok": True,
+                        "code": "profile_repair_rolled_back",
+                        "operation_id": operation_id,
+                        "rollback_backup_path": clean_text(rollback_backup_path, 2000),
+                        "rollback_results": results,
+                        "rolled_back": rolled_back,
+                        "rollback_stale": stale,
+                    }
+                )
+                state = (
+                    "rolled_back"
+                    if rolled_back + guards == len(results) and stale == 0
+                    else "partial"
+                )
+                self._conn.execute(
+                    "UPDATE profile_repair_operations SET state=?, result=?, updated_at=? WHERE operation_id=?",
+                    (state, json_dumps(result), now, operation_id),
+                )
+                self._embedding_candidate_cache.clear()
+                self._embedding_candidate_cache_revision = ""
+        return result
 
     async def insert_memory(self, record: MemoryRecord, review_reason: str = "") -> str:
         return await self._run_recoverable_database_operation(
@@ -6382,6 +8648,19 @@ class MemoryStore:
                 next_metadata = metadata if isinstance(metadata, dict) else json_loads(row["metadata"], {})
                 if not isinstance(next_metadata, dict):
                     next_metadata = {}
+                prospective = MemoryRecord.from_row(row)
+                prospective.memory_type = next_type
+                prospective.visibility = next_visibility
+                prospective.lifecycle = next_lifecycle
+                prospective.review_status = next_review_status
+                prospective.metadata = dict(next_metadata)
+                current = MemoryRecord.from_row(row)
+                if (
+                    self._profile_single_value_invariant_signature(current)
+                    != self._profile_single_value_invariant_signature(prospective)
+                    and self._profile_single_value_domain_conflict_sync(prospective)
+                ):
+                    return False
                 try:
                     next_importance = max(0.0, min(1.0, float(importance if importance is not None else row["importance"])))
                 except Exception:
@@ -6563,20 +8842,156 @@ class MemoryStore:
         return await asyncio.to_thread(self._update_review_status_sync, memory_id, status)
 
     def _update_review_status_sync(self, memory_id: str, status: str) -> bool:
+        memory_id = clean_text(memory_id, 120)
         now = utc_now()
-        status = "auto" if status in {"approve", "approved", "auto"} else "rejected"
-        lifecycle = "archived" if status == "rejected" else "stable_memory"
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE memories SET review_status=?, lifecycle=?, updated_at=? WHERE id=?",
-                (status, lifecycle, now, memory_id),
-            )
-            self._conn.execute(
-                "UPDATE review_queue SET status=?, updated_at=? WHERE memory_id=?",
-                (status, now, memory_id),
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+        review_status = (
+            "auto"
+            if clean_text(status, 24).lower() in {"approve", "approved", "auto"}
+            else "rejected"
+        )
+        lifecycle = "archived" if review_status == "rejected" else "stable_memory"
+        with self._lock:  # noqa: SIM117
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    "SELECT * FROM memories WHERE id=?", (memory_id,)
+                ).fetchone()
+                if row is None:
+                    return False
+
+                record = MemoryRecord.from_row(row)
+                metadata = (
+                    dict(record.metadata) if isinstance(record.metadata, dict) else {}
+                )
+                extractor = clean_text(metadata.get("extractor"), 40).lower()
+                dimension = clean_text(
+                    metadata.get("profile_dimension"), 80
+                ).lower()
+                is_rule_profile = bool(
+                    record.memory_type in self.PROFILE_MEMORY_TYPES
+                    and extractor in self.PROFILE_RULE_EXTRACTORS
+                )
+                if not is_rule_profile:
+                    self._conn.execute(
+                        "UPDATE memories SET review_status=?, lifecycle=?, updated_at=? WHERE id=?",
+                        (review_status, lifecycle, now, memory_id),
+                    )
+                    self._conn.execute(
+                        "UPDATE review_queue SET status=?, updated_at=? WHERE memory_id=?",
+                        (review_status, now, memory_id),
+                    )
+                    return True
+
+                if review_status == "rejected":
+                    metadata["profile_state"] = "rejected"
+                    metadata["profile_status"] = "rejected"
+                    metadata["profile_archive_reason"] = "manual_rejected"
+                    metadata["profile_status_updated_at"] = now
+                    metadata["quality_gate_passed"] = False
+                    record.metadata = metadata
+                    record.lifecycle = "archived"
+                    record.review_status = "rejected"
+                    record.updated_at = now
+                    self._write_memory_record_sync(record)
+                    self._conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id=?", (record.id,)
+                    )
+                    self._conn.execute(
+                        "UPDATE review_queue SET status='rejected', updated_at=? WHERE memory_id=?",
+                        (now, record.id),
+                    )
+                    self._embedding_candidate_cache.clear()
+                    self._embedding_candidate_cache_revision = ""
+                    return True
+
+                profile_value = clean_text(metadata.get("profile_value"), 240)
+                normalized_value = normalize_profile_value(
+                    metadata.get("normalized_value")
+                )
+                if (
+                    not dimension
+                    or not profile_value
+                    or not normalized_value
+                    or normalize_profile_value(profile_value) != normalized_value
+                ):
+                    return False
+
+                domain_rows = self._profile_domain_rows_sync(record)
+                try:
+                    quality_score = float(
+                        metadata.get("extraction_quality_score") or 0.0
+                    )
+                except (TypeError, ValueError):
+                    quality_score = 0.0
+                if not math.isfinite(quality_score):
+                    quality_score = 0.0
+                metadata["profile_state"] = "active"
+                metadata["profile_status"] = "active"
+                metadata["extraction_quality"] = "confirmed"
+                metadata["extraction_quality_score"] = round(
+                    max(0.95, min(1.0, quality_score)), 4
+                )
+                metadata["evidence_strength"] = "user_confirmed"
+                metadata["quality_gate_passed"] = True
+                metadata["required_evidence_count"] = 1
+                metadata["profile_confirmation_source"] = "manual_review"
+                metadata["profile_status_updated_at"] = now
+                metadata["profile_cardinality"] = (
+                    "single"
+                    if dimension in self.PROFILE_SINGLE_VALUE_DIMENSIONS
+                    else clean_text(metadata.get("profile_cardinality"), 20).lower()
+                    or "multi"
+                )
+                record.metadata = metadata
+                record.confidence = max(float(record.confidence or 0.0), 0.95)
+                record.lifecycle = "stable_memory"
+                record.review_status = "auto"
+                record.updated_at = now
+                self._write_memory_record_sync(record)
+
+                cardinality = metadata["profile_cardinality"]
+                if cardinality == "single":
+                    for domain_row in domain_rows:
+                        other = MemoryRecord.from_row(domain_row)
+                        if other.id == record.id or self._profile_state(other) != "active":
+                            continue
+                        other_metadata = (
+                            dict(other.metadata)
+                            if isinstance(other.metadata, dict)
+                            else {}
+                        )
+                        if (
+                            clean_text(
+                                other_metadata.get("profile_dimension"), 80
+                            ).lower()
+                            != dimension
+                        ):
+                            continue
+                        other_metadata["profile_state"] = "superseded"
+                        other_metadata["profile_status"] = "superseded"
+                        other_metadata["profile_superseded_by"] = record.id
+                        other_metadata["profile_status_updated_at"] = now
+                        other.metadata = other_metadata
+                        other.lifecycle = "archived"
+                        other.review_status = "auto"
+                        other.supersedes_id = record.id
+                        other.updated_at = now
+                        self._write_memory_record_sync(other)
+                        self._conn.execute(
+                            "DELETE FROM memory_embeddings WHERE memory_id=?",
+                            (other.id,),
+                        )
+                        self._conn.execute(
+                            "UPDATE review_queue SET status='superseded', updated_at=? WHERE memory_id=?",
+                            (now, other.id),
+                        )
+
+                self._conn.execute(
+                    "UPDATE review_queue SET status='auto', updated_at=? WHERE memory_id=?",
+                    (now, record.id),
+                )
+                self._embedding_candidate_cache.clear()
+                self._embedding_candidate_cache_revision = ""
+                return True
 
     async def approve_livingmemory_imports(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._approve_livingmemory_imports_sync)
@@ -6685,13 +9100,29 @@ class MemoryStore:
         return await asyncio.to_thread(self._update_memory_visibility_sync, memory_id, visibility)
 
     def _update_memory_visibility_sync(self, memory_id: str, visibility: str) -> bool:
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE memories SET visibility=?, updated_at=? WHERE id=?",
-                (clean_text(visibility, 40), utc_now(), clean_text(memory_id, 120)),
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+        memory_id = clean_text(memory_id, 120)
+        visibility = clean_text(visibility, 40)
+        now = utc_now()
+        with self._lock:  # noqa: SIM117
+            with self._transaction_sync():
+                row = self._conn.execute(
+                    "SELECT * FROM memories WHERE id=?", (memory_id,)
+                ).fetchone()
+                if row is None:
+                    return False
+                record = MemoryRecord.from_row(row)
+                target = deepcopy(record)
+                target.visibility = visibility
+                if self._profile_single_value_domain_conflict_sync(target):
+                    return False
+                cur = self._conn.execute(
+                    "UPDATE memories SET visibility=?, updated_at=? WHERE id=?",
+                    (visibility, now, memory_id),
+                )
+                if cur.rowcount:
+                    self._embedding_candidate_cache.clear()
+                    self._embedding_candidate_cache_revision = ""
+                return cur.rowcount > 0
 
     async def update_memory_lifecycle(self, memory_id: str, lifecycle: str) -> bool:
         return await asyncio.to_thread(self._update_memory_lifecycle_sync, memory_id, lifecycle)
