@@ -62,29 +62,78 @@ class MemoryAuditManager:
                 group_id=record.group_id,
             )
 
-        attempts = await self.service._summary_provider_attempts(ctx)
-        if not attempts:
-            raise RuntimeError("没有可用的记忆总结模型，无法生成审计预览")
         proposals: list[dict[str, Any]] = []
-        provider_id = ""
+        provider_ids: list[dict[str, str]] = []
         errors: list[str] = []
-        completed = False
-        for attempt in attempts:
-            provider = attempt.get("provider")
-            provider_id = clean_text(attempt.get("provider_id"), 120) or self.service._provider_runtime_id(provider)
-            try:
-                proposals = await self._request_proposals(provider, provider_id, prepared)
-                completed = True
-                break
-            except Exception as exc:
-                errors.append(clean_text(exc, 240))
-        if not completed:
+        prepared_by_scope: dict[str, list[dict[str, Any]]] = {}
+        for item in prepared:
+            record: MemoryRecord = item["record"]
+            record_scope = clean_text(record.scope, 40).lower()
+            scope_key = record_scope if record_scope in {"private", "group"} else "unknown"
+            prepared_by_scope.setdefault(scope_key, []).append(item)
+
+        for scope, scoped_candidates in prepared_by_scope.items():
+            scoped_ctx = self._context_for_scope(scoped_candidates[0]["record"], ctx, scope)
+            attempts = await self.service._summary_provider_attempts(scoped_ctx)
+            if not attempts:
+                errors.append(f"scope={scope}: no summary provider")
+                continue
+            completed = False
+            attempt_errors: list[str] = []
+            for attempt in attempts:
+                provider = attempt.get("provider")
+                provider_id = (
+                    clean_text(attempt.get("provider_id"), 120)
+                    or self.service._provider_runtime_id(provider)
+                )
+                try:
+                    scoped_proposals = await self._request_proposals(provider, provider_id, scoped_candidates)
+                    proposals.extend(scoped_proposals)
+                    provider_ids.append({"scope": scope, "provider_id": provider_id})
+                    completed = True
+                    break
+                except Exception as exc:
+                    attempt_errors.append(f"scope={scope}: {clean_text(exc, 240)}")
+            if not completed:
+                errors.extend(attempt_errors or [f"scope={scope}: provider returned no result"])
+                continue
+
+        if errors:
+            # Do not persist a partial audit preview: applying it would make
+            # the result look complete while one scope was never checked.
             raise RuntimeError(f"记忆审计模型未返回有效建议：{errors[-1]}")
+        if not provider_ids:
+            raise RuntimeError("没有可用的记忆总结模型，无法生成审计预览")
 
         accepted = self._validate_proposals(proposals, prepared, max_items)
-        batch = self._new_batch(accepted, candidate_count=len(prepared), provider_id=provider_id)
+        unique_provider_ids = list(
+            dict.fromkeys(item["provider_id"] for item in provider_ids if item["provider_id"])
+        )
+        batch = self._new_batch(
+            accepted,
+            candidate_count=len(prepared),
+            provider_id=unique_provider_ids[0] if len(unique_provider_ids) == 1 else "",
+            provider_ids=provider_ids,
+        )
         await asyncio.to_thread(self._write_batch, batch)
         return self._public_batch(batch)
+
+    @staticmethod
+    def _context_for_scope(
+        record: MemoryRecord,
+        fallback: SessionContext,
+        scope: str,
+    ) -> SessionContext:
+        resolved_scope = scope if scope in {"private", "group"} else "unknown"
+        return SessionContext(
+            session_id=record.session_id,
+            scope=resolved_scope,
+            platform=record.platform,
+            user_id=record.subject.id if record.subject.kind == "user" else "",
+            user_name=record.subject.name if record.subject.kind == "user" else "",
+            group_id=record.group_id,
+            bot_id=fallback.bot_id,
+        )
 
     async def status(self, batch_id: str) -> dict[str, Any]:
         return self._public_batch(await asyncio.to_thread(self._read_batch, batch_id))
@@ -432,6 +481,7 @@ class MemoryAuditManager:
         *,
         candidate_count: int,
         provider_id: str,
+        provider_ids: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         expire_hours = max(1, min(168, self.service.config.int("maintenance_audit.preview_expire_hours", 24)))
@@ -443,6 +493,7 @@ class MemoryAuditManager:
             "created_at": now.isoformat(timespec="seconds"),
             "expires_at": (now + timedelta(hours=expire_hours)).isoformat(timespec="seconds"),
             "provider_id": clean_text(provider_id, 120),
+            "provider_ids": provider_ids or [],
             "candidate_count": int(candidate_count),
             "backup_path": "",
             "items": items,

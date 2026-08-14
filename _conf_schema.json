@@ -152,26 +152,54 @@
   },
   "memory_summary": {
     "description": "长期记忆总结",
-    "hint": "把时间线整理为可长期保存、可召回的阶段性记忆。模型、触发阈值和证据长度都在这里配置。",
+    "hint": "把时间线整理为可长期保存、可召回的阶段性记忆。私聊/群聊总结模型、触发阈值和证据长度都在这里配置。",
     "type": "object",
     "items": {
       "enabled": {
         "description": "启用阶段性总结",
-        "hint": "开启后，同一会话累计到阈值时会调用当前会话模型生成 conversation_summary 长期记忆。",
+        "hint": "开启后，同一会话累计到阈值时会按私聊/群聊范围选择总结模型，生成 conversation_summary 长期记忆。",
         "type": "bool",
         "default": true
       },
       "provider_id": {
-        "description": "总结模型提供商",
+        "description": "通用总结模型提供商（兼容回退）",
         "_special": "select_provider",
-        "hint": "选择用于阶段性记忆总结的 LLM 提供商。留空则使用当前会话正在使用的模型。",
+        "hint": "私聊或群聊专用 Provider 未配置或专用模型失败时使用此通用 Provider；留空则使用当前会话正在使用的模型。",
         "type": "string",
         "default": ""
       },
       "fallback_provider_id": {
-        "description": "备用总结模型提供商",
+        "description": "通用备用总结模型提供商（兼容回退）",
         "_special": "select_provider",
-        "hint": "主总结模型不可用或总结失败时使用。留空则直接回退当前会话模型。",
+        "hint": "对应专用备用 Provider 未配置时使用；专用主模型不可用或总结失败时也会尝试。留空则直接回退当前会话模型。",
+        "type": "string",
+        "default": ""
+      },
+      "private_provider_id": {
+        "description": "私聊总结模型提供商",
+        "_special": "select_provider",
+        "hint": "仅用于私聊时间线的阶段性总结。留空时回退到通用总结模型提供商。",
+        "type": "string",
+        "default": ""
+      },
+      "private_fallback_provider_id": {
+        "description": "私聊备用总结模型提供商",
+        "_special": "select_provider",
+        "hint": "私聊主总结模型失败时使用。留空时依次回退到通用备用 Provider 和当前会话模型。",
+        "type": "string",
+        "default": ""
+      },
+      "group_provider_id": {
+        "description": "群聊总结模型提供商",
+        "_special": "select_provider",
+        "hint": "仅用于群聊时间线的阶段性总结。留空时回退到通用总结模型提供商。",
+        "type": "string",
+        "default": ""
+      },
+      "group_fallback_provider_id": {
+        "description": "群聊备用总结模型提供商",
+        "_special": "select_provider",
+        "hint": "群聊主总结模型失败时使用。留空时依次回退到通用备用 Provider 和当前会话模型。",
         "type": "string",
         "default": ""
       },

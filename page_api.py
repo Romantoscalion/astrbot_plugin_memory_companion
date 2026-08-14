@@ -1236,6 +1236,14 @@ class PluginPageApi:
                     "enabled": config.bool("memory_summary.enabled", True),
                     "provider_id": str(config.get("memory_summary.provider_id", "") or ""),
                     "fallback_provider_id": str(config.get("memory_summary.fallback_provider_id", "") or ""),
+                    "private_provider_id": str(config.get("memory_summary.private_provider_id", "") or ""),
+                    "private_fallback_provider_id": str(
+                        config.get("memory_summary.private_fallback_provider_id", "") or ""
+                    ),
+                    "group_provider_id": str(config.get("memory_summary.group_provider_id", "") or ""),
+                    "group_fallback_provider_id": str(
+                        config.get("memory_summary.group_fallback_provider_id", "") or ""
+                    ),
                     "min_events": config.int("memory_summary.min_events", 8),
                     "trigger_event_count": config.int("memory_summary.trigger_event_count", 12),
                     "trigger_interval_minutes": config.int("memory_summary.trigger_interval_minutes", 60),

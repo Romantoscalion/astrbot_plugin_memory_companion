@@ -645,6 +645,105 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("primary", attempts[0]["source"])
         self.assertIs(provider, attempts[0]["provider"])
 
+    async def test_summary_provider_attempts_use_scope_specific_models(self) -> None:
+        providers = {
+            "private-model": _TextProvider('{"summary":"private"}'),
+            "group-model": _TextProvider('{"summary":"group"}'),
+            "shared-model": _TextProvider('{"summary":"shared"}'),
+        }
+        requested: list[str] = []
+
+        async def get_provider_by_id(provider_id):
+            requested.append(str(provider_id))
+            return providers.get(str(provider_id))
+
+        context = SimpleNamespace(
+            get_provider_by_id=get_provider_by_id,
+            get_using_provider=lambda _session_id: None,
+        )
+        service = self.make_service(
+            {
+                "memory_summary": {
+                    "provider_id": "shared-model",
+                    "private_provider_id": "private-model",
+                    "group_provider_id": "group-model",
+                }
+            },
+            context=context,
+        )
+
+        private_attempts = await service._summary_provider_attempts(
+            SessionContext(session_id="private:u1", scope="private", user_id="u1")
+        )
+        group_attempts = await service._summary_provider_attempts(
+            SessionContext(session_id="group:g1", scope="group", group_id="g1")
+        )
+
+        self.assertEqual(["private-model", "shared-model"], requested[:2])
+        self.assertEqual("private-model", private_attempts[0]["provider_id"])
+        self.assertEqual("group-model", group_attempts[0]["provider_id"])
+        self.assertNotEqual(private_attempts[0]["provider"], group_attempts[0]["provider"])
+
+    async def test_summary_provider_attempts_fall_back_to_shared_model_when_scope_model_unset(self) -> None:
+        shared = _TextProvider('{"summary":"shared"}')
+
+        async def get_provider_by_id(provider_id):
+            return shared if provider_id == "shared-model" else None
+
+        context = SimpleNamespace(
+            get_provider_by_id=get_provider_by_id,
+            get_using_provider=lambda _session_id: None,
+        )
+        service = self.make_service(
+            {"memory_summary": {"provider_id": "shared-model"}},
+            context=context,
+        )
+
+        attempts = await service._summary_provider_attempts(
+            SessionContext(session_id="group:g1", scope="group", group_id="g1")
+        )
+
+        self.assertEqual(1, len(attempts))
+        self.assertEqual("primary", attempts[0]["source"])
+        self.assertEqual("shared-model", attempts[0]["provider_id"])
+
+    async def test_summary_provider_attempts_keep_scope_specific_fallbacks_separate(self) -> None:
+        providers = {
+            "private-model": _TextProvider('{"summary":"private"}'),
+            "private-fallback": _TextProvider('{"summary":"private fallback"}'),
+            "group-model": _TextProvider('{"summary":"group"}'),
+            "group-fallback": _TextProvider('{"summary":"group fallback"}'),
+        }
+
+        async def get_provider_by_id(provider_id):
+            return providers.get(str(provider_id))
+
+        context = SimpleNamespace(
+            get_provider_by_id=get_provider_by_id,
+            get_using_provider=lambda _session_id: None,
+        )
+        service = self.make_service(
+            {
+                "memory_summary": {
+                    "private_provider_id": "private-model",
+                    "private_fallback_provider_id": "private-fallback",
+                    "group_provider_id": "group-model",
+                    "group_fallback_provider_id": "group-fallback",
+                }
+            },
+            context=context,
+        )
+
+        private_attempts = await service._summary_provider_attempts(
+            SessionContext(session_id="private:u1", scope="private", user_id="u1")
+        )
+        group_attempts = await service._summary_provider_attempts(
+            SessionContext(session_id="group:g1", scope="group", group_id="g1")
+        )
+
+        self.assertEqual(["private-model", "private-fallback"], [item["provider_id"] for item in private_attempts])
+        self.assertEqual(["group-model", "group-fallback"], [item["provider_id"] for item in group_attempts])
+
     async def test_summary_reports_only_rows_actually_sent_to_provider(self) -> None:
         summarizer = MemorySummarizer(max_input_chars=1000, provider_timeout_seconds=1)
         rows = [

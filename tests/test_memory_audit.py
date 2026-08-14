@@ -26,8 +26,10 @@ class _Response:
 class _Provider:
     def __init__(self, payload: dict):
         self.payload = payload
+        self.prompts: list[str] = []
 
-    async def text_chat(self, **_kwargs):
+    async def text_chat(self, **kwargs):
+        self.prompts.append(str(kwargs.get("prompt") or ""))
         return _Response(self.payload)
 
 
@@ -158,6 +160,61 @@ class MemoryAuditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(before.content, after.content)
         self.assertEqual(before.updated_at, after.updated_at)
         self.assertTrue((service.audit.root / f"{batch['batch_id']}.json").exists())
+
+    async def test_preview_routes_private_and_group_candidates_to_separate_models(self) -> None:
+        service, _root = self.make_service({"items": []})
+        await self.seed(service)
+        group_event_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id="qq:GroupMessage:g1",
+            scope="group",
+            subject_id="u2",
+            object_id="g1",
+            content="group fact",
+        )
+        await service.store.insert_memory(
+            MemoryRecord(
+                id="summary-group",
+                memory_type="conversation_summary",
+                subject=EntityRef.bot_self(),
+                object=EntityRef(kind="group", id="g1"),
+                scope="group",
+                session_id="qq:GroupMessage:g1",
+                group_id="g1",
+                visibility="group_public",
+                lifecycle="stable_memory",
+                content="group fact",
+                evidence="group fact",
+                metadata={
+                    "key_facts_with_refs": [
+                        {"fact": "group fact", "refs": [group_event_id]}
+                    ],
+                },
+            )
+        )
+        private_provider = _Provider({"items": []})
+        group_provider = _Provider({"items": []})
+        routed_scopes: list[str] = []
+
+        async def scoped_attempts(ctx):
+            routed_scopes.append(ctx.scope)
+            provider = group_provider if ctx.scope == "group" else private_provider
+            return [{"provider": provider, "provider_id": f"{ctx.scope}-provider"}]
+
+        service._summary_provider_attempts = scoped_attempts
+        batch = await service.audit.preview(SessionContext())
+
+        self.assertEqual({"private", "group"}, set(routed_scopes))
+        self.assertEqual(1, len(private_provider.prompts))
+        self.assertEqual(1, len(group_provider.prompts))
+        self.assertIn("summary-1", private_provider.prompts[0])
+        self.assertNotIn("summary-group", private_provider.prompts[0])
+        self.assertIn("summary-group", group_provider.prompts[0])
+        self.assertNotIn("summary-1", group_provider.prompts[0])
+        self.assertEqual(
+            {("private", "private-provider"), ("group", "group-provider")},
+            {(item["scope"], item["provider_id"]) for item in batch["provider_ids"]},
+        )
 
     async def test_apply_requires_confirmation_and_rollback_restores_content(self) -> None:
         proposal = {

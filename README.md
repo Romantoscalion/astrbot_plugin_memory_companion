@@ -143,7 +143,7 @@ astrbot_plugin_memory_companion
 ### 推荐初始配置
 
 1. 保持 `memory_capture.enabled=true`。
-2. 保持 `memory_summary.enabled=true`，并配置 `memory_summary.provider_id`。
+2. 保持 `memory_summary.enabled=true`，按需配置 `memory_summary.private_provider_id` / `memory_summary.group_provider_id`；不区分会话时仍可只配置兼容字段 `memory_summary.provider_id`。
 3. 保持 `memory_injection.enabled=true`。
 4. 检索模式使用 `retrieval.mode=auto`。
 5. 初期不急着启用 Embedding；记忆变多后再配置 Embedding Provider。
@@ -160,6 +160,8 @@ astrbot_plugin_memory_companion
 ### 阶段性总结
 
 `memory_summary` 控制时间线压缩为长期记忆的节奏。总结输入会作为不可信消息处理，提示词注入、角色覆盖和系统指令伪装会被标记与清洗，降低总结被带偏的概率。
+
+私聊和群聊可以分别选择总结模型：`memory_summary.private_provider_id` 只处理私聊时间线，`memory_summary.group_provider_id` 只处理群聊时间线。对应的 `private_fallback_provider_id` / `group_fallback_provider_id` 用于主模型失败时的备用尝试；未填写专用字段，或专用模型调用失败时，会兼容使用 `provider_id` / `fallback_provider_id`，再回退到当前会话模型。这样可以为群聊选择更轻量或更擅长多人对话的模型，同时不影响已有配置。
 
 如果日志显示请求 `127.0.0.1:11434` 超时，含义是本机 Ollama 没有在期限内生成总结，不是记忆数据库损坏。当前版本默认最多等待 60 秒、单个 Provider 只请求一次；失败后会尝试不同的备用 Provider，并完整保留尚未总结的时间线。可在这里换用更轻的本地模型或独立总结 Provider，并按机器性能调整“总结模型超时秒数”。
 

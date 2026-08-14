@@ -183,6 +183,10 @@ def apply_preset(raw: dict[str, Any], name: str) -> dict[str, Any]:
         "preserved": [
             "memory_summary.provider_id",
             "memory_summary.fallback_provider_id",
+            "memory_summary.private_provider_id",
+            "memory_summary.private_fallback_provider_id",
+            "memory_summary.group_provider_id",
+            "memory_summary.group_fallback_provider_id",
             "retrieval.embedding_provider_id",
             "retrieval.rerank_provider_id",
         ],
