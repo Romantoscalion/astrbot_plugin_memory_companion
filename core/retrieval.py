@@ -10,6 +10,8 @@ from typing import Any
 
 from .identity import session_target_id
 from .models import MemoryRecord, SearchResult, SessionContext, clean_text
+from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
+
 from .store import MemoryStore
 from .time_intent import TimeIntent
 from .visibility import VisibilityPolicy
@@ -243,6 +245,23 @@ class RetrievalEngine:
         ranked, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         total = max(1, int(total_limit or 1))
         ranked = await self._maybe_rerank_results(query, ranked, total)
+        allow_profile_fallback = self._query_allows_profile_fallback(query)
+        block_profile_retrieval = self._query_blocks_profile_retrieval(query)
+
+        def selectable_for_slot(item: SearchResult, slot: str) -> bool:
+            if slot != "user_profile":
+                return True
+            memory_type = clean_text(
+                getattr(item.memory, "memory_type", ""), 80
+            ).lower()
+            if memory_type in PROFILE_MEMORY_TYPES and block_profile_retrieval:
+                return False
+            if allow_profile_fallback:
+                return True
+            return (
+                memory_type not in PROFILE_MEMORY_TYPES
+                or self._profile_result_has_relevance(item)
+            )
         enforced_caps = {clean_text(slot, 60) for slot in (capped_slots or set()) if clean_text(slot, 60)}
         slot_order = [
             "open_loop",
@@ -271,6 +290,7 @@ class RetrievalEngine:
                     for candidate in ranked
                     if candidate.memory.id not in selected_ids
                     and self._slot_for_memory(candidate.memory, ctx) == slot
+                    and selectable_for_slot(candidate, slot)
                 ),
                 None,
             )
@@ -292,6 +312,8 @@ class RetrievalEngine:
                     continue
                 if self._slot_for_memory(item.memory, ctx) != slot:
                     continue
+                if not selectable_for_slot(item, slot):
+                    continue
                 item.reason = self._with_slot_reason(item.reason, slot)
                 slot_map[slot].append(item)
                 selected.append(item)
@@ -307,6 +329,8 @@ class RetrievalEngine:
                 if item.memory.id in selected_ids:
                     continue
                 slot = self._slot_for_memory(item.memory, ctx)
+                if not selectable_for_slot(item, slot):
+                    continue
                 slot_limit = max(0, int(slot_limits.get(slot, 0) or 0))
                 if slot_limit <= 0:
                     continue
@@ -1068,10 +1092,22 @@ class RetrievalEngine:
         searchable: list[tuple[MemoryRecord, str]] = []
         prefiltered: dict[str, int] = {}
         time_filtered = 0
+        block_profile_retrieval = self._query_blocks_profile_retrieval(query)
         for memory in candidates:
-            visibility_reason, prefilter_reason = self._search_visibility_reason(memory, ctx, acl_state)
+            memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
+            visibility_reason, prefilter_reason = self._search_visibility_reason(
+                memory, ctx, acl_state
+            )
             if visibility_reason:
-                if time_intent is not None and time_intent.active and not self._memory_overlaps_time_window(memory, time_intent):
+                if memory_type in PROFILE_MEMORY_TYPES and block_profile_retrieval:
+                    reason = "profile_intent_not_requested"
+                    prefiltered[reason] = prefiltered.get(reason, 0) + 1
+                    continue
+                if (
+                    time_intent is not None
+                    and time_intent.active
+                    and not self._memory_overlaps_time_window(memory, time_intent)
+                ):
                     time_filtered += 1
                     continue
                 searchable.append((memory, visibility_reason))
@@ -1736,6 +1772,9 @@ class RetrievalEngine:
         ctx: SessionContext,
         acl_state: dict[str, object],
     ) -> tuple[str, str]:
+        quality_allowed, quality_reason = self._profile_retrieval_decision(memory)
+        if not quality_allowed:
+            return "", quality_reason
         visible, visibility_reason = self.policy.is_visible(memory, ctx)
         acl_deny_reason = self._acl_deny_reason(memory, ctx, acl_state)
         if visible:
@@ -1749,6 +1788,296 @@ class RetrievalEngine:
             return acl_reason, ""
         privacy_reason = self._acl_privacy_guard_reason(memory, ctx, visibility_reason, acl_state)
         return "", privacy_reason or visibility_reason
+
+    @staticmethod
+    def _profile_retrieval_decision(memory: MemoryRecord) -> tuple[bool, str]:
+        """Keep inactive and low-quality profile candidates out of every route."""
+        memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        profile_state = clean_text(metadata.get("profile_state"), 40).lower()
+        review_status = clean_text(getattr(memory, "review_status", ""), 40).lower()
+        lifecycle = clean_text(getattr(memory, "lifecycle", ""), 40).lower()
+        is_profile = memory_type in PROFILE_MEMORY_TYPES or bool(profile_state)
+        if is_profile and review_status in {"pending", "rejected"}:
+            return False, f"profile_review_{review_status}"
+        if is_profile and lifecycle == "archived":
+            return False, "profile_state_archived"
+        if profile_state in {
+            "candidate",
+            "pending",
+            "rejected",
+            "superseded",
+            "archived",
+        }:
+            return False, f"profile_state_{profile_state}"
+        allowed, reason = profile_quality_decision(memory, require_active=True)
+        if not allowed:
+            return False, reason
+        return True, "profile_quality_compatible"
+
+    def _query_allows_profile_fallback(self, query: str) -> bool:
+        """Reserve a profile slot without lexical evidence only for profile intent."""
+        text = clean_text(query, 1000)
+        compact = re.sub(r"[\s，。！？!?,.、~～…]+", "", text).lower()
+        return bool(
+            compact
+            and not self._looks_like_current_task_query(compact)
+            and self._looks_like_explicit_profile_query(text)
+        )
+
+    def _query_blocks_profile_retrieval(self, query: str) -> bool:
+        """Block portrait retrieval for greetings, current state, and empty queries."""
+        text = clean_text(query, 1000)
+        compact = re.sub(r"[\s，。！？!?,.、~～…]+", "", text).lower()
+        if not compact:
+            return True
+        if self._looks_like_current_state_query(compact):
+            return True
+        if self._query_allows_profile_fallback(text):
+            return False
+        greetings = {
+            "你好",
+            "您好",
+            "嗨",
+            "哈喽",
+            "hello",
+            "hi",
+            "早",
+            "早安",
+            "早上好",
+            "午安",
+            "晚上好",
+            "晚安",
+            "在吗",
+            "在不在",
+            "最近好吗",
+            "你好吗",
+        }
+        greeting_base = re.sub(r"(?:呀|啊|哈|哦|喔|哟|啦|呢|诶|欸)+$", "", compact)
+        if compact in greetings or greeting_base in greetings:
+            return True
+        return not bool(self._terms(text))
+
+    def _profile_result_has_relevance(self, item: SearchResult) -> bool:
+        reason = clean_text(getattr(item, "reason", ""), 1600).lower()
+        if re.search(r"(?:^|;)(?:exact|profile)=1(?:;|$)", reason):
+            return True
+        hits = re.search(r"(?:^|;)hits=(\d+)", reason)
+        if hits and int(hits.group(1)) > 0:
+            return True
+        vector = re.search(r"(?:^|;)vector=([0-9.]+)", reason)
+        if vector:
+            try:
+                return float(vector.group(1)) >= self.embedding_score_threshold
+            except ValueError:
+                return False
+        return False
+
+    @staticmethod
+    def _looks_like_explicit_profile_query(text: str) -> bool:
+        source = clean_text(text, 1000).lower()
+        compact = re.sub(r"\s+", "", source)
+        if not compact:
+            return False
+        chinese_markers = (
+            "我的称呼",
+            "称呼我",
+            "怎么叫我",
+            "如何叫我",
+            "该叫我",
+            "喊我什么",
+            "我叫什么",
+            "我的名字",
+            "我的姓名",
+            "我的昵称",
+            "我的职业",
+            "我做什么工作",
+            "我从事什么工作",
+            "我是做什么的",
+            "我的生日",
+            "我的出生",
+            "我的偏好",
+            "我喜欢什么",
+            "我讨厌什么",
+            "我的爱好",
+            "我的习惯",
+            "我的专业",
+            "我的学业",
+            "我的星座",
+            "我的血型",
+            "我的禁忌",
+            "我的忌口",
+            "我对什么过敏",
+            "我不能吃什么",
+            "我的沟通习惯",
+            "我的边界",
+            "我的雷区",
+            "我不想聊什么",
+            "我的资料",
+            "我的画像",
+        )
+        english_patterns = (
+            r"\bmy\s+(?:name|nickname|birthday|occupation|job|profession|"
+            r"preferences?|favorites?|favourites?|habits?|profile|major|"
+            r"education|zodiac|blood\s+type|allerg(?:y|ies)|boundary)\b",
+            r"\bcall\s+me\b",
+            r"\babout\s+me\b",
+            r"\b(?:myname|mynickname|mybirthday|myoccupation|myjob|"
+            r"myprofession|mypreference|myfavorite|myfavourite|myhabit|"
+            r"myprofile|mymajor|myeducation|myzodiac|mybloodtype|"
+            r"myallergy|myboundary|callme|aboutme)\b",
+        )
+        if any(marker in compact for marker in chinese_markers) or any(
+            re.search(pattern, source) for pattern in english_patterns
+        ):
+            return True
+        occupation_patterns = (
+            r"(?:你(?:还)?记得)?我的(?:工作岗位|职位|职务)(?:是)?(?:什么|啥|哪(?:一)?个)?",
+            r"(?:你(?:还)?记得)?我(?:现在|目前)?是做什么工作的?",
+        )
+        general_profile_patterns = (
+            r"关于我的(?:资料|画像|个人信息|基本信息)",
+            r"(?:关于我|你(?:还)?记得我)(?:你)?(?:记得|知道|了解)(?:什么|哪些)",
+        )
+        return any(
+            re.search(pattern, compact)
+            for pattern in (*occupation_patterns, *general_profile_patterns)
+        )
+
+    @staticmethod
+    def _looks_like_current_task_query(text: str) -> bool:
+        """Identify task/project context that must not be treated as a profile query."""
+        compact = re.sub(r"\s+", "", clean_text(text, 1000)).lower()
+        if not compact:
+            return False
+        explicit_task_markers = (
+            "工作安排",
+            "工作进度",
+            "工作计划",
+            "工作任务",
+            "项目安排",
+            "项目进度",
+            "项目计划",
+            "项目任务",
+            "学业进度",
+            "学习进度",
+            "课程进度",
+            "作业进度",
+            "我们的项目",
+            "我们的工作",
+            "待办",
+            "日程",
+            "排班",
+            "工单",
+        )
+        if any(marker in compact for marker in explicit_task_markers):
+            return True
+        english_context_markers = (
+            "job",
+            "work",
+            "project",
+            "task",
+            "meeting",
+            "schedule",
+            "agenda",
+        )
+        english_state_markers = (
+            "progress",
+            "plan",
+            "status",
+            "assignment",
+            "deadline",
+        )
+        if any(marker in compact for marker in english_context_markers) and any(
+            marker in compact for marker in english_state_markers
+        ):
+            return True
+        temporal_markers = (
+            "今天",
+            "今日",
+            "现在",
+            "当前",
+            "这次",
+            "本周",
+            "这周",
+            "最近",
+        )
+        task_markers = ("工作", "任务", "项目", "计划", "安排", "进度", "日程")
+        return any(marker in compact for marker in temporal_markers) and any(
+            marker in compact for marker in task_markers
+        )
+
+    @staticmethod
+    def _profile_query_matches_memory(query: str, memory: MemoryRecord) -> bool:
+        memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
+        if memory_type not in PROFILE_MEMORY_TYPES:
+            return False
+        source = clean_text(query, 1000).lower()
+        if not RetrievalEngine._looks_like_explicit_profile_query(source):
+            return False
+        compact = re.sub(
+            r"[\s，。！？!?,.、~～…]+", "", source
+        )
+        if not compact:
+            return False
+        if any(
+            marker in compact
+            for marker in ("我的画像", "我的资料", "myprofile", "aboutme")
+        ) or re.search(r"关于我的(?:资料|画像|个人信息|基本信息)", compact):
+            return True
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        dimension = clean_text(metadata.get("profile_dimension"), 80).lower()
+        aliases = {
+            "preferred_address": (
+                "我的称呼",
+                "称呼我",
+                "怎么叫我",
+                "如何叫我",
+                "该叫我",
+                "喊我什么",
+                "我叫什么",
+                "我的昵称",
+                "callme",
+                "myname",
+                "mynickname",
+            ),
+            "birthday": ("我的生日", "我的出生", "mybirthday"),
+            "occupation": (
+                "我的职业",
+                "我做什么工作",
+                "我从事什么工作",
+                "我是做什么的",
+                "我的工作岗位",
+                "我的职位",
+                "我的职务",
+                "myoccupation",
+                "myjob",
+                "myprofession",
+            ),
+            "education": ("我的专业", "我的学业", "mymajor", "myeducation"),
+            "zodiac": ("我的星座", "myzodiac"),
+            "blood_type": ("我的血型", "mybloodtype"),
+            "preference": (
+                "我的偏好",
+                "我喜欢什么",
+                "我讨厌什么",
+                "我的爱好",
+                "mypreference",
+                "myfavorite",
+                "myfavourite",
+            ),
+            "dietary_restriction": (
+                "我的禁忌",
+                "我的忌口",
+                "我对什么过敏",
+                "我不能吃什么",
+                "myallergy",
+            ),
+            "communication_preference": ("我的习惯", "我的沟通习惯", "myhabit"),
+            "habit": ("我的习惯", "myhabit"),
+            "boundary": ("我的边界", "我的雷区", "我不想聊什么", "myboundary"),
+        }
+        return any(marker in compact for marker in aliases.get(dimension, ()))
 
     def _prefilter_summary_reason(self, prefiltered: dict[str, int]) -> str:
         total = sum(max(0, int(count or 0)) for count in prefiltered.values())
@@ -1798,6 +2127,7 @@ class RetrievalEngine:
             in {
                 "user_profile",
                 "user_preference",
+                "user_habit",
                 "relationship_claim",
                 "explicit_memory",
                 "manual_memory",
@@ -2052,6 +2382,7 @@ class RetrievalEngine:
         elif len(terms) >= 4:
             min_hits = 2
         return {
+            "query_text": compact,
             "exact_phrases": exact_phrases,
             "min_hits": min_hits,
             "contextual_recall": contextual_recall,
@@ -2289,12 +2620,18 @@ class RetrievalEngine:
         metadata_text_parts = [
             metadata.get("canonical_summary", ""),
             metadata.get("persona_summary", ""),
+            metadata.get("profile_dimension", ""),
+            metadata.get("profile_value", ""),
+            metadata.get("normalized_value", ""),
             " ".join(str(item) for item in metadata.get("key_facts", []) if item)
-            if isinstance(metadata.get("key_facts"), list) else "",
+            if isinstance(metadata.get("key_facts"), list)
+            else "",
             " ".join(str(item) for item in metadata.get("topics", []) if item)
-            if isinstance(metadata.get("topics"), list) else "",
+            if isinstance(metadata.get("topics"), list)
+            else "",
             " ".join(str(item) for item in metadata.get("participants", []) if item)
-            if isinstance(metadata.get("participants"), list) else "",
+            if isinstance(metadata.get("participants"), list)
+            else "",
         ]
         return " ".join(
             [
@@ -2325,9 +2662,19 @@ class RetrievalEngine:
         term_hits = sum(1 for term in terms if term and term in haystack)
         exact_phrases = [str(item) for item in profile.get("exact_phrases", []) if str(item)]
         exact_hit = any(phrase in compact_haystack for phrase in exact_phrases)
+        profile_hit = self._profile_query_matches_memory(
+            str(profile.get("query_text") or " ".join(terms)),
+            memory,
+        )
         min_hits = int(profile.get("min_hits", 1) or 1)
         vector_relevant = vector_score >= self.embedding_score_threshold if self.embedding_enabled else False
-        if terms and not exact_hit and term_hits < min_hits and not vector_relevant:
+        if (
+            terms
+            and not exact_hit
+            and not profile_hit
+            and term_hits < min_hits
+            and not vector_relevant
+        ):
             return 0.0, f"keyword_hit_too_weak hits={term_hits}/{min_hits}"
         graph_guard_reason = self._livingmemory_graph_relevance_guard(memory, term_hits, exact_hit, min_hits)
         if graph_guard_reason and vector_score < min(0.98, self.embedding_score_threshold + 0.12):
@@ -2342,7 +2689,9 @@ class RetrievalEngine:
                     continue
                 idf = term_stats.get(term, 0.0)
                 bm25 += idf * ((freq * 2.2) / (freq + 1.2))
-            lexical = (0.42 if exact_hit else 0.24) + min(0.72, bm25 * 0.18)
+            lexical = (0.42 if exact_hit or profile_hit else 0.24) + min(
+                0.72, bm25 * 0.18
+            )
         else:
             lexical = 0.0
 
@@ -2370,7 +2719,7 @@ class RetrievalEngine:
         if not terms:
             score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus
         return score, (
-            f"hits={term_hits};exact={int(exact_hit)};bm25={bm25:.2f};"
+            f"hits={term_hits};exact={int(exact_hit)};profile={int(profile_hit)};bm25={bm25:.2f};"
             f"vector={vector_score:.3f};importance={memory.importance:.2f};"
             f"persona={persona_bonus:.2f};dynamics={dynamics_bonus:.2f};recency={age_bonus:.2f}"
         )

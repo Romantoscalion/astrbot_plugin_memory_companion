@@ -65,6 +65,14 @@ class PortraitService:
         scope = self._scope_for_context(ctx)
         if not scope:
             return {"ok": False, "code": "bridge_person_mismatch", "facts": 0}
+        candidates = extract_explicit_candidates(ctx.message_text)
+        if not candidates:
+            return {
+                "ok": True,
+                "code": "portrait_no_candidate",
+                "facts": 0,
+                "person_id": person_ref["person_id"],
+            }
         evidence = build_evidence(
             person_ref=person_ref,
             scope=scope,
@@ -77,20 +85,22 @@ class PortraitService:
         if not evidence_result.get("ok") or not evidence_result.get("created"):
             return {"ok": bool(evidence_result.get("ok")), "code": evidence_result.get("code", "portrait_evidence_recorded"), "facts": 0}
         created = 0
-        for candidate in extract_explicit_candidates(ctx.message_text):
+        for candidate in candidates:
             fact = {
                 **candidate,
                 "person_id": person_ref["person_id"],
                 "portrait_tier": "base",
                 "source_scope": scope,
-                "usable_scope": "self_low_global" if cross_scene_whitelisted_fact(
+                "usable_scope": "self_low_global"
+                if cross_scene_whitelisted_fact(
                     dimension=candidate["dimension"],
                     claim_summary=candidate["claim_summary"],
                     sensitivity=candidate["sensitivity"],
                     source_scope=scope,
-                ) else "source_only",
-                "confidence": 0.9,
-                "status": "active",
+                )
+                else "source_only",
+                "confidence": float(candidate.get("extraction_quality_score") or 0.0),
+                "status": clean_text(candidate.get("profile_state"), 40) or "candidate",
                 "evidence_hashes": [evidence["evidence_hash"]],
                 "context_refs": evidence["context_refs"],
                 "operation_id": f"portrait.explicit:{evidence['evidence_hash'][:24]}",

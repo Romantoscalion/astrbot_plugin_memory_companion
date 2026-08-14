@@ -5,6 +5,11 @@ from typing import Any
 
 from .identity import entity_for_current_target, entity_for_user, looks_like_command
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
+from .profile_quality import (
+    extract_profile_candidates,
+    profile_candidate_metadata,
+    profile_rejection_reason,
+)
 
 
 class MemoryClassifier:
@@ -93,31 +98,46 @@ class MemoryClassifier:
             "visibility": visibility,
             "sayability": "direct",
             "reality_level": "real_user_fact",
-            "lifecycle": "stable_memory",
-            "confidence": 0.82,
-            "importance": 0.68,
-            "review_status": "auto",
             "source_plugin": "memory_companion",
         }
 
-        fact = self._extract_preference_or_profile(ctx, text)
-        if fact:
+        profile_facts = self._extract_profile_facts(ctx, ctx.message_text)
+        facts = profile_facts or [self._extract_non_profile_memory(ctx, text)]
+        for fact in (item for item in facts if item):
+            metadata = {
+                "source_memory_id": source_memory_id,
+                "extractor": "rule_v2",
+                "owner_bot_id": clean_text(ctx.bot_id, 120),
+            }
+            if fact.get("profile_dimension"):
+                metadata.update(
+                    profile_candidate_metadata(fact, source_memory_id=source_memory_id)
+                )
+                metadata["independent_evidence_count"] = 1
+                metadata["evidence_count"] = 1
+            profile_state = clean_text(fact.get("profile_state"), 40) or "active"
             records.append(
                 MemoryRecord(
                     memory_type=fact["memory_type"],
                     content=fact["content"],
                     evidence=text,
                     tags=fact["tags"],
-                    metadata={
-                        "source_memory_id": source_memory_id,
-                        "extractor": "rule_v1",
-                        "owner_bot_id": clean_text(ctx.bot_id, 120),
-                    },
+                    lifecycle="stable_memory"
+                    if profile_state == "active"
+                    else "raw_event",
+                    confidence=float(fact.get("confidence") or 0.82),
+                    importance=float(fact.get("importance") or 0.68),
+                    review_status="auto" if profile_state == "active" else "pending",
+                    metadata=metadata,
                     **base,
                 )
             )
 
         return records
+
+    @staticmethod
+    def profile_rejection_reason(text: Any) -> str:
+        return profile_rejection_reason(text)
 
     def external_record(
         self,
@@ -198,39 +218,70 @@ class MemoryClassifier:
         return min(0.85, score)
 
     def _extract_preference_or_profile(self, ctx: SessionContext, text: str) -> dict[str, Any] | None:
+        facts = self._extract_profile_facts(ctx, text)
+        if facts:
+            return facts[0]
+        return self._extract_non_profile_memory(ctx, text)
+
+    def _extract_profile_facts(
+        self, ctx: SessionContext, text: str
+    ) -> list[dict[str, Any]]:
+        name = ctx.user_name or ctx.user_id or "当前用户"
+        facts: list[dict[str, Any]] = []
+        for candidate in extract_profile_candidates(text):
+            label = clean_text(candidate.get("label"), 40)
+            value = clean_text(candidate.get("profile_value"), 80)
+            facts.append(
+                {
+                    **candidate,
+                    "content": f"{name}明确表达过：{label} {value}",
+                    "tags": [
+                        "stable_fact",
+                        str(candidate["memory_type"]),
+                        label,
+                        str(candidate["profile_dimension"]),
+                    ],
+                }
+            )
+        return facts
+
+    def _extract_non_profile_memory(
+        self, ctx: SessionContext, text: str
+    ) -> dict[str, Any] | None:
+        """Keep non-profile legacy facts while requiring a direct full statement."""
         name = ctx.user_name or ctx.user_id or "当前用户"
         patterns = [
-            # 偏好 - 基础
-            (r"(?:我|咱|俺)(?:很|最|超|特别|有点|真的|真的好|超级)?喜欢(.{1,40})", "user_preference", "喜欢"),
-            (r"(?:我|咱|俺)(?:很|最|超|特别|真的)?讨厌(.{1,40})", "user_preference", "讨厌"),
-            (r"(?:我|咱|俺)(?:不喜欢|不爱|不太喜欢)(.{1,40})", "user_preference", "不喜欢"),
-            (r"(?:我|咱|俺)(?:最爱|超爱|最喜欢|特别喜欢|真的好爱)(.{1,40})", "user_preference", "最爱"),
-            (r"(?:我|咱|俺)(?:对|对于)(.{2,30})(?:过敏|不能吃|不能碰|受不了)", "user_preference", "过敏/禁忌"),
-            # 身份/画像
-            (r"(?:我|咱|俺)(?:的)?生日(?:是|在)?(.{2,20})", "user_profile", "生日"),
-            (r"(?:以后|之后)?(?:叫我|喊我)(.{1,20})", "user_profile", "称呼"),
-            (r"(?:我|咱|俺)(?:是|在)(?:做|干|从事)(.{2,40})", "user_profile", "职业"),
-            (r"(?:我|咱|俺)(?:是|在)(?:学|读)(?:的是?)?(.{2,40})", "user_profile", "专业/学业"),
-            (r"(?:我|咱|俺)(?:是|属于)(.{2,12})(?:座|型)", "user_profile", "星座/血型"),
-            (r"(?:我|咱|俺)(?:的)?(?:星座|血型)(?:是)?(.{2,12})", "user_profile", "星座/血型"),
             # 明确要求记住
-            (r"(?:记住|别忘了?|你要记得|务必记得|一定记得)(.{2,80})", "explicit_memory", "明确要求"),
+            (
+                r"^(?:请)?(?:记住|别忘了?|你要记得|务必记得|一定记得)(.{2,80})$",
+                "explicit_memory",
+                "明确要求",
+            ),
             # 承诺/约定
-            (r"(?:我|咱|俺)(?:保证|发誓|答应你|跟你约定|说好了)(.{2,60})", "explicit_memory", "承诺/约定"),
-            (r"(?:下次|以后|明天|回头|之后)(?:一定|肯定会|一定会|保证)(.{2,40})", "explicit_memory", "承诺"),
+            (
+                r"^(?:我|咱|俺)(?:保证|发誓|答应你|跟你约定|说好了)(.{2,60})$",
+                "explicit_memory",
+                "承诺/约定",
+            ),
+            (
+                r"^(?:下次|以后|明天|回头|之后)(?:一定|肯定会|一定会|保证)(.{2,40})$",
+                "explicit_memory",
+                "承诺",
+            ),
             # 关系表达
-            (r"(?:你|你呀)(?:是我|是咱)(?:最|特别|很)?(.{2,20})(?:朋友|伙伴|重要的人|信任的人)", "relationship_claim", "关系定位"),
-            (r"(?:我|咱|俺)(?:很|特别|真的|最)?(?:信任|依赖|在意|在乎|珍惜)(.{2,30})", "relationship_claim", "关系表达"),
-            # 情绪状态
-            (r"(?:我|咱|俺)(?:最近|今天|现在|这阵子|这会儿)?(?:很|有点|真的|好|特别)?(?:累|压力大|焦虑|低落|开心|难过|孤独|害怕|不安)(.{0,40})", "user_preference", "情绪状态"),
-            # 习惯
-            (r"(?:我|咱|俺)(?:一般|通常|习惯|每次|总是|经常)(.{2,40})", "user_habit", "习惯"),
-            # 边界/雷区
-            (r"(?:我|咱|俺)(?:不喜欢别人|讨厌别人|不希望)(.{2,40})", "user_preference", "边界"),
-            (r"(?:别问我|不要问我|不想聊)(.{0,30})", "user_preference", "雷区"),
+            (
+                r"^(?:你|你呀)(?:是我|是咱)(?:最|特别|很)?(.{2,20})(?:朋友|伙伴|重要的人|信任的人)$",
+                "relationship_claim",
+                "关系定位",
+            ),
+            (
+                r"^(?:我|咱|俺)(?:很|特别|真的|最)?(?:信任|依赖|在意|在乎|珍惜)(.{2,30})$",
+                "relationship_claim",
+                "关系表达",
+            ),
         ]
         for pattern, memory_type, label in patterns:
-            match = re.search(pattern, text)
+            match = re.fullmatch(pattern, text)
             if not match:
                 continue
             value = clean_text(match.group(1).strip(" ，。！？!?.：:"), 80)

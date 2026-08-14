@@ -89,6 +89,10 @@ USER_MEMORY_SUMMARY_VERSION = "memory.user_memory_summary.v1"
 _USER_MEMORY_PROFILE_TYPES = frozenset({"user_profile", "user_habit", "manual_memory"})
 _USER_MEMORY_PREFERENCE_TYPES = frozenset({"user_preference"})
 _USER_MEMORY_RELATIONSHIP_TYPES = frozenset({"relationship_claim", "relationship_phase_summary"})
+_RULE_PROFILE_MEMORY_TYPES = frozenset(
+    {"user_profile", "user_preference", "user_habit"}
+)
+
 _USER_MEMORY_CONVERSATION_TYPES = frozenset(
     {"conversation_event", "conversation_summary", "important_event", "memory_decay_summary", "self_action"}
 )
@@ -493,6 +497,96 @@ class MemoryCompanionService:
             rebind["embeddings_scheduled"] = embeddings_scheduled
         return result
 
+    @staticmethod
+    def _prepare_rule_profile_write(record: MemoryRecord) -> tuple[str, str]:
+        """Return (write mode, reason) and normalize rule profile state in place."""
+        metadata = dict(record.metadata) if isinstance(record.metadata, dict) else {}
+        extractor = clean_text(metadata.get("extractor"), 40).lower()
+        if (
+            record.memory_type not in _RULE_PROFILE_MEMORY_TYPES
+            or not extractor.startswith("rule_")
+        ):
+            return "generic", "not_rule_profile"
+
+        rejection_reason = clean_text(
+            metadata.get("rejection_reason")
+            or metadata.get("profile_rejection_reason")
+            or metadata.get("quality_rejection_reason"),
+            120,
+        )
+        if rejection_reason or metadata.get("quality_gate_passed") is False:
+            return "reject", rejection_reason or "profile_quality_rejected"
+
+        dimension = clean_text(metadata.get("profile_dimension"), 80).lower()
+        value = clean_text(metadata.get("profile_value"), 240)
+        normalized = clean_text(metadata.get("normalized_value"), 240)
+        try:
+            quality_score = float(metadata.get("extraction_quality_score"))
+        except (TypeError, ValueError):
+            quality_score = -1.0
+        if (
+            not dimension
+            or not value
+            or not normalized
+            or not 0.0 <= quality_score <= 1.0
+        ):
+            return "reject", "profile_candidate_metadata_missing"
+        if extractor not in MemoryStore.PROFILE_RULE_EXTRACTORS:
+            return "reject", "profile_extractor_unsupported"
+
+        extraction_quality = clean_text(metadata.get("extraction_quality"), 40).lower()
+        evidence_strength = clean_text(metadata.get("evidence_strength"), 40).lower()
+        requested_state = clean_text(
+            metadata.get("profile_state") or metadata.get("profile_status"),
+            32,
+        ).lower()
+        explicit_active = bool(
+            requested_state == "active"
+            and extraction_quality == "explicit"
+            and evidence_strength == "direct_statement"
+            and quality_score >= 0.8
+        )
+        next_state = "active" if explicit_active else "candidate"
+        try:
+            configured_evidence_count = int(
+                metadata.get("required_evidence_count") or 2
+            )
+        except (TypeError, ValueError):
+            configured_evidence_count = 2
+        metadata["extractor"] = extractor
+        metadata["profile_dimension"] = dimension
+        metadata["profile_value"] = value
+        metadata["normalized_value"] = normalized
+        metadata["profile_state"] = next_state
+        metadata["profile_status"] = next_state
+        metadata["quality_gate_passed"] = True
+        metadata["required_evidence_count"] = (
+            1 if explicit_active else max(2, min(10, configured_evidence_count))
+        )
+        record.metadata = metadata
+        record.confidence = quality_score
+        record.lifecycle = "stable_memory" if explicit_active else "raw_event"
+        record.review_status = "auto" if explicit_active else "pending"
+        if not explicit_active:
+            record.importance = min(float(record.importance or 0.3), 0.55)
+        return "profile", next_state
+
+    @staticmethod
+    def _log_profile_write_gate(
+        record: MemoryRecord, *, decision: str, reason: str
+    ) -> None:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        logger.info(
+            "[MemoryCompanion] 画像写入门禁: decision=%s reason=%s type=%s dimension=%s "
+            "subject=%s source=%s",
+            clean_text(decision, 40),
+            clean_text(reason, 120),
+            clean_text(record.memory_type, 80),
+            clean_text(metadata.get("profile_dimension"), 80),
+            clean_text(record.subject.id, 120),
+            clean_text(metadata.get("source_memory_id"), 160),
+        )
+
     async def handle_llm_request(self, event: Any, req: Any) -> None:
         if bool(getattr(event, "private_companion_req036_denied", False)):
             # Companion owns the fixed-reply branch. Do not resolve identity,
@@ -544,8 +638,8 @@ class MemoryCompanionService:
         record = self.classifier.from_user_message(ctx)
         if not record:
             return
-        memory_id = ""
-        if not await self._timeline_already_has_message(ctx, "user_message"):
+        memory_id = await self._existing_timeline_message_id(ctx, "user_message")
+        if not memory_id:
             event_metadata = {
                 "memory_id": memory_id,
                 "sender_name": ctx.user_name,
@@ -556,26 +650,83 @@ class MemoryCompanionService:
             event_metadata.update(self._cross_window_event_metadata(ctx))
             event_metadata.update(self._reply_chain_metadata(reply_chain))
             if ctx.scope == "group":
-                event_metadata.update(await self._conversation_memory_metadata(ctx, source="llm_request"))
-            await self.store.add_timeline_event(
+                event_metadata.update(
+                    await self._conversation_memory_metadata(ctx, source="llm_request")
+                )
+            memory_id = await self.store.add_timeline_event(
                 event_type="user_message",
                 session_id=ctx.session_id,
                 scope=ctx.scope,
                 subject_id=ctx.user_id,
                 object_id=ctx.current_target_id,
-                content=self._timeline_content_with_reply_chain(ctx.message_text, reply_chain),
+                content=self._timeline_content_with_reply_chain(
+                    ctx.message_text, reply_chain
+                ),
                 metadata=event_metadata,
             )
         if self.config.bool("memory_capture.record_relationship_edges", True):
             await self.note_relationships(ctx, source_memory_id=memory_id)
         if self.config.bool("memory_capture.extract_stable_facts", True):
-            for derived in self.classifier.derived_user_memories(ctx, source_memory_id=memory_id):
-                derived.id = self.stable_id("derived", derived.memory_type, ctx.session_id, derived.content)
+            derived_memories = self.classifier.derived_user_memories(
+                ctx,
+                source_memory_id=memory_id,
+            )
+            if not any(
+                clean_text((item.metadata or {}).get("profile_dimension"), 80)
+                for item in derived_memories
+            ):
+                rejection_reason = self.classifier.profile_rejection_reason(
+                    ctx.message_text
+                )
+                if rejection_reason:
+                    logger.info(
+                        "[MemoryCompanion] 画像写入门禁: decision=rejected "
+                        "reason=%s type=profile_candidate dimension= subject=%s source=%s",
+                        rejection_reason,
+                        clean_text(ctx.user_id, 120),
+                        clean_text(memory_id, 160),
+                    )
+            for derived in derived_memories:
+                derived.id = self.stable_id(
+                    "derived", derived.memory_type, ctx.session_id, derived.content
+                )
                 self.importance.calibrate(derived, source="stable_fact_extraction")
-                derived_id = await self.store.insert_memory(derived)
-                self._schedule_memory_embedding(derived_id, derived)
+                write_mode, gate_reason = self._prepare_rule_profile_write(derived)
+                if write_mode == "reject":
+                    self._log_profile_write_gate(
+                        derived,
+                        decision="rejected",
+                        reason=gate_reason,
+                    )
+                    continue
+                if write_mode == "profile":
+                    profile_result = await self.store.upsert_profile_candidate(derived)
+                    if not profile_result.get("ok"):
+                        self._log_profile_write_gate(
+                            derived,
+                            decision="rejected",
+                            reason=clean_text(profile_result.get("code"), 120),
+                        )
+                        continue
+                    derived_id = clean_text(profile_result.get("memory_id"), 120)
+                    gate_reason = clean_text(profile_result.get("profile_status"), 40)
+                    self._log_profile_write_gate(
+                        derived,
+                        decision="written",
+                        reason=gate_reason,
+                    )
+                    if gate_reason == "active":
+                        stored_profile = await self.store.get_memory(derived_id)
+                        self._schedule_memory_embedding(
+                            derived_id, stored_profile or derived
+                        )
+                else:
+                    derived_id = await self.store.insert_memory(derived)
+                    self._schedule_memory_embedding(derived_id, derived)
                 relation_type = str(derived.metadata.get("relation_type") or "")
-                if relation_type and self.config.bool("memory_capture.record_relationship_edges", True):
+                if relation_type and self.config.bool(
+                    "memory_capture.record_relationship_edges", True
+                ):
                     await self.store.upsert_relationship(
                         subject=derived.subject,
                         object=self._bot_entity(ctx),
@@ -775,6 +926,11 @@ class MemoryCompanionService:
         self._schedule_session_summary(ctx, reason="after_bot_response")
 
     async def _timeline_already_has_message(self, ctx: SessionContext, event_type: str) -> bool:
+        return bool(await self._existing_timeline_message_id(ctx, event_type))
+
+    async def _existing_timeline_message_id(
+        self, ctx: SessionContext, event_type: str
+    ) -> str:
         message_id = clean_text(ctx.message_id, 120)
         rows = await self.store.recent_timeline(
             limit=20,
@@ -783,23 +939,32 @@ class MemoryCompanionService:
             entity_id=ctx.current_target_id,
         )
         text = clean_text(ctx.message_text, 1000)
-        subject_id = clean_text(self._bot_subject_id(ctx) if event_type == "bot_response" else ctx.user_id, 120)
+        subject_id = clean_text(
+            self._bot_subject_id(ctx) if event_type == "bot_response" else ctx.user_id,
+            120,
+        )
         for row in rows:
             if clean_text(row.get("event_type"), 80) != event_type:
                 continue
             if subject_id and clean_text(row.get("subject_id"), 120) != subject_id:
                 continue
             metadata = json_loads(row.get("metadata"), {})
-            existing_message_id = clean_text(row.get("message_id") or metadata.get("message_id") or "", 120)
+            existing_message_id = clean_text(
+                row.get("message_id") or metadata.get("message_id") or "", 120
+            )
             if message_id and existing_message_id and message_id == existing_message_id:
-                return True
+                return clean_text(row.get("id"), 160)
             if text and clean_text(row.get("content"), 1000) == text:
-                previous_at = self._parse_utc_datetime(str(row.get("occurred_at") or row.get("created_at") or ""))
+                previous_at = self._parse_utc_datetime(
+                    str(row.get("occurred_at") or row.get("created_at") or "")
+                )
                 if previous_at is not None:
-                    gap_seconds = max(0.0, (datetime.now(timezone.utc) - previous_at).total_seconds())
+                    gap_seconds = max(
+                        0.0, (datetime.now(timezone.utc) - previous_at).total_seconds()
+                    )
                     if gap_seconds <= 3:
-                        return True
-        return False
+                        return clean_text(row.get("id"), 160)
+        return ""
 
     async def _conversation_memory_metadata(self, ctx: SessionContext, *, source: str) -> dict[str, Any]:
         metadata: dict[str, Any] = {
@@ -1809,7 +1974,9 @@ class MemoryCompanionService:
         slot_map: dict[str, list[SearchResult]] = {"self_timeline": [], "user_profile": []}
         results: list[SearchResult] = []
         for index, (slot, record) in enumerate(selected):
-            expression = "tone" if outfit_focus or slot == "user_profile" else "mention"
+            # Fast profiles already perform a narrow, intent-specific selection.
+            # Mark usable facts as mention; tone now intentionally carries no raw text.
+            expression = "mention"
             result = SearchResult(
                 memory=record,
                 score=max(0.1, 1.0 - index * 0.05),
@@ -6085,6 +6252,8 @@ class MemoryCompanionService:
             recent_fact_context=recent_fact_context,
             recent_cross_window_context=recent_cross_window_context,
         )
+        injection_omissions, included_memory_ids = self.injection.diagnostic_snapshot()
+        blocked.extend(injection_omissions)
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
@@ -6108,12 +6277,14 @@ class MemoryCompanionService:
             note=note if injection else f"{note}:no_injection_body",
             retrieval_info=retrieval_path_info,
         )
-        if write_log and self.config.bool("memory_injection.enable_injection_logs", True):
+        if write_log and self.config.bool(
+            "memory_injection.enable_injection_logs", True
+        ):
             await self.store.add_injection_log(
                 session_id=ctx.session_id,
                 scope=ctx.scope,
                 query=intent.query,
-                selected_memory_ids=[item.memory.id for item in results],
+                selected_memory_ids=included_memory_ids,
                 blocked_reasons=blocked[:30],
                 injection_chars=len(injection),
             )
@@ -6387,6 +6558,8 @@ class MemoryCompanionService:
             recent_fact_context=recent_fact_context,
             recent_cross_window_context=recent_cross_window_context,
         )
+        injection_omissions, included_memory_ids = self.injection.diagnostic_snapshot()
+        blocked.extend(injection_omissions)
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
@@ -6415,7 +6588,7 @@ class MemoryCompanionService:
                 session_id=ctx.session_id,
                 scope=ctx.scope,
                 query=intent.query,
-                selected_memory_ids=[item.memory.id for item in results],
+                selected_memory_ids=included_memory_ids,
                 blocked_reasons=blocked[:30],
                 injection_chars=len(injection),
             )

@@ -20,7 +20,7 @@ except ImportError:  # Existing standalone core.* test/import compatibility.
         validate_portrait_request,
     )
 from .models import clean_text
-
+from .profile_quality import RULE_EXTRACTOR, extract_profile_candidates
 
 PORTRAIT_TIERS = frozenset({"base", "intelligent"})
 SENSITIVITY_LEVELS = frozenset({"low", "sensitive", "high"})
@@ -34,13 +34,6 @@ PURPOSE_RESULT_CODES = {
 _SENSITIVE_TOKENS = (
     "疾病", "病", "过敏", "治疗", "药", "医院", "政治", "宗教", "信仰", "性", "住址", "地址",
     "定位", "行程", "财务", "工资", "密码", "账号", "身份证", "创伤", "自杀",
-)
-_EXPLICIT_PATTERNS = (
-    (r"(?:我|咱|俺)(?:很|最|超|特别|有点|真的|超级)?喜欢(.{1,40})", "preference", "like"),
-    (r"(?:我|咱|俺)(?:不喜欢|不爱|不太喜欢|讨厌)(.{1,40})", "preference", "dislike"),
-    (r"(?:以后|之后)?(?:叫我|喊我)(.{1,20})", "preferred_address", "address"),
-    (r"(?:我|咱|俺)(?:通常|一般|习惯|经常)(.{2,40})", "communication_preference", "habit"),
-    (r"(?:别问我|不要问我|不想聊)(.{0,30})", "boundary", "avoid"),
 )
 _CROSS_SCENE_PREFERENCE_MARKERS = (
     "吃", "喝", "食物", "料理", "烤肉", "火锅", "甜品", "咖啡", "茶",
@@ -126,38 +119,55 @@ def cross_scene_whitelisted_fact(
     return False
 
 
-def extract_explicit_candidates(text: Any) -> list[dict[str, str]]:
+def extract_explicit_candidates(text: Any) -> list[dict[str, Any]]:
     """Extract only self-contained first-person statements without context text."""
-    source = _text(text, 1800)
-    if not source:
-        return []
-    results: list[dict[str, str]] = []
-    for pattern, dimension, kind in _EXPLICIT_PATTERNS:
-        match = re.search(pattern, source)
-        if not match:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in extract_profile_candidates(text):
+        dimension = _text(candidate.get("profile_dimension"), 80)
+        kind = _text(candidate.get("kind"), 40)
+        value = _text(candidate.get("profile_value"), 80)
+        normalized_value = _text(candidate.get("normalized_value"), 80)
+        summary = _text(candidate.get("claim_summary"), 180)
+        if (
+            not dimension
+            or not kind
+            or not value
+            or not normalized_value
+            or not summary
+        ):
             continue
-        claim = _text(match.group(1).strip(" ，。！？!?.：:"), 80)
-        if not claim:
+        claim_hash = normalized_claim_hash(dimension, f"{kind}:{normalized_value}")
+        if claim_hash in seen:
             continue
-        summary = {
-            "like": f"喜欢 {claim}",
-            "dislike": f"不喜欢 {claim}",
-            "address": f"希望被称为 {claim}",
-            "habit": f"沟通习惯：{claim}",
-            "avoid": f"不希望聊 {claim}" if claim else "有明确不想聊的内容",
-        }[kind]
+        seen.add(claim_hash)
         item = {
             "dimension": dimension,
-            "normalized_claim_hash": normalized_claim_hash(dimension, f"{kind}:{claim}"),
-            "claim_summary": _text(summary, 180),
-            "sensitivity": classify_sensitivity(claim),
+            "profile_dimension": dimension,
+            "profile_value": value,
+            "normalized_value": normalized_value,
+            "profile_polarity": kind,
+            "profile_cardinality": _text(candidate.get("profile_cardinality"), 16)
+            or "multi",
+            "normalized_claim_hash": claim_hash,
+            "claim_summary": summary,
+            "sensitivity": classify_sensitivity(f"{value} {summary}"),
             "producer_kind": "rule_explicit",
-            "producer_version": "req036.rule.v1",
+            "producer_version": "req036.rule.v2",
+            "extractor": RULE_EXTRACTOR,
             "derivation_kind": "explicit_statement",
             "epistemic_status": "explicit",
+            "extraction_quality": _text(candidate.get("extraction_quality"), 40)
+            or "explicit",
+            "extraction_quality_score": float(
+                candidate.get("extraction_quality_score") or 0.0
+            ),
+            "evidence_strength": _text(candidate.get("evidence_strength"), 40)
+            or "direct_statement",
+            "profile_state": _text(candidate.get("profile_state"), 40) or "candidate",
+            "quality_gate_passed": bool(candidate.get("quality_gate_passed")),
         }
-        if item not in results:
-            results.append(item)
+        results.append(item)
     return results
 
 
