@@ -15,6 +15,7 @@ from .portrait import (
     extract_explicit_candidates,
     portrait_access_decision,
 )
+from .portrait_namespace import portrait_namespace_decision
 
 
 class PortraitService:
@@ -30,19 +31,58 @@ class PortraitService:
                 return value
         return None
 
-    async def sync_profile_context(self, *, event: Any = None, req: Any = None) -> dict[str, Any]:
+    @staticmethod
+    def _namespace_context(event: Any = None, req: Any = None) -> tuple[bool, Any]:
+        for source in (event, req):
+            if source is None:
+                continue
+            if isinstance(source, dict) and "namespace_context" in source:
+                return True, source.get("namespace_context")
+            if hasattr(source, "private_companion_namespace_context"):
+                return True, getattr(source, "private_companion_namespace_context", None)
+        return False, None
+
+    async def sync_profile_context(
+        self,
+        *,
+        event: Any = None,
+        req: Any = None,
+        legacy_scope: str = "private",
+    ) -> dict[str, Any]:
         dto = self._profile_context(event, req)
         errors = validate_profile_dto(dto)
         if errors:
             return {"ok": False, "code": "bridge_contract_mismatch", "errors": errors, "dto": None}
         assert isinstance(dto, dict)
         person_ref = build_person_ref(dto["person_ref"])
-        result = await self.store.upsert_portrait_person_projection(person_ref, dto["capability_summary"])
+        namespace_present, namespace_value = self._namespace_context(event, req)
+        namespace = portrait_namespace_decision(
+            namespace_value,
+            person_id=person_ref.get("person_id"),
+            legacy_scope=legacy_scope,
+            purpose="profile_write",
+            namespace_present=namespace_present,
+        )
+        if not namespace.get("ok"):
+            return {"ok": False, "code": namespace.get("code"), "errors": [], "dto": dto}
+        result = await self.store.upsert_portrait_person_projection(
+            person_ref,
+            dto["capability_summary"],
+            source_scope=str(namespace.get("source_scope") or ""),
+        )
         if not result.get("ok"):
             return {"ok": False, "code": result.get("code", "bridge_degraded"), "errors": [], "dto": dto}
         if person_ref["profile_status"] != "active" or person_ref["identity_assurance"] not in {"observed", "verified", "explicit_linked"}:
             return {"ok": False, "code": "bridge_person_mismatch", "errors": [], "dto": dto}
-        return {"ok": True, "code": "profile_exact", "errors": [], "dto": dto, "person_ref": person_ref}
+        return {
+            "ok": True,
+            "code": "profile_exact",
+            "errors": [],
+            "dto": dto,
+            "person_ref": person_ref,
+            "source_scope": str(namespace.get("source_scope") or ""),
+            "legacy_scope": str(namespace.get("legacy_scope") or ""),
+        }
 
     async def capture_user_message(self, ctx: SessionContext, *, event: Any = None, req: Any = None) -> dict[str, Any]:
         """Capture only a sender's own message as portrait evidence.
@@ -50,7 +90,10 @@ class PortraitService:
         The raw message is used transiently to derive a hash and deterministic
         explicit candidate.  It is never copied to the portrait tables.
         """
-        synced = await self.sync_profile_context(event=event, req=req)
+        scope = self._scope_for_context(ctx)
+        if not scope:
+            return {"ok": False, "code": "bridge_person_mismatch", "facts": 0}
+        synced = await self.sync_profile_context(event=event, req=req, legacy_scope=scope)
         if not synced.get("ok"):
             return {"ok": False, "code": synced.get("code", "bridge_degraded"), "facts": 0}
         person_ref = synced["person_ref"]
@@ -62,9 +105,6 @@ class PortraitService:
                 "facts": 0,
                 "person_id": person_ref["person_id"],
             }
-        scope = self._scope_for_context(ctx)
-        if not scope:
-            return {"ok": False, "code": "bridge_person_mismatch", "facts": 0}
         candidates = extract_explicit_candidates(ctx.message_text)
         if not candidates:
             return {
@@ -73,6 +113,7 @@ class PortraitService:
                 "facts": 0,
                 "person_id": person_ref["person_id"],
             }
+        scope = str(synced.get("source_scope") or "")
         evidence = build_evidence(
             person_ref=person_ref,
             scope=scope,
@@ -120,6 +161,20 @@ class PortraitService:
         if not decision["candidates_allowed"]:
             return {"ok": False, "code": decision["code"], "items": [], "decision": decision}
         person_ref = request.get("person_ref") if isinstance(request.get("person_ref"), dict) else {}
+        namespace = portrait_namespace_decision(
+            request.get("namespace_context"),
+            person_id=request.get("target_person_id"),
+            legacy_scope=request.get("scope"),
+            purpose="profile_read",
+            namespace_present="namespace_context" in request,
+        )
+        if not namespace.get("ok"):
+            return {
+                "ok": False,
+                "code": namespace.get("code", "portrait_namespace_invalid"),
+                "items": [],
+                "decision": decision,
+            }
         projection = await self.store.portrait_projection_decision(person_ref)
         if not projection.get("ok"):
             return {
@@ -131,7 +186,8 @@ class PortraitService:
         target = clean_text(request.get("target_person_id"), 80)
         result = await self.store.portrait_summary(
             target,
-            scope=clean_text(request.get("scope"), 80),
+            scope=str(namespace.get("source_scope") or ""),
+            legacy_scope=str(namespace.get("legacy_scope") or ""),
             limit=max(1, min(16, int(limit))),
             low_only=True,
             usage_min_confidence=self.config.float("portrait.usage_min_confidence", 0.75),

@@ -77,6 +77,7 @@ from .qq_history import QQHistoryReader
 from .reply_chain import ReplyChainResolver
 from .retrieval import RetrievalEngine
 from .store import MemoryStore
+from .scoped_store import ScopedStore
 from .summarizer import MemorySummarizer
 from .time_intent import TimeIntent, parse_time_intent
 from .turn_signal import analyze_turn_signal, message_terms
@@ -198,6 +199,7 @@ class MemoryCompanionService:
 
         self.store = MemoryStore(self.data_dir / "memory_companion.db")
         self.store.initialize()
+        self.scoped_store = ScopedStore(self.data_dir / "req041_scoped.db")
         self.portraits = PortraitService(self.store, self.config)
         normalized = self.store.normalize_legacy_manual_visibility()
         if normalized:

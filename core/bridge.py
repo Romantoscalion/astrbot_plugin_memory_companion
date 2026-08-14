@@ -14,7 +14,10 @@ from .bot_personal_dto import BotPersonalArchiveDTO, build_bot_personal_archive
 from .capability_probe import CapabilityCache, PROFILE_NAMES as C4_PROFILE_NAMES, build_capability_snapshot
 from .context_consumer import consume_context_projection
 from .models import EntityRef, MemoryRecord, SessionContext, clean_text
+from .namespace_capability import namespace_capability_descriptor
+from .namespace import build_namespace_context, validate_namespace_context
 from .person_projection import consume_person_projection
+from .scoped_store import ScopedStore, ScopedStoreError
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
@@ -448,14 +451,41 @@ class MemoryCompanionBridge:
 
     def __init__(self, plugin: Any):
         self._plugin = plugin
+        self.__scoped_store: ScopedStore | None = None
+        self.__scoped_store_resolved = False
         self._capability_cache = CapabilityCache()
+        self._emotion_producer_token = object()
+        self._emotion_page_admin_token = object()
+        self._active = True
+
+    @property
+    def _scoped_store(self) -> ScopedStore | None:
+        """Resolve the namespace store only when a namespace API is used.
+
+        Bot-personal capability probes are pure contract probes and must not
+        touch plugin services or databases merely because a Bridge object was
+        constructed.
+        """
+        if not self.__scoped_store_resolved:
+            candidate = getattr(self._plugin, "scoped_store", None)
+            self.__scoped_store = candidate if isinstance(candidate, ScopedStore) else None
+            self.__scoped_store_resolved = True
+        return self.__scoped_store
+
+    def bridge_lifecycle_status(self) -> dict[str, Any]:
+        """Expose only whether this in-process bridge can still serve calls."""
+        return {"active": self._active}
+
+    def deactivate(self) -> None:
+        """Revoke all issued capabilities before plugin service shutdown."""
+        self._active = False
         self._emotion_producer_token = object()
         self._emotion_page_admin_token = object()
 
     def register_emotion_producer(self, producer: Any) -> Any | None:
         """Issue a private Companion capability only to a live registered plugin."""
 
-        if not self._is_registered_private_companion(producer):
+        if not self._active or not self._is_registered_private_companion(producer):
             return None
         return _EmotionProducerCapability(self, producer, self._emotion_producer_token)
 
@@ -536,6 +566,8 @@ class MemoryCompanionBridge:
     def bind_emotion_page_api(self, page_api: Any) -> Any | None:
         """Issue a private diagnostic capability to this Memory plugin's Page API."""
 
+        if not self._active:
+            return None
         page_plugin = getattr(page_api, "plugin", None)
         if page_plugin is not self._plugin and getattr(page_plugin, "service", None) is not self._plugin:
             return None
@@ -606,7 +638,8 @@ class MemoryCompanionBridge:
 
     def _is_valid_emotion_producer_capability(self, capability: Any) -> bool:
         return (
-            type(capability) is _EmotionProducerCapability
+            self._active
+            and type(capability) is _EmotionProducerCapability
             and capability._bridge is self
             and capability._token is self._emotion_producer_token
             and self._is_registered_private_companion(capability._producer)
@@ -637,7 +670,8 @@ class MemoryCompanionBridge:
 
     def _is_valid_emotion_page_admin_capability(self, capability: Any) -> bool:
         return (
-            type(capability) is _EmotionPageAdminCapability
+            self._active
+            and type(capability) is _EmotionPageAdminCapability
             and capability._bridge is self
             and capability._token is self._emotion_page_admin_token
             and (
@@ -1598,6 +1632,8 @@ class MemoryCompanionBridge:
         must remain safe to call from ordinary chat paths even when the contract
         is stale or the local module is otherwise malformed.
         """
+        if not self._active:
+            return self._negative_personal_capability_probe("bridge_inactive")
         if self._capability_cache.snapshot().get("state") == "negative":
             return self.capability_status()
         try:
@@ -1678,6 +1714,223 @@ class MemoryCompanionBridge:
             result["state"] = "ready"
         result["legacy_state"] = result.get("state", "degraded")
         return result
+
+    def probe_namespace_context_capabilities(self) -> dict[str, Any]:
+        """Advertise ready only after the store and active epoch are bound."""
+        status = self._scoped_store.epoch_status() if self._scoped_store is not None else {"bound": False}
+        ready = self._active and status.get("bound") is True
+        return namespace_capability_descriptor(
+            available=ready,
+            methods=(
+                "list_scoped_records",
+                "read_scoped_record",
+                "erase_scoped_group_scopes",
+                "erase_scoped_persona_scopes",
+                "tombstone_scoped_identity_scopes",
+                "tombstone_scoped_namespace",
+                "tombstone_scoped_record",
+                "upsert_scoped_record",
+            ) if ready else (),
+            error_code=(
+                "" if ready
+                else "bridge_inactive" if not self._active
+                else "namespace_scoped_api_not_bound"
+            ),
+        )
+
+    def bind_namespace_migration_epoch(
+        self,
+        capability: Any,
+        *,
+        operation_id: str,
+        expected_previous_epoch: str,
+        migration_epoch: str,
+        policy_version: str,
+    ) -> dict[str, Any]:
+        if not self._active:
+            return {"ok": False, "state": "degraded", "code": "bridge_inactive"}
+        if not self._is_valid_private_companion_capability(capability):
+            return {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
+        if self._scoped_store is None:
+            return {"ok": False, "state": "degraded", "code": "namespace_scoped_store_unavailable"}
+        try:
+            result = self._scoped_store.bind_epoch(
+                operation_id=operation_id,
+                expected_previous_epoch=expected_previous_epoch,
+                migration_epoch=migration_epoch,
+                policy_version=policy_version,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {
+            "ok": True,
+            "state": "ready",
+            "code": result,
+            "epoch": self._scoped_store.epoch_status(),
+        }
+
+    def _authorized_scoped_context(
+        self, capability: Any, namespace: Any
+    ) -> tuple[Any | None, dict[str, Any] | None]:
+        if not self._active:
+            return None, {"ok": False, "state": "degraded", "code": "bridge_inactive"}
+        if not self._is_valid_private_companion_capability(capability):
+            return None, {"ok": False, "state": "forbidden", "code": "producer_capability_required"}
+        if self._scoped_store is None:
+            return None, {"ok": False, "state": "degraded", "code": "namespace_scoped_store_unavailable"}
+        if self._scoped_store.epoch_status().get("bound") is not True:
+            return None, {"ok": False, "state": "degraded", "code": "namespace_scoped_api_not_bound"}
+        errors = validate_namespace_context(namespace)
+        if errors:
+            return None, {"ok": False, "state": "rejected", "code": errors[0]}
+        context = build_namespace_context(namespace)
+        if context is None:
+            return None, {"ok": False, "state": "rejected", "code": "namespace_context_invalid"}
+        return context, None
+
+    def upsert_scoped_record(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        payload: dict[str, Any],
+        event_id: str,
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.upsert(
+                context, record_kind=record_kind, record_id=record_id, revision=revision,
+                payload=payload, event_id=event_id,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": result}
+
+    def read_scoped_record(
+        self, capability: Any, namespace: Any, *, record_kind: str, record_id: str
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            record = self._scoped_store.read(context, record_kind=record_kind, record_id=record_id)
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": "found" if record is not None else "not_found", "record": record}
+
+    def list_scoped_records(
+        self, capability: Any, namespace: Any, *, record_kind: str, limit: int = 100
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            records = self._scoped_store.list_records(context, record_kind=record_kind, limit=limit)
+        except (ScopedStoreError, TypeError, ValueError, OverflowError) as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": "listed", "records": records}
+
+    def tombstone_scoped_record(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        record_kind: str,
+        record_id: str,
+        revision: int,
+        event_id: str,
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.tombstone(
+                context, record_kind=record_kind, record_id=record_id, revision=revision, event_id=event_id,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", "code": result}
+
+    def tombstone_scoped_namespace(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.tombstone_namespace(
+                context, operation_id=operation_id, reason_code=reason_code,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", **result}
+
+    def tombstone_scoped_identity_scopes(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str,
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.tombstone_identity_scopes(
+                context, operation_id=operation_id, reason_code=reason_code,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", **result}
+
+    def erase_scoped_group_scopes(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str = "group_reset",
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.erase_group_scopes(
+                context, operation_id=operation_id, reason_code=reason_code,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", **result}
+
+    def erase_scoped_persona_scopes(
+        self,
+        capability: Any,
+        namespace: Any,
+        *,
+        operation_id: str,
+        reason_code: str = "persona_reset",
+    ) -> dict[str, Any]:
+        context, denied = self._authorized_scoped_context(capability, namespace)
+        if denied is not None:
+            return denied
+        try:
+            result = self._scoped_store.erase_persona_scopes(
+                context, operation_id=operation_id, reason_code=reason_code,
+            )
+        except ScopedStoreError as exc:
+            return {"ok": False, "state": "rejected", "code": str(exc)[:120]}
+        return {"ok": True, "state": "ready", **result}
 
     def capability_status(self) -> dict[str, Any]:
         """Return the bounded C4 cache state without probing storage."""
