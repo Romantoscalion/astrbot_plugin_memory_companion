@@ -162,9 +162,23 @@
         "default": true
       },
       "provider_id": {
-        "description": "总结模型提供商",
+        "description": "通用总结模型提供商",
         "_special": "select_provider",
-        "hint": "选择用于阶段性记忆总结的 LLM 提供商。留空则使用当前会话正在使用的模型。",
+        "hint": "私聊或群聊没有选择专用模型时使用。留空则继续尝试备用模型和当前会话模型。",
+        "type": "string",
+        "default": ""
+      },
+      "private_provider_id": {
+        "description": "私聊总结模型提供商",
+        "_special": "select_provider",
+        "hint": "仅用于私聊时间线总结。留空则使用通用总结模型；不可用时也会自动回退通用和备用模型。",
+        "type": "string",
+        "default": ""
+      },
+      "group_provider_id": {
+        "description": "群聊总结模型提供商",
+        "_special": "select_provider",
+        "hint": "仅用于群聊时间线总结。留空则使用通用总结模型；不可用时也会自动回退通用和备用模型。",
         "type": "string",
         "default": ""
       },

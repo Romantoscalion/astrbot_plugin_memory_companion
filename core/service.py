@@ -4030,12 +4030,25 @@ class MemoryCompanionService:
         return result
 
     async def _summary_provider_attempts(self, ctx: SessionContext) -> list[dict[str, Any]]:
+        scoped_provider_key = {
+            "private": "private_provider_id",
+            "group": "group_provider_id",
+        }.get(clean_text(ctx.scope, 40).lower(), "")
+        preferred: list[tuple[str, str]] = []
+        if scoped_provider_key:
+            scoped_provider_id = clean_text(
+                self.config.get(f"memory_summary.{scoped_provider_key}", ""),
+                120,
+            )
+            if scoped_provider_id:
+                preferred.append((f"{ctx.scope}_primary", scoped_provider_id))
         return await self._provider_attempts(
             ctx,
             prefix="memory_summary",
             provider_key="provider_id",
             fallback_provider_key="fallback_provider_id",
             include_current=True,
+            preferred=preferred,
         )
 
     async def _provider_attempts(
@@ -4046,11 +4059,12 @@ class MemoryCompanionService:
         provider_key: str,
         fallback_provider_key: str,
         include_current: bool,
+        preferred: list[tuple[str, str]] | None = None,
     ) -> list[dict[str, Any]]:
         attempts: list[dict[str, Any]] = []
         seen: set[str] = set()
         seen_provider_objects: set[int] = set()
-        configured = [
+        configured = list(preferred or []) + [
             (
                 "primary",
                 clean_text(self.config.get(f"{prefix}.{provider_key}", ""), 120),
