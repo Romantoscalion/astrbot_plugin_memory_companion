@@ -9997,7 +9997,7 @@ class MemoryCompanionService:
         self._background_tasks.clear()
         self._save_token_usage(force=True)
         try:
-            self.store.close()
+            await asyncio.to_thread(self.store.close)
         except Exception as exc:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:

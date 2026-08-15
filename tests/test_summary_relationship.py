@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,6 +80,75 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(finalized.is_set())
         self.assertTrue(task.done())
+        self.assertTrue(service.store._closed)
+
+    async def test_async_close_waits_for_queued_relationship_write(self) -> None:
+        service = self.make_service()
+        entered = threading.Event()
+        release = threading.Event()
+        original = service.store._upsert_relationship_sync
+
+        def delayed_write(*args):
+            entered.set()
+            release.wait(timeout=2)
+            return original(*args)
+
+        service.store._upsert_relationship_sync = delayed_write
+        write_task = asyncio.create_task(
+            service.store.upsert_relationship(
+                subject=EntityRef(kind="user", id="u1"),
+                object=EntityRef.bot_self(),
+                relation_type="conversation_partner",
+                scope="private",
+                session_id="private:u1",
+            )
+        )
+        await asyncio.to_thread(entered.wait, 1)
+
+        close_task = asyncio.create_task(service.aclose())
+        await asyncio.sleep(0)
+        self.assertFalse(close_task.done())
+        release.set()
+
+        relationship_id, _ = await asyncio.gather(write_task, close_task)
+        self.assertTrue(relationship_id)
+        self.assertTrue(service.store._closed)
+        skipped = await service.store.upsert_relationship(
+            subject=EntityRef(kind="user", id="u2"),
+            object=EntityRef.bot_self(),
+            relation_type="conversation_partner",
+        )
+        self.assertEqual("", skipped)
+
+    async def test_cancelled_relationship_await_does_not_race_store_close(self) -> None:
+        service = self.make_service()
+        entered = threading.Event()
+        release = threading.Event()
+        original = service.store._upsert_relationship_sync
+
+        def delayed_write(*args):
+            entered.set()
+            release.wait(timeout=2)
+            return original(*args)
+
+        service.store._upsert_relationship_sync = delayed_write
+        write_task = asyncio.create_task(
+            service.store.upsert_relationship(
+                subject=EntityRef(kind="user", id="u1"),
+                object=EntityRef.bot_self(),
+                relation_type="conversation_partner",
+            )
+        )
+        await asyncio.to_thread(entered.wait, 1)
+        write_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await write_task
+
+        close_task = asyncio.create_task(service.aclose())
+        await asyncio.sleep(0)
+        self.assertFalse(close_task.done())
+        release.set()
+        await asyncio.wait_for(close_task, timeout=1)
         self.assertTrue(service.store._closed)
 
     async def test_fast_context_capabilities_can_be_rolled_back_independently(self) -> None:

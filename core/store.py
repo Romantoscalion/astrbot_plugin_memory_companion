@@ -60,6 +60,9 @@ class MemoryStore:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = self._open_connection()
         self._lock = threading.RLock()
+        self._operation_condition = threading.Condition()
+        self._active_tracked_operations = 0
+        self._closing = False
         self._closed = False
         self._fts_enabled = False
         self._savepoint_counter = 0
@@ -160,6 +163,36 @@ class MemoryStore:
 
     async def _run_recoverable_database_operation(self, operation: Any, *args: Any) -> Any:
         return await asyncio.to_thread(self._run_with_database_recovery_sync, operation, *args)
+
+    async def _run_tracked_operation(
+        self,
+        operation: Any,
+        *args: Any,
+        closed_result: Any = None,
+    ) -> Any:
+        """Keep a queued executor write alive until store shutdown can flush it."""
+
+        with self._operation_condition:
+            if self._closing or self._closed:
+                return closed_result
+            self._active_tracked_operations += 1
+
+        def run() -> Any:
+            try:
+                return operation(*args)
+            finally:
+                with self._operation_condition:
+                    self._active_tracked_operations -= 1
+                    self._operation_condition.notify_all()
+
+        try:
+            future = asyncio.get_running_loop().run_in_executor(None, run)
+        except BaseException:
+            with self._operation_condition:
+                self._active_tracked_operations -= 1
+                self._operation_condition.notify_all()
+            raise
+        return await asyncio.shield(future)
 
     def _database_file_snapshot(self) -> dict[str, Any]:
         def size(path: Path) -> int:
@@ -2090,6 +2123,12 @@ class MemoryStore:
         return len(rows)
 
     def close(self) -> None:
+        with self._operation_condition:
+            if self._closed:
+                return
+            self._closing = True
+            while self._active_tracked_operations:
+                self._operation_condition.wait()
         with self._lock:
             if self._closed:
                 return
@@ -4825,7 +4864,7 @@ class MemoryStore:
         source_memory_id: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        return await asyncio.to_thread(
+        return await self._run_tracked_operation(
             self._upsert_relationship_sync,
             subject,
             object,
@@ -4839,6 +4878,7 @@ class MemoryStore:
             review_status,
             source_memory_id,
             metadata or {},
+            closed_result="",
         )
 
     def _upsert_relationship_sync(
