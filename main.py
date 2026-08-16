@@ -16,7 +16,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "1.7.3"
+PLUGIN_VERSION = "1.9.0"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -68,6 +68,11 @@ class MemoryCompanionPlugin(Star):
         self._register_page_api_if_available()
 
         logger.info("[MemoryCompanion] 我会牢牢记住你 已启动，数据目录=%s", self.service.data_dir)
+
+    async def initialize(self):
+        """Start retained maintenance workers after AstrBot owns the event loop."""
+        self.service._ensure_lifecycle_maintenance_dispatcher()
+        self.service._ensure_portrait_daily_dispatcher()
 
     def bot_personal_capability_status(self) -> dict[str, Any]:
         return dict(self.bot_personal_capabilities)

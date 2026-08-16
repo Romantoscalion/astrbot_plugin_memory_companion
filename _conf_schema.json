@@ -1043,6 +1043,30 @@
         "hint": "开启后，睡眠维护会筛选长期未访问、重要度较低的稳定记忆，先压缩成高层摘要，再归档原碎片。",
         "type": "bool",
         "default": true
+      },
+      "auto_schedule_enabled": {
+        "description": "自动自然遗忘维护",
+        "hint": "开启后插件会在后台周期执行保留、衰减、归档与索引维护，不再依赖手动点击。",
+        "type": "bool",
+        "default": true
+      },
+      "auto_startup_delay_seconds": {
+        "description": "自动维护启动延迟（秒）",
+        "hint": "插件收到首条消息后等待一段时间再执行，避免启动和对话热路径争抢资源。",
+        "type": "int",
+        "default": 120
+      },
+      "auto_interval_hours": {
+        "description": "自动维护间隔（小时）",
+        "hint": "两次自然遗忘维护之间的最短间隔，最小 1 小时。",
+        "type": "int",
+        "default": 24
+      },
+      "memory_decay_archive_without_summary": {
+        "description": "无模型时冷归档",
+        "hint": "没有可用总结模型或候选过少时，将达到严格衰减阈值的碎片放入可恢复冷区；不会物理删除。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -1101,16 +1125,10 @@
         "default": 90
       },
       "memory_decay_max_importance_percent": {
-        "description": "最大衰减重要度",
-        "hint": "重要度高于该百分比的记忆不会自动衰减。建议 65-80。",
+        "description": "重要记忆慢忘阈值",
+        "hint": "重要度高于该百分比后会延长遗忘周期，但不会形成永久保护；只有明确固定或手工保护的记忆永不自动衰减。建议 65-80。",
         "type": "int",
         "default": 74
-      },
-      "memory_decay_max_access_count": {
-        "description": "最大召回次数",
-        "hint": "被召回次数超过该值的记忆不会自动衰减，表示它仍然有用。",
-        "type": "int",
-        "default": 2
       },
       "memory_decay_score_threshold_percent": {
         "description": "衰减分阈值",

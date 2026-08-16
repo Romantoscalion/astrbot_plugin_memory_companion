@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import ConfigView
 from .models import EntityRef, MemoryRecord, clean_text, json_loads
+from .sensitive_data import redact_sensitive_value
 
 
 PORTABLE_FORMAT = "astrbot-memory-jsonl"
@@ -493,7 +494,8 @@ class PortableMemoryArchive:
 
     @staticmethod
     def _write_line(handle: Any, payload: dict[str, Any]) -> None:
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+        safe_payload = redact_sensitive_value(payload)
+        handle.write(json.dumps(safe_payload, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     @staticmethod
     def _normalized_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -502,11 +504,11 @@ class PortableMemoryArchive:
             if key in result:
                 fallback: Any = [] if key == "aliases" else {}
                 result[key] = json_loads(result[key], fallback) if isinstance(result[key], str) else result[key]
-        return result
+        return redact_sensitive_value(result)
 
     @staticmethod
     def _memory_payload(memory: MemoryRecord) -> dict[str, Any]:
-        return {
+        return redact_sensitive_value({
             "id": memory.id,
             "memory_type": memory.memory_type,
             "subject": {"kind": memory.subject.kind, "id": memory.subject.id, "name": memory.subject.name, "role": memory.subject.role},
@@ -536,7 +538,7 @@ class PortableMemoryArchive:
             "content_fingerprint": memory.content_fingerprint,
             "merged_count": memory.merged_count,
             "supersedes_id": memory.supersedes_id,
-        }
+        })
 
     @classmethod
     def _memory_record(cls, data: dict[str, Any], batch_id: str) -> MemoryRecord:

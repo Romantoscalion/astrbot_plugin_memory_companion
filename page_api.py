@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - optional in isolated page tests.
 from .core.bridge import serialize_memory
 from .core.coordination_status import build_coordination_status, project_p6_status
 from .core.identity import normalize_session_context_fields, parse_scope_from_session
+from .core.memory_atom import DURABILITY_LEVELS, SENSITIVITY_LEVELS, VALIDITY_STATUSES
 from .core.models import SessionContext, clean_text
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
@@ -52,6 +53,106 @@ THEME_KEYS = set(THEME_NAME_TO_KEY.values())
 DEFAULT_THEME_NAME = "月白"
 DEFAULT_THEME_KEY = THEME_NAME_TO_KEY[DEFAULT_THEME_NAME]
 
+UI_CONTRACT_VERSION = "memory.page.ui.v2"
+UI_MODES = (
+    {"id": "standard", "label": "简洁管理"},
+    {"id": "cinema", "label": "放映馆界面"},
+)
+UI_VIEW_ENDPOINTS = {
+    "overview": ("/stats", "/buckets"),
+    "users": (
+        "/memories",
+        "/memory",
+        "/memory/update",
+        "/memory/delete",
+        "/portrait/profiles",
+        "/portrait/profile",
+        "/portrait/govern",
+        "/maintenance/clear_scope",
+    ),
+    "groups": (
+        "/memories",
+        "/memory",
+        "/memory/update",
+        "/memory/delete",
+        "/maintenance/clear_scope",
+    ),
+    "personal": ("/companion/personal-memory", "/companion/personal-photo-data"),
+    "knowledge": (
+        "/graph",
+        "/relations",
+        "/threads",
+        "/thread/status",
+        "/timeline",
+        "/logs",
+        "/persona-state",
+        "/emotion/traces",
+        "/emotion/trace",
+    ),
+    "microscope": ("/search",),
+    "archive": (
+        "/context/config",
+        "/config/schema",
+        "/config/module/update",
+        "/retrieval/config/update",
+        "/operations/diagnostics",
+        "/operations/preset",
+        "/maintenance",
+        "/maintenance/audit/preview",
+        "/maintenance/audit/status",
+        "/maintenance/audit/apply",
+        "/maintenance/audit/rollback",
+        "/data/export",
+        "/data/import/preview",
+        "/data/import/run",
+        "/conversation-import/targets",
+        "/conversation-import/qq/capabilities",
+        "/conversation-import/qq/preview",
+        "/conversation-import/upload",
+        "/conversation-import/start",
+        "/conversation-import/status",
+        "/conversation-import/pause",
+        "/conversation-import/resume",
+        "/conversation-import/rebind",
+        "/conversation-import/rollback",
+        "/maintenance/repair_livingmemory_content",
+        "/maintenance/clear_all",
+        "/import/livingmemory/preview",
+        "/import/livingmemory/run",
+        "/acl/matrix",
+        "/acl/upsert",
+        "/acl/delete",
+    ),
+}
+UI_ENDPOINT_EXPOSURE = {
+    "/ui/capabilities": {"exposure": "internal", "reason": "前端启动时用于自校验，不作为业务按钮"},
+    "/memory/visibility": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
+    "/memory/lifecycle": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
+    "/acl": {"exposure": "compat", "reason": "当前权限拓扑使用聚合 matrix 端点"},
+    "/acl/policy": {"exposure": "advanced", "reason": "保留给高级策略调用，普通拓扑按规则管理"},
+    "/coordination/status": {"exposure": "internal", "reason": "由个人记忆和统计投影聚合展示"},
+    "/profiles": {"exposure": "compat", "reason": "旧 Bot profile 查询兼容入口"},
+    "/user-memory-summary": {"exposure": "compat", "reason": "旧用户摘要工作区兼容入口"},
+    "/portrait/migration": {"exposure": "internal", "reason": "画像迁移控制，不向普通面板暴露"},
+    "/capabilities/bot-personal": {"exposure": "internal", "reason": "跨插件能力探测"},
+    "/companion/personal-photo": {"exposure": "internal", "reason": "图片代理兼容入口"},
+    "/companion/personal-photo-data": {"exposure": "visible", "reason": "个人相册按需加载的数据端点"},
+    "/maintenance/sleep": {"exposure": "compat", "reason": "页面使用统一 maintenance 操作，保留状态/命令兼容"},
+}
+UI_DANGEROUS_ENDPOINTS = frozenset(
+    {
+        "/memory/delete",
+        "/portrait/govern",
+        "/maintenance/audit/apply",
+        "/maintenance/audit/rollback",
+        "/data/import/run",
+        "/conversation-import/rollback",
+        "/maintenance/clear_all",
+        "/maintenance/clear_scope",
+        "/import/livingmemory/run",
+    }
+)
+
 
 class PluginPageApi:
     def __init__(self, plugin: Any) -> None:
@@ -65,9 +166,9 @@ class PluginPageApi:
             except Exception:
                 self._emotion_page_admin_capability = None
 
-    def register_routes(self) -> None:
-        register = self.plugin.context.register_web_api
-        routes = [
+    def _route_specs(self) -> list[tuple[str, Any, list[str], str]]:
+        return [
+            ("/ui/capabilities", self.ui_capabilities, ["GET"], "MemoryCompanion UI capability contract"),
             ("/stats", self.stats, ["GET"], "MemoryCompanion Page stats"),
             ("/buckets", self.buckets, ["GET"], "MemoryCompanion Page buckets"),
             ("/memories", self.memories, ["GET"], "MemoryCompanion Page memories"),
@@ -133,9 +234,41 @@ class PluginPageApi:
             ("/persona-state", self.persona_state, ["GET"], "MemoryCompanion Page persona state"),
             ("/acl/matrix", self.acl_matrix, ["GET"], "MemoryCompanion Page ACL matrix"),
         ]
+
+    def register_routes(self) -> None:
+        register = self.plugin.context.register_web_api
         for prefix in PAGE_API_PREFIXES:
-            for route, handler, methods, desc in routes:
+            for route, handler, methods, desc in self._route_specs():
                 register(f"{prefix}{route}", handler, methods, desc)
+
+    async def ui_capabilities(self):
+        routes = self._route_specs()
+        endpoint_views: dict[str, list[str]] = {}
+        for view, endpoints in UI_VIEW_ENDPOINTS.items():
+            for endpoint in endpoints:
+                endpoint_views.setdefault(endpoint, []).append(view)
+        return self._ok(
+            {
+                "contract_version": UI_CONTRACT_VERSION,
+                "modes": list(UI_MODES),
+                "views": [
+                    {"id": view, "endpoints": list(endpoints)}
+                    for view, endpoints in UI_VIEW_ENDPOINTS.items()
+                ],
+                "endpoints": [
+                    {
+                        "path": path,
+                        "methods": list(methods),
+                        "description": description,
+                        "exposure": UI_ENDPOINT_EXPOSURE.get(path, {}).get("exposure", "visible"),
+                        "reason": UI_ENDPOINT_EXPOSURE.get(path, {}).get("reason", "面板直接功能"),
+                        "views": endpoint_views.get(path, []),
+                        "dangerous": path in UI_DANGEROUS_ENDPOINTS,
+                    }
+                    for path, _handler, methods, description in routes
+                ],
+            }
+        )
 
     async def stats(self):
         stats = await self.plugin.service.store.stats()
@@ -778,6 +911,33 @@ class PluginPageApi:
         memory_id = clean_text(payload.get("id"), 120)
         if not memory_id:
             return self._err("missing id", 400)
+        current = await self.plugin.service.store.get_memory(memory_id)
+        if current is None:
+            return self._err("memory not found", 404)
+        validity_status = self._optional_choice(payload, "validity_status", VALIDITY_STATUSES)
+        durability = self._optional_choice(payload, "durability", DURABILITY_LEVELS)
+        sensitivity = self._optional_choice(payload, "sensitivity", SENSITIVITY_LEVELS)
+        try:
+            valid_from = self._optional_iso_timestamp(payload, "valid_from")
+            valid_to = self._optional_iso_timestamp(payload, "valid_to")
+            salience = self._optional_unit_score(payload, "salience")
+        except ValueError as exc:
+            return self._err(clean_text(exc, 240), 400)
+        if validity_status is False:
+            return self._err("invalid validity_status", 400)
+        if durability is False:
+            return self._err("invalid durability", 400)
+        if sensitivity is False:
+            return self._err("invalid sensitivity", 400)
+        effective_valid_from = valid_from if valid_from is not None else current.valid_from
+        effective_valid_to = valid_to if valid_to is not None else current.valid_to
+        if (
+            effective_valid_from
+            and effective_valid_to
+            and self._iso_timestamp_number(effective_valid_from)
+            > self._iso_timestamp_number(effective_valid_to)
+        ):
+            return self._err("valid_from must not be later than valid_to", 400)
         ok = await self.plugin.service.store.update_memory_payload(
             memory_id,
             memory_type=payload.get("memory_type"),
@@ -787,6 +947,12 @@ class PluginPageApi:
             confidence=payload.get("confidence"),
             visibility=payload.get("visibility"),
             lifecycle=payload.get("lifecycle"),
+            validity_status=validity_status,
+            valid_from=valid_from,
+            valid_to=valid_to,
+            salience=salience,
+            durability=durability,
+            sensitivity=sensitivity,
         )
         if not ok:
             return self._err("memory not found", 404)
@@ -1091,9 +1257,15 @@ class PluginPageApi:
 
     async def thread_status(self):
         payload = await self._json()
+        thread_id = clean_text(payload.get("id"), 120)
+        status = clean_text(payload.get("status"), 40).lower()
+        if not thread_id:
+            return self._err("missing thread id", 400)
+        if status not in {"open", "closed"}:
+            return self._err("thread status must be open or closed", 400)
         ok = await self.plugin.service.store.update_cross_window_thread_status(
-            clean_text(payload.get("id"), 120),
-            clean_text(payload.get("status"), 40),
+            thread_id,
+            status,
         )
         return self._ok({"updated": ok})
 
@@ -1604,11 +1776,31 @@ class PluginPageApi:
             if api is None:
                 continue
             plugin = getattr(api, "_plugin", None)
+            bridge_status: dict[str, Any] = {}
+            status_getter = getattr(plugin, "_memory_companion_coordination_status", None) if plugin else None
+            if callable(status_getter):
+                try:
+                    candidate = status_getter()
+                    if isinstance(candidate, dict):
+                        bridge_status = candidate
+                except Exception:
+                    bridge_status = {"available": False, "state": "degraded", "reason": "bridge_status_failed"}
+            bridge_available = bool(
+                bridge_status.get("available")
+                and bridge_status.get("state") not in {"degraded", "local_only", "disabled", "inactive"}
+                and not bridge_status.get("degraded")
+            )
             return {
                 "available": True,
                 "plugin_name": "astrbot_plugin_private_companion",
                 "daily_plan_enabled": bool(getattr(plugin, "enable_daily_plan", False)) if plugin else False,
                 "detail_enabled": bool(getattr(plugin, "enable_detail_enhancement", False)) if plugin else False,
+                "bridge_available": bridge_available,
+                "bridge_state": clean_text(bridge_status.get("state") or "degraded", 40),
+                "bridge_reason": clean_text(
+                    bridge_status.get("reason") or bridge_status.get("error_code") or "bridge_status_unavailable",
+                    120,
+                ),
                 "plugin": plugin,
             }
         return {
@@ -2928,6 +3120,45 @@ class PluginPageApi:
 
     def _query_int(self, key: str, default: int) -> int:
         return self._int(request.args.get(key), default)
+
+    @staticmethod
+    def _optional_choice(payload: dict[str, Any], key: str, allowed: set[str] | frozenset[str]) -> Any:
+        if key not in payload:
+            return None
+        value = clean_text(payload.get(key), 40).lower()
+        return value if value in allowed else False
+
+    @staticmethod
+    def _optional_iso_timestamp(payload: dict[str, Any], key: str) -> str | None:
+        if key not in payload:
+            return None
+        value = clean_text(payload.get(key), 80)
+        if not value:
+            return ""
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(f"{key} must be an ISO-8601 timestamp") from exc
+        return value
+
+    @staticmethod
+    def _optional_unit_score(payload: dict[str, Any], key: str) -> float | None:
+        if key not in payload:
+            return None
+        try:
+            value = float(payload.get(key))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a number between 0 and 1") from exc
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{key} must be a number between 0 and 1")
+        return value
+
+    @staticmethod
+    def _iso_timestamp_number(value: str) -> float:
+        parsed = datetime.fromisoformat(clean_text(value, 80).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        return parsed.timestamp()
 
     @staticmethod
     def _acl_window_error(scope: str, window_id: str) -> str:

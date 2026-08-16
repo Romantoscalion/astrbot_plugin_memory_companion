@@ -6,13 +6,17 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.config import ConfigView
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord
-from astrbot_plugin_remember_you.core.operations import (
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.config import ConfigView
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord
+from astrbot_plugin_memory_companion.core.operations import (
     PORTABLE_FORMAT,
     PortableMemoryArchive,
     apply_preset,
@@ -20,7 +24,7 @@ from astrbot_plugin_remember_you.core.operations import (
     persist_runtime_config,
     scan_plugin_conflicts,
 )
-from astrbot_plugin_remember_you.core.store import MemoryStore
+from astrbot_plugin_memory_companion.core.store import MemoryStore
 
 
 class OperationPresetTests(unittest.TestCase):

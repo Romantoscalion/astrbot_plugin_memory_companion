@@ -10,19 +10,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if "astrbot_plugin_remember_you" not in sys.modules:
-    package = types.ModuleType("astrbot_plugin_remember_you")
-    package.__path__ = [str(ROOT)]
-    sys.modules["astrbot_plugin_remember_you"] = package
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.chat_import import HistoricalChatImporter
-from astrbot_plugin_remember_you.core.models import MemoryRecord
-from astrbot_plugin_remember_you.core.operations import PORTABLE_EXPORT_PAGE_SIZE, PortableMemoryArchive
-from astrbot_plugin_remember_you.core.retrieval import RetrievalEngine
-from astrbot_plugin_remember_you.core.store import MemoryStore
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.chat_import import HistoricalChatImporter
+from astrbot_plugin_memory_companion.core.models import MemoryRecord
+from astrbot_plugin_memory_companion.core.operations import PORTABLE_EXPORT_PAGE_SIZE, PortableMemoryArchive
+from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
+from astrbot_plugin_memory_companion.core.store import MemoryStore
 
 
 class _Config:

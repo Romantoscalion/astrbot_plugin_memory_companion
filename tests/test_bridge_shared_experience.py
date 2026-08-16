@@ -6,11 +6,15 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.bridge import MemoryCompanionBridge
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.bridge import MemoryCompanionBridge
 
 
 class _Service:

@@ -232,6 +232,12 @@ class MemoryCompanionService:
         self._decay_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._portrait_dispatch_task: asyncio.Task[Any] | None = None
+        self._maintenance_dispatch_task: asyncio.Task[Any] | None = None
+        self._maintenance_dispatch_status: dict[str, Any] = {
+            "state": "idle",
+            "last_error": "",
+            "last_completed_at": "",
+        }
         self._portrait_dispatch_status: dict[str, Any] = {
             "state": "idle",
             "last_run_day": "",
@@ -594,6 +600,7 @@ class MemoryCompanionService:
             # Companion owns the fixed-reply branch. Do not resolve identity,
             # read memory, write evidence, or enter any LLM path here.
             return
+        self._ensure_lifecycle_maintenance_dispatcher()
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
@@ -749,6 +756,7 @@ class MemoryCompanionService:
             self._schedule_session_summary(ctx, reason="after_user_message")
 
     async def handle_group_message(self, event: Any) -> None:
+        self._ensure_lifecycle_maintenance_dispatcher()
         if not self.config.bool("memory_capture.enabled", True):
             return
         if not self.config.bool("conversation_memory.enabled", True):
@@ -835,6 +843,58 @@ class MemoryCompanionService:
         self._portrait_dispatch_task = task
         if task is not None:
             self._portrait_dispatch_status["state"] = "scheduled"
+
+    def _ensure_lifecycle_maintenance_dispatcher(self) -> None:
+        """Start one retained, low-frequency natural-forgetting scheduler."""
+        if self._closing or self._closed or not self.config.bool("maintenance.auto_schedule_enabled", True):
+            return
+        if self._maintenance_dispatch_task is not None and not self._maintenance_dispatch_task.done():
+            return
+        task = self._spawn_background(
+            self._lifecycle_maintenance_dispatch_loop(),
+            label="lifecycle-maintenance",
+        )
+        self._maintenance_dispatch_task = task
+        if task is not None:
+            self._maintenance_dispatch_status["state"] = "scheduled"
+
+    async def _lifecycle_maintenance_dispatch_loop(self) -> None:
+        startup_delay = max(
+            5,
+            self.config.int("maintenance.auto_startup_delay_seconds", 120),
+        )
+        interval_hours = max(
+            1,
+            self.config.int("maintenance.auto_interval_hours", 24),
+        )
+        await asyncio.sleep(startup_delay)
+        while (
+            not self._closing
+            and not self._closed
+            and self.config.bool("maintenance.auto_schedule_enabled", True)
+        ):
+            try:
+                self._maintenance_dispatch_status["state"] = "running"
+                result = await self.sleep_maintenance(reason="scheduled_natural_forgetting")
+                self._maintenance_dispatch_status.update(
+                    {
+                        "state": "scheduled",
+                        "last_error": "",
+                        "last_completed_at": clean_text(result.get("ran_at"), 80),
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._maintenance_dispatch_status.update(
+                    {
+                        "state": "degraded",
+                        "last_error": self._describe_exception(exc),
+                        "last_completed_at": utc_now(),
+                    }
+                )
+                logger.warning("[MemoryCompanion] 自动自然遗忘维护失败: %s", exc, exc_info=True)
+            await asyncio.sleep(interval_hours * 3600)
 
     async def _portrait_daily_dispatch_loop(self) -> None:
         """Run only in the configured daily window, never on a message path."""
@@ -1366,10 +1426,17 @@ class MemoryCompanionService:
             "version": dto.version,
             "idempotency_key": dto.idempotency_key,
             "payload_schema_version": dto.payload_schema_version,
+            "payload_fingerprint": fingerprint,
+            "payload": payload,
+            "canonical_schema_version": dto.canonical_schema_version,
+            "window_date": dto.window_date or dto.date,
+            "created_at": dto.created_at,
+            "updated_at": dto.updated_at,
+            "temporal_phase": dto.temporal_phase,
             "evidence_kind": dto.evidence_kind,
             "canonical_evidence_level": dto.canonical_evidence_level,
             "archive_evidence_level": dto.archive_evidence_level,
-            "evidence_level_mapping": dict(dto.evidence_level_mapping or {}),
+            "evidence_level_mapping": deepcopy(dto.evidence_level_mapping or {}),
             "authority_kind": dto.authority_kind,
             "commitment_level": dto.commitment_level,
             "epistemic_status": dto.epistemic_status,
@@ -1381,13 +1448,13 @@ class MemoryCompanionService:
             "object_actor_id": dto.object_actor_id,
             "source_actor_id": dto.source_actor_id,
             "target_user_id": dto.target_user_id,
-            "participant_roles": list(dto.participant_roles or []),
-            "runtime_origin_refs": list(dto.runtime_origin_refs),
+            "participant_roles": deepcopy(dto.participant_roles or []),
+            "runtime_origin_refs": list(dto.runtime_origin_refs or []),
             "expires_at": dto.expires_at,
-            "decision_trace": [dict(item) for item in dto.decision_trace],
-            "canonical_schema_version": dto.canonical_schema_version,
-            "payload_fingerprint": fingerprint,
-            "payload": payload,
+            "decision_trace": deepcopy(dto.decision_trace or []),
+            "owner_bot_id": dto.owner_bot_id,
+            "persona_id": dto.persona_id,
+            "legacy_namespace": dto.canonical_schema_version < 3,
         }
         reality_level = {
             "planned": "planned",
@@ -1402,13 +1469,16 @@ class MemoryCompanionService:
             "calendar": "calendar_event",
             "proactive": "proactive_action",
         }.get(dto.source_kind, dto.source_kind)
+        namespace_digest = hashlib.sha256(
+            f"{dto.owner_bot_id or 'legacy'}|{dto.persona_id}".encode("utf-8")
+        ).hexdigest()[:20]
         record = MemoryRecord(
             id=dto.record_id,
             memory_type=dto.memory_type,
             subject=EntityRef(kind="bot", id=dto.subject, role="subject"),
             object=EntityRef(kind="bot", id=dto.subject, role="object"),
             scope="private",
-            session_id="bot_personal",
+            session_id=f"bot_personal:{namespace_digest}",
             visibility="bot_self",
             sayability="indirect",
             reality_level=reality_level,
@@ -1422,12 +1492,23 @@ class MemoryCompanionService:
             metadata=metadata,
             source_plugin="bot_personal_bridge",
             occurred_at=dto.occurred_at,
+            owner_bot_id=dto.owner_bot_id,
+            valid_to=dto.expires_at,
+            durability="ephemeral" if dto.expires_at else "normal",
+            sensitivity="private",
+            canonical_key=(
+                f"bot_personal|{dto.owner_bot_id or 'legacy'}|{dto.persona_id}|"
+                f"{dto.memory_type}|{dto.idempotency_key}"
+            ),
             # MemoryStore's generic content dedupe intentionally ignores the
             # metadata payload.  Bot Personal records therefore need a stable
             # key-derived fingerprint or different agenda keys would merge
             # into one row merely because their display reference is similar.
             content_fingerprint=hashlib.sha256(
-                f"bot_personal|{dto.memory_type}|{dto.idempotency_key}".encode("utf-8")
+                (
+                    f"bot_personal|{dto.owner_bot_id or 'legacy'}|{dto.persona_id}|"
+                    f"{dto.memory_type}|{dto.idempotency_key}"
+                ).encode("utf-8")
             ).hexdigest(),
         )
         try:
@@ -1449,8 +1530,19 @@ class MemoryCompanionService:
             return {"ok": False, "record_id": "", "deduplicated": False, "version": 0, "error_code": exc.error_code, "state": "invalid"}
         return await self.record_bot_personal_archive(dto)
 
-    async def read_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
-        """Read-only, domain-isolated Bot Personal references with no payload output."""
+    async def read_bot_personal_profile(
+        self,
+        query: str = "",
+        *,
+        limit: int = 10,
+        owner_bot_id: str = "",
+        persona_id: str = "",
+    ) -> dict[str, Any]:
+        """Read safe references from exactly one Bot/persona namespace.
+
+        Calls without namespace parameters are compatibility reads and can see
+        legacy unowned rows only; current v3 rows never cross that boundary.
+        """
         store = getattr(self, "store", None)
         lister = getattr(store, "list_memories", None)
         if not callable(lister):
@@ -1462,7 +1554,6 @@ class MemoryCompanionService:
                 query="",
                 scope="private",
                 visibility="bot_self",
-                session_id="bot_personal",
             )
         except Exception:
             return {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": [], "error_code": "store_unavailable"}
@@ -1471,6 +1562,16 @@ class MemoryCompanionService:
         for record in records:
             metadata = record.metadata if isinstance(record.metadata, dict) else {}
             if clean_text(metadata.get("memory_domain"), 80) != "bot_self_schedule":
+                continue
+            record_bot_id = clean_text(metadata.get("owner_bot_id") or record.owner_bot_id, 120)
+            record_persona_id = clean_text(metadata.get("persona_id"), 96)
+            if owner_bot_id or persona_id:
+                if (
+                    record_bot_id != clean_text(owner_bot_id, 120)
+                    or record_persona_id != clean_text(persona_id, 96)
+                ):
+                    continue
+            elif record_bot_id or record_persona_id not in {"", "legacy"}:
                 continue
             source_refs: list[str] = []
             raw_source_refs = metadata.get("source_refs")
@@ -2415,6 +2516,7 @@ class MemoryCompanionService:
                 "user_id": clean_text(ctx.user_id, 120),
                 "group_id": clean_text(ctx.group_id, 120),
                 "bot_id": clean_text(ctx.bot_id, 120),
+                "persona_id": clean_text(ctx.persona_id, 96),
             },
             "time": time_payload,
             "slots": slot_limits or {},
@@ -2463,15 +2565,16 @@ class MemoryCompanionService:
             cache.pop(key, None)
         self._retrieval_result_cache_stats["evictions"] = self._retrieval_result_cache_stats.get("evictions", 0) + remove_count
 
-    async def _mark_cached_results_accessed(self, results: list[Any]) -> None:
-        memory_ids: list[str] = []
-        for item in results or []:
-            memory = getattr(item, "memory", None)
-            memory_id = clean_text(getattr(memory, "id", ""), 120)
-            if memory_id and memory_id not in memory_ids:
-                memory_ids.append(memory_id)
-        if memory_ids:
-            await self.store.mark_accessed(memory_ids)
+    async def _mark_injected_memories(self, memory_ids: list[str]) -> None:
+        """Reinforce only records that were present in the final request context."""
+        unique_ids: list[str] = []
+        for value in memory_ids or []:
+            memory_id = clean_text(value, 120)
+            if memory_id and memory_id not in unique_ids:
+                unique_ids.append(memory_id)
+        marker = getattr(self.store, "mark_injected", None)
+        if unique_ids and callable(marker):
+            await marker(unique_ids)
 
     async def search(
         self,
@@ -2498,7 +2601,6 @@ class MemoryCompanionService:
             results = await engine.revalidate_cached_results(results, ctx)
             self._last_retrieval_path_info = dict(cached.get("path_info") or {})
             self._last_retrieval_path_info["cache"] = "hit"
-            await self._mark_cached_results_accessed(results)
             return results
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         results = await engine.search(query, ctx, top_k, time_intent=time_intent)
@@ -2534,7 +2636,6 @@ class MemoryCompanionService:
             blocked = await engine.revalidate_cached_diagnostics(blocked, ctx)
             self._last_retrieval_path_info = dict(cached.get("path_info") or {})
             self._last_retrieval_path_info["cache"] = "hit"
-            await self._mark_cached_results_accessed(results)
             return results, blocked
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         results, blocked = await engine.search_with_diagnostics(query, ctx, top_k, time_intent=time_intent)
@@ -2603,7 +2704,6 @@ class MemoryCompanionService:
             slot_map = {slot: items for slot, items in slot_map.items() if items}
             self._last_retrieval_path_info = dict(cached.get("path_info") or {})
             self._last_retrieval_path_info["cache"] = "hit"
-            await self._mark_cached_results_accessed(results)
             return results, blocked, slot_map
         engine = await self._retrieval_engine(ctx, admin_read_all=admin_read_all)
         if not self.config.bool("context_orchestration.enabled", True):
@@ -3380,6 +3480,7 @@ class MemoryCompanionService:
     def _context_from_memory_record(record: MemoryRecord | None) -> SessionContext:
         if record is None:
             return SessionContext()
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
         return SessionContext(
             session_id=record.session_id,
             scope=record.scope,
@@ -3387,6 +3488,8 @@ class MemoryCompanionService:
             user_id=record.subject.id if record.subject.kind == "user" else "",
             user_name=record.subject.name if record.subject.kind == "user" else "",
             group_id=record.group_id,
+            bot_id=clean_text(record.owner_bot_id or metadata.get("owner_bot_id"), 120),
+            persona_id=clean_text(metadata.get("persona_id"), 96),
             message_id=record.message_id,
         )
 
@@ -3400,6 +3503,7 @@ class MemoryCompanionService:
             group_id=ctx.group_id,
             group_name=ctx.group_name,
             bot_id=ctx.bot_id,
+            persona_id=ctx.persona_id,
             message_id=ctx.message_id,
             message_text=ctx.message_text,
             strict_session_only=ctx.strict_session_only,
@@ -3781,6 +3885,13 @@ class MemoryCompanionService:
                 for row in rows[: self.config.int("memory_summary.evidence_events", 12)]
                 if clean_text(row.get("content"), 220)
             )
+            summary_quality = self.summarizer.summary_quality(payload or {})
+            evidence_gate_passed = summary_quality == "normal"
+            candidate_valid_to = (
+                (datetime.now(timezone.utc) + timedelta(days=14)).isoformat(timespec="seconds")
+                if not evidence_gate_passed
+                else ""
+            )
             record = MemoryRecord(
                 id=self.stable_id("summary", ctx.session_id, start_at, end_at, content),
                 memory_type="conversation_summary",
@@ -3793,13 +3904,21 @@ class MemoryCompanionService:
                 visibility=visibility,
                 sayability="direct",
                 reality_level="llm_summary",
-                lifecycle="stable_memory",
+                lifecycle="stable_memory" if evidence_gate_passed else "short_term_candidate",
                 content=content,
                 evidence=evidence,
-                confidence=0.72,
+                confidence=0.72 if evidence_gate_passed else 0.42,
                 importance=float((payload or {}).get("importance", 0.68) or 0.68),
-                review_status="auto",
-                tags=["summary", "long_term", ctx.scope] + [clean_text(topic, 80) for topic in (payload or {}).get("topics", [])[:5]],
+                review_status="auto" if evidence_gate_passed else "pending",
+                tags=[
+                    "summary",
+                    "long_term" if evidence_gate_passed else "evidence_candidate",
+                    ctx.scope,
+                ] + [clean_text(topic, 80) for topic in (payload or {}).get("topics", [])[:5]],
+                owner_bot_id=self._bot_subject_id(ctx),
+                valid_to=candidate_valid_to,
+                durability="normal" if evidence_gate_passed else "short",
+                sensitivity="internal",
                 metadata={
                     "summary_event_count": len(rows),
                     "unsummarized_total": total,
@@ -3811,7 +3930,9 @@ class MemoryCompanionService:
                     "summarizer": "companion_memory_schema_v1",
                     "summary_schema_version": "companion_memory_v1",
                     "owner_bot_id": self._bot_subject_id(ctx),
-                    "summary_quality": self.summarizer.summary_quality(payload or {}),
+                    "summary_quality": summary_quality,
+                    "evidence_gate_passed": evidence_gate_passed,
+                    "raw_timeline_preserved": not evidence_gate_passed,
                     "canonical_summary": clean_text((payload or {}).get("canonical_summary"), 2000),
                     "persona_summary": clean_text((payload or {}).get("persona_summary") or (payload or {}).get("summary"), 2000),
                     "topics": (payload or {}).get("topics", []),
@@ -3828,6 +3949,27 @@ class MemoryCompanionService:
             )
             self.importance.calibrate(record, source="conversation_summary")
             memory_id = await self.store.insert_memory(record)
+            if not evidence_gate_passed:
+                retries = await self.store.record_summary_failure(
+                    session_id=ctx.session_id,
+                    scope=ctx.scope,
+                    start_timeline_id=str(rows[0].get("id") or ""),
+                    end_timeline_id=str(rows[-1].get("id") or ""),
+                    error="evidence_gate_rejected",
+                    metadata={
+                        "reason": "missing_or_unsupported_fact_references",
+                        "state": "evidence_quarantine",
+                        "candidate_memory_id": memory_id,
+                        "raw_timeline_preserved": True,
+                    },
+                )
+                logger.warning(
+                    "[MemoryCompanion] 阶段总结未通过证据门禁，已隔离候选并保留原始时间线: session=%s memory=%s retry=%s",
+                    ctx.session_id,
+                    memory_id,
+                    retries,
+                )
+                return memory_id
             self._schedule_memory_embedding(memory_id, record)
             await self._record_verified_group_bot_self_facts(ctx, rows, payload or {}, memory_id)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
@@ -5543,11 +5685,20 @@ class MemoryCompanionService:
 
     def sleep_status(self) -> dict[str, Any]:
         if not self.sleep_state_path.exists():
-            return {"ok": True, "ran_at": "", "message": "还没有执行过睡眠维护。"}
+            return {
+                "ok": True,
+                "ran_at": "",
+                "message": "还没有执行过睡眠维护。",
+                "scheduler": dict(self._maintenance_dispatch_status),
+            }
         try:
-            return json_loads(self.sleep_state_path.read_text(encoding="utf-8"), {})
+            result = json_loads(self.sleep_state_path.read_text(encoding="utf-8"), {})
+            if not isinstance(result, dict):
+                result = {}
+            result["scheduler"] = dict(self._maintenance_dispatch_status)
+            return result
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc), "scheduler": dict(self._maintenance_dispatch_status)}
 
     async def _run_raw_event_retention(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
@@ -5625,10 +5776,35 @@ class MemoryCompanionService:
             for group in groups[:max_groups]:
                 items = list(group.get("items") or [])
                 if len(items) < min_items:
-                    skipped_groups += 1
+                    if self.config.bool("maintenance.memory_decay_archive_without_summary", True):
+                        archived_count = await self._cold_archive_decay_items(
+                            group,
+                            reason="natural_decay_sparse_cold_archive",
+                        )
+                        archived += archived_count
+                        group_reports.append(
+                            {
+                                "bucket": group.get("bucket"),
+                                "summary_id": "",
+                                "archived": archived_count,
+                                "reason": "sparse_cold_archive",
+                            }
+                        )
+                    else:
+                        skipped_groups += 1
                     continue
                 try:
                     result = await self._summarize_decay_group(group)
+                    if (
+                        not result.get("summary_id")
+                        and result.get("reason") in {"no_summary_provider", "empty_summary"}
+                        and self.config.bool("maintenance.memory_decay_archive_without_summary", True)
+                    ):
+                        result["archived"] = await self._cold_archive_decay_items(
+                            group,
+                            reason="natural_decay_providerless_cold_archive",
+                        )
+                        result["reason"] = "providerless_cold_archive"
                     if result.get("summary_id"):
                         summaries += 1
                     archived += int(result.get("archived") or 0)
@@ -5660,20 +5836,11 @@ class MemoryCompanionService:
         tags = {clean_text(tag, 80).lower() for tag in (record.tags or [])}
         protected_types = {
             "manual_memory",
-            "user_profile",
-            "user_preference",
             "explicit_memory",
-            "relationship_claim",
             "companion_note",
-            "schedule_fragment",
-            "creative_work",
-            "reading_memory",
-            "proactive_message",
         }
         protected_tags = {
             "manual",
-            "stable_fact",
-            "relationship_claim",
             "needs_review",
             "protected",
             "no_decay",
@@ -5689,11 +5856,12 @@ class MemoryCompanionService:
             self._metadata_weight(metadata, "scar_weight"),
             self._metadata_weight(metadata, "emotional_debt_weight"),
         )
-        if decay_mode == "no_decay" or durable_weight >= 0.78:
+        if decay_mode == "no_decay":
             return None
-        if decay_mode in {"scar_slow_decay", "creative_milestone"} or phase in {"conflict", "repair", "comfort"}:
-            if record.importance >= 0.45 or record.access_count > 0:
-                return None
+        semantic_slow_decay = (
+            decay_mode in {"scar_slow_decay", "creative_milestone"}
+            or phase in {"conflict", "repair", "comfort"}
+        )
         if memory_type in protected_types or tags & protected_tags:
             return None
         if record.visibility == "bot_self" and not self.config.bool("maintenance.memory_decay_include_bot_self", False):
@@ -5703,21 +5871,53 @@ class MemoryCompanionService:
             False,
         ):
             return None
-        max_importance = self._config_percent("maintenance.memory_decay_max_importance_percent", 74)
-        if record.importance > max_importance:
-            return None
-        if record.access_count > self.config.int("maintenance.memory_decay_max_access_count", 2):
-            return None
-
         now = datetime.now(timezone.utc)
         anchor = self._parse_iso(record.occurred_at or record.created_at)
-        accessed = self._parse_iso(record.last_accessed_at) or anchor
+        last_injected_at = clean_text(getattr(record, "last_injected_at", ""), 96)
+        accessed = self._parse_iso(last_injected_at or record.last_accessed_at) or anchor
         if anchor is None:
             return None
         age_days = max(0.0, (now - anchor).total_seconds() / 86400)
         idle_days = max(0.0, (now - (accessed or anchor)).total_seconds() / 86400)
-        min_age = max(1, self.config.int("maintenance.memory_decay_after_days", 180))
-        min_idle = max(1, self.config.int("maintenance.memory_decay_idle_days", 90))
+        durability = clean_text(getattr(record, "durability", "normal"), 24).lower() or "normal"
+        if durability == "pinned":
+            return None
+        durability_age_multiplier = {
+            "ephemeral": 0.05,
+            "short": 0.35,
+            "normal": 1.0,
+            "durable": 4.0,
+        }.get(durability, 1.0)
+        durability_idle_multiplier = {
+            "ephemeral": 0.05,
+            "short": 0.35,
+            "normal": 1.0,
+            "durable": 3.0,
+        }.get(durability, 1.0)
+        importance_soft_threshold = self._config_percent(
+            "maintenance.memory_decay_max_importance_percent",
+            74,
+        )
+        importance = max(0.0, min(1.0, float(record.importance or 0.0)))
+        if importance > importance_soft_threshold:
+            remaining = max(0.01, 1.0 - importance_soft_threshold)
+            soft_protection = 1.0 + min(
+                3.0,
+                ((importance - importance_soft_threshold) / remaining) * 3.0,
+            )
+            durability_age_multiplier *= soft_protection
+            durability_idle_multiplier *= max(1.0, soft_protection * 0.75)
+        if durable_weight:
+            durability_age_multiplier *= 1.0 + durable_weight * 2.0
+            durability_idle_multiplier *= 1.0 + durable_weight * 1.5
+        min_age = max(
+            1,
+            int(self.config.int("maintenance.memory_decay_after_days", 180) * durability_age_multiplier),
+        )
+        min_idle = max(
+            1,
+            int(self.config.int("maintenance.memory_decay_idle_days", 90) * durability_idle_multiplier),
+        )
         if age_days < min_age or idle_days < min_idle:
             return None
 
@@ -5733,8 +5933,22 @@ class MemoryCompanionService:
             decay_score *= 0.72
         elif decay_mode == "summary_decay":
             decay_score *= 0.86
+        if semantic_slow_decay:
+            decay_score *= 0.62
         if self._metadata_weight(metadata, "freshness_weight") >= 0.45:
             decay_score *= 0.82
+        try:
+            reinforcement = max(
+                0.0,
+                min(
+                    1.0,
+                    float(getattr(record, "reinforcement_score", 0.0) or metadata.get("reinforcement_score") or 0.0),
+                ),
+            )
+        except (TypeError, ValueError):
+            reinforcement = 0.0
+        rehearsal_strength = reinforcement * math.exp(-math.log(2.0) * idle_days / 60.0)
+        decay_score = max(0.0, decay_score - (rehearsal_strength * 0.25))
         if decay_score < self._config_percent("maintenance.memory_decay_score_threshold_percent", 75):
             return None
         return {
@@ -5744,7 +5958,8 @@ class MemoryCompanionService:
             "score": round(decay_score, 3),
             "reason": (
                 f"age={age_days:.1f}d idle={idle_days:.1f}d "
-                f"importance={record.importance:.2f} access={record.access_count}"
+                f"importance={record.importance:.2f} durability={durability} "
+                f"reinforcement={reinforcement:.2f}"
             ),
         }
 
@@ -5760,8 +5975,16 @@ class MemoryCompanionService:
         for item in candidates:
             record = item["record"]
             owner = self._decay_owner_id(record)
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
             key = "|".join(
                 [
+                    clean_text(record.platform, 80) or "unknown_platform",
+                    clean_text(
+                        getattr(record, "owner_bot_id", "")
+                        or (record.metadata if isinstance(record.metadata, dict) else {}).get("owner_bot_id"),
+                        160,
+                    ) or "legacy_bot_owner",
+                    clean_text(metadata.get("persona_id"), 96) or "legacy_persona",
                     clean_text(record.scope, 40) or "unknown",
                     clean_text(owner, 160),
                     clean_text(record.visibility, 40),
@@ -5774,6 +5997,21 @@ class MemoryCompanionService:
         ]
         groups.sort(key=lambda group: (len(group["items"]), group["items"][0].get("score", 0)), reverse=True)
         return groups
+
+    async def _cold_archive_decay_items(self, group: dict[str, Any], *, reason: str) -> int:
+        records = [
+            item.get("record")
+            for item in (group.get("items") or [])
+            if isinstance(item, dict) and isinstance(item.get("record"), MemoryRecord)
+        ]
+        memory_ids = [record.id for record in records if record.id]
+        if not memory_ids:
+            return 0
+        return await self.store.archive_memories(
+            memory_ids,
+            reason=clean_text(reason, 120),
+            supersedes_id="",
+        )
 
     def _decay_owner_id(self, record: MemoryRecord) -> str:
         if record.scope == "group" or record.visibility == "group_public":
@@ -5842,6 +6080,10 @@ class MemoryCompanionService:
             review_status="auto",
             tags=["summary", "decay_summary", "sleep_maintenance", sample.scope],
             metadata={
+                "persona_id": clean_text(
+                    (sample.metadata if isinstance(sample.metadata, dict) else {}).get("persona_id"),
+                    96,
+                ),
                 "source_memory_ids": [record.id for record in records],
                 "source_memory_count": len(records),
                 "start_at": first_at,
@@ -5852,10 +6094,17 @@ class MemoryCompanionService:
                 "decay_policy": {
                     "after_days": self.config.int("maintenance.memory_decay_after_days", 180),
                     "idle_days": self.config.int("maintenance.memory_decay_idle_days", 90),
-                    "max_importance": self._config_percent("maintenance.memory_decay_max_importance_percent", 74),
-                    "max_access_count": self.config.int("maintenance.memory_decay_max_access_count", 2),
+                    "importance_soft_threshold": self._config_percent(
+                        "maintenance.memory_decay_max_importance_percent",
+                        74,
+                    ),
                 },
             },
+            owner_bot_id=clean_text(
+                sample.owner_bot_id
+                or (sample.metadata if isinstance(sample.metadata, dict) else {}).get("owner_bot_id"),
+                120,
+            ),
             source_plugin="memory_companion",
         )
         self.importance.calibrate(summary_record, source="memory_decay_summary")
@@ -5881,6 +6130,7 @@ class MemoryCompanionService:
 
     def _decay_context(self, sample: MemoryRecord) -> SessionContext:
         owner = self._decay_owner_id(sample)
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         return SessionContext(
             session_id=sample.session_id,
             scope=sample.scope,
@@ -5889,6 +6139,8 @@ class MemoryCompanionService:
             user_name=sample.subject.name or sample.object.name,
             group_id=sample.group_id or (owner if sample.scope == "group" else ""),
             group_name=sample.object.name if sample.object.kind == "group" else "",
+            bot_id=clean_text(sample.owner_bot_id or metadata.get("owner_bot_id"), 120),
+            persona_id=clean_text(metadata.get("persona_id"), 96),
             message_text="",
         )
 
@@ -6256,6 +6508,7 @@ class MemoryCompanionService:
         )
         if short_reply_anchor:
             injection_max_chars = min(injection_max_chars, 1050)
+        included_memory_ids: list[str] = []
         injection = self.injection.compose(
             ctx,
             results,
@@ -6273,8 +6526,9 @@ class MemoryCompanionService:
             address_hint=self._address_hint_for_injection(ctx),
             recent_fact_context=recent_fact_context,
             recent_cross_window_context=recent_cross_window_context,
+            included_memory_ids=included_memory_ids,
         )
-        injection_omissions, included_memory_ids = self.injection.diagnostic_snapshot()
+        injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
@@ -6562,6 +6816,7 @@ class MemoryCompanionService:
         injection_max_chars = self._injection_max_chars_for_query(ctx, retrieval_query, time_intent=time_intent)
         if short_reply_anchor:
             injection_max_chars = min(injection_max_chars, 1050)
+        actual_injected_memory_ids: list[str] = []
         injection = self.injection.compose(
             ctx,
             results,
@@ -6579,8 +6834,9 @@ class MemoryCompanionService:
             address_hint=self._address_hint_for_injection(ctx),
             recent_fact_context=recent_fact_context,
             recent_cross_window_context=recent_cross_window_context,
+            included_memory_ids=actual_injected_memory_ids,
         )
-        injection_omissions, included_memory_ids = self.injection.diagnostic_snapshot()
+        injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
@@ -6610,7 +6866,7 @@ class MemoryCompanionService:
                 session_id=ctx.session_id,
                 scope=ctx.scope,
                 query=intent.query,
-                selected_memory_ids=included_memory_ids,
+                selected_memory_ids=actual_injected_memory_ids,
                 blocked_reasons=blocked[:30],
                 injection_chars=len(injection),
             )
@@ -6626,6 +6882,7 @@ class MemoryCompanionService:
             slot_map=slot_map,
         )
         if append_temp_text(req, injection):
+            await self._mark_injected_memories(actual_injected_memory_ids)
             logger.info(
                 "[MemoryCompanion] 已临时注入结构化记忆: session=%s source=%s count=%s chars=%s",
                 ctx.session_id,
@@ -6637,6 +6894,7 @@ class MemoryCompanionService:
 
         prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
         req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
+        await self._mark_injected_memories(actual_injected_memory_ids)
         logger.warning("[MemoryCompanion] TextPart 不可用，已回退到 prompt 注入: session=%s", ctx.session_id)
 
     def _log_injection_debug(
@@ -9514,6 +9772,7 @@ class MemoryCompanionService:
             group_id=normalized["group_id"],
             group_name=str(payload.get("group_name") or ""),
             bot_id=str(payload.get("bot_id") or ""),
+            persona_id=str(payload.get("persona_id") or ""),
             message_id=str(payload.get("message_id") or ""),
             message_text=str(payload.get("message_text") or ""),
             strict_session_only=bool(payload.get("strict_session_only", False)),
@@ -9538,6 +9797,7 @@ class MemoryCompanionService:
             group_id=normalized["group_id"],
             group_name=ctx.group_name,
             bot_id=ctx.bot_id,
+            persona_id=ctx.persona_id,
             message_id=ctx.message_id,
             message_text=ctx.message_text,
             strict_session_only=ctx.strict_session_only,

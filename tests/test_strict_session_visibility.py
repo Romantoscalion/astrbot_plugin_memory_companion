@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import unittest
 
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SessionContext
-from astrbot_plugin_remember_you.core.service import MemoryCompanionService
-from astrbot_plugin_remember_you.core.visibility import VisibilityPolicy
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
+
+
+bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SessionContext
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
+from astrbot_plugin_memory_companion.core.visibility import VisibilityPolicy
 
 
 class StrictSessionVisibilityTests(unittest.TestCase):

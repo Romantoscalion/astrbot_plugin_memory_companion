@@ -17,19 +17,20 @@
       document.documentElement.dataset.overviewLayout = layout;
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=1.7.3-memory-audit" />
+  <link rel="stylesheet" href="./app.css?v=1.9.0-ui-v2" />
 </head>
 <body>
   <main id="app" class="film-app">
-    <nav id="overviewLayoutSwitch" class="overview-layout-switch" role="radiogroup" aria-label="总览样式">
-      <button class="overview-layout-option" data-overview-layout="standard" type="button" role="radio" aria-checked="false" aria-controls="standardOverview">
-        常规总览
+    <nav id="overviewLayoutSwitch" class="overview-layout-switch" role="radiogroup" aria-label="界面模式">
+      <button class="overview-layout-option" data-overview-layout="standard" type="button" role="radio" aria-checked="false" aria-controls="standardOverview workspace">
+        简洁管理
       </button>
-      <button class="overview-layout-option" data-overview-layout="cinema" type="button" role="radio" aria-checked="false" aria-controls="cinemaOverview">
-        放映馆视图
+      <button class="overview-layout-option" data-overview-layout="cinema" type="button" role="radio" aria-checked="false" aria-controls="cinemaOverview workspace">
+        放映馆界面
       </button>
     </nav>
     <span id="overviewLayoutAnnouncement" class="sr-only" aria-live="polite"></span>
+    <div id="uiCompatibilityBanner" class="ui-compatibility-banner" role="alert" hidden></div>
 
     <header class="topbar">
       <div>
@@ -65,7 +66,7 @@
               <p class="eyebrow">Workspace</p>
               <h2 id="overviewDestinationsTitle">功能入口</h2>
             </div>
-            <span>6 个工作区 · 1 个兼容入口</span>
+            <span>6 个工作区</span>
           </div>
           <div class="overview-entry-grid">
             <button class="overview-entry is-private" data-overview-view="relations" data-user-memory-filter="private" type="button">
@@ -78,28 +79,23 @@
               <span class="overview-entry-copy"><b>群聊记忆</b><small>群聊 · 成员 · 上下文</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
-            <button class="overview-entry is-user" data-overview-view="relations" data-user-memory-filter="all" type="button">
-              <span class="overview-entry-index">03</span>
-              <span class="overview-entry-copy"><b>用户档案与记忆</b><small>按用户统一查看全部记忆</small></span>
-              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
-            </button>
             <button class="overview-entry is-personal" data-overview-view="review" type="button">
-              <span class="overview-entry-index">04</span>
+              <span class="overview-entry-index">03</span>
               <span class="overview-entry-copy"><b>个人记忆</b><small>日程 · 相册 · 主观记忆</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
             <button class="overview-entry is-graph" data-overview-view="objects" type="button">
-              <span class="overview-entry-index">05</span>
+              <span class="overview-entry-index">04</span>
               <span class="overview-entry-copy"><b>知识图谱</b><small>节点 · 关系 · 时间线</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
             <button class="overview-entry is-search" data-overview-view="microscope" type="button">
-              <span class="overview-entry-index">06</span>
+              <span class="overview-entry-index">05</span>
               <span class="overview-entry-copy"><b>记忆显微镜</b><small>模拟召回 · 注入检查</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
             <button class="overview-entry is-archive is-wide" data-overview-view="archive" type="button">
-              <span class="overview-entry-index">07</span>
+              <span class="overview-entry-index">06</span>
               <span class="overview-entry-copy"><b>维护 / 迁移 / 配置</b><small>运行状态 · 备份 · 导入 · 配置</small></span>
               <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
             </button>
@@ -143,7 +139,6 @@
       <button class="filmstrip" style="--a:14deg; --z:5;--off:-225px;--tx:-440px" data-view="relations" data-user-memory-filter="all" data-tip-title="用户档案与记忆" data-tip-sub="私聊 · 画像 · 偏好 · 关系" type="button"><span class="strip-label" style="--label-edge:380px"><b>用户档案与记忆</b><small>按用户统一查看</small></span></button>
       <button class="filmstrip" style="--a:162deg;--z:1;--off:215px;--tx:-260px" data-view="review"     data-tip-title="个人记忆"       data-tip-sub="Bot 日程 · 生活细化"         type="button"><span class="strip-label is-flipped"><b>个人记忆</b><small>日程 · 细化</small></span></button>
       <button class="filmstrip" style="--a:136deg;--z:3;--off:-390px" data-view="archive"    data-tip-title="维护/迁移/配置"   data-tip-sub="工具 · 迁移 · 配置"        type="button"><span class="strip-label is-flipped"><b>维护/迁移/配置</b><small>工具 · 配置</small></span></button>
-      <button class="filmstrip" style="--a:106deg;--z:6;--off:220px" data-view="relations" data-user-memory-filter="private" data-tip-title="私聊记忆（兼容入口）" data-tip-sub="进入用户档案与记忆" type="button"><span class="strip-label is-flipped"><b>私聊记忆</b><small>进入统一工作区</small></span></button>
 
       <section class="overview-core" aria-live="polite">
         <div class="core-ring"></div>
@@ -157,7 +152,7 @@
     <section id="workspace" class="workspace-frame" aria-label="二级工作区">
       <div class="workspace-head">
         <div>
-          <p class="eyebrow">Locked Frame</p>
+          <p id="workspaceEyebrow" class="eyebrow">Locked Frame</p>
           <h2 id="workspaceTitle">对象</h2>
           <p id="workspaceHint">选择左侧对象后，所有检查视图都会收束到同一范围。</p>
         </div>
@@ -338,8 +333,25 @@
                       <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
                       <button id="maintenanceBtn" type="button">运行维护</button>
                     </section>
+                    <section class="maintenance-action memory-audit-action">
+                      <b>7. 可回滚记忆审计</b>
+                      <p class="archive-note">仅在配置中启用后可用。先生成证据约束的预览，再明确应用；已应用批次可回滚。</p>
+                      <div class="memory-audit-controls">
+                        <label>候选上限
+                          <input id="memoryAuditLimit" type="number" min="0" max="100" value="0" inputmode="numeric" />
+                        </label>
+                        <button id="memoryAuditPreviewBtn" type="button">生成预览</button>
+                      </div>
+                      <div class="memory-audit-controls">
+                        <label>批次 ID
+                          <input id="memoryAuditBatchId" type="text" placeholder="audit_..." autocomplete="off" />
+                        </label>
+                        <button id="memoryAuditStatusBtn" class="subtle" type="button">读取状态</button>
+                      </div>
+                      <div id="memoryAuditResult" class="memory-audit-result" aria-live="polite"></div>
+                    </section>
                     <section class="maintenance-action">
-                      <b>7. 危险清理</b>
+                      <b>8. 危险清理</b>
                       <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
                       <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
                     </section>
@@ -461,7 +473,7 @@ Bot: 12-14 15:10:30
         </section>
 
         <aside id="detailDrawer" class="detail-drawer empty">
-          选择一格胶片或一条记忆查看详情。
+          选择一条记忆查看详情。
         </aside>
       </div>
     </section>
@@ -473,6 +485,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=1.7.3-memory-audit"></script>
+  <script src="./app.js?v=1.9.0-ui-v2"></script>
 </body>
 </html>

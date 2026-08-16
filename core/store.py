@@ -15,14 +15,26 @@ from pathlib import Path
 from typing import Any
 
 from .identity import parse_scope_from_session
+from .memory_atom import (
+    DURABILITY_LEVELS,
+    SENSITIVITY_LEVELS,
+    VALIDITY_STATUSES,
+    clamp_score,
+    normalize_durability,
+    normalize_sensitivity,
+    normalize_validity_status,
+    validity_where_clause,
+)
 from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads, new_id, stable_fingerprint, utc_now
 from .portrait import cross_scene_whitelisted_fact
 from .profile_quality import normalize_profile_value, profile_quality_decision
 from .portrait_namespace import portrait_scope_kind, portrait_scope_persona
+from .sensitive_data import redact_sensitive_text, redact_sensitive_value
 
 
 class MemoryStore:
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
+    SCHEMA_VERSION = "memory-atom-v2"
 
     PROFILE_MEMORY_TYPES = frozenset({"user_profile", "user_preference", "user_habit"})
 
@@ -75,6 +87,7 @@ class MemoryStore:
         self._last_database_error: dict[str, Any] = {}
         self._database_recovery_attempts = 0
         self._database_recovery_successes = 0
+        self.last_schema_backup_path = ""
 
     def _open_connection(self) -> sqlite3.Connection:
         database = str(self.db_path)
@@ -290,8 +303,15 @@ class MemoryStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self.last_schema_backup_path = self._backup_before_schema_upgrade_sync()
             self._conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS schema_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+
                 CREATE TABLE IF NOT EXISTS memories (
                     id TEXT PRIMARY KEY,
                     memory_type TEXT NOT NULL,
@@ -316,6 +336,21 @@ class MemoryStore:
                     evidence TEXT NOT NULL DEFAULT '',
                     confidence REAL NOT NULL DEFAULT 0.5,
                     importance REAL NOT NULL DEFAULT 0.3,
+                    owner_bot_id TEXT NOT NULL DEFAULT '',
+                    validity_status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(validity_status IN ('active','superseded','expired','archived','deleted','quarantined')),
+                    valid_from TEXT NOT NULL DEFAULT '',
+                    valid_to TEXT NOT NULL DEFAULT '',
+                    salience REAL NOT NULL DEFAULT 0.3 CHECK(salience >= 0 AND salience <= 1),
+                    durability TEXT NOT NULL DEFAULT 'normal'
+                        CHECK(durability IN ('ephemeral','short','normal','durable','pinned')),
+                    sensitivity TEXT NOT NULL DEFAULT 'private'
+                        CHECK(sensitivity IN ('public','internal','private','restricted')),
+                    reinforcement_score REAL NOT NULL DEFAULT 0
+                        CHECK(reinforcement_score >= 0 AND reinforcement_score <= 1),
+                    injection_count INTEGER NOT NULL DEFAULT 0 CHECK(injection_count >= 0),
+                    last_injected_at TEXT NOT NULL DEFAULT '',
+                    canonical_key TEXT NOT NULL DEFAULT '',
                     review_status TEXT NOT NULL DEFAULT 'auto',
                     tags TEXT NOT NULL DEFAULT '[]',
                     metadata TEXT NOT NULL DEFAULT '{}',
@@ -752,6 +787,7 @@ class MemoryStore:
                     updated_at TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(person_id, run_day)
                 );
+
                 """
             )
             self._ensure_memory_columns_sync()
@@ -762,6 +798,18 @@ class MemoryStore:
             self._ensure_retrieval_revision_sync()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_atom_domain "
+                "ON memories(owner_bot_id, platform, scope, validity_status)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_validity_time "
+                "ON memories(validity_status, valid_from, valid_to)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_canonical_key "
+                "ON memories(canonical_key)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_summary ON timeline(session_id, summarized_at, occurred_at)"
@@ -838,7 +886,159 @@ class MemoryStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_person ON portrait_learning_queue(person_id, state, updated_at)"
             )
+            self._redact_existing_sensitive_rows_sync()
+            self._conn.execute(
+                """INSERT INTO schema_metadata(key,value,updated_at) VALUES('schema_version',?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (self.SCHEMA_VERSION, utc_now()),
+            )
             self._conn.commit()
+
+    def _backup_before_schema_upgrade_sync(self) -> str:
+        """Create a consistent, private rollback copy before mutating an existing schema."""
+
+        tables = {
+            clean_text(row["name"], 160)
+            for row in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        if not tables:
+            return ""
+        if "schema_metadata" in tables:
+            row = self._conn.execute(
+                "SELECT value FROM schema_metadata WHERE key='schema_version'"
+            ).fetchone()
+            if row is not None and clean_text(row["value"], 80) == self.SCHEMA_VERSION:
+                return ""
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = self.db_path.with_name(
+            f"{self.db_path.stem}.before-{self.SCHEMA_VERSION}.{timestamp}{self.db_path.suffix or '.db'}"
+        )
+        with closing(sqlite3.connect(str(backup_path))) as backup_conn:
+            self._conn.backup(backup_conn)
+        backup_path.chmod(0o600)
+        return str(backup_path)
+
+    def _redact_existing_sensitive_rows_sync(self) -> None:
+        """Idempotently scrub legacy rows before recall, embedding, or export."""
+        rekeyed = False
+        for row in self._conn.execute("SELECT id, content, evidence, metadata FROM memories").fetchall():
+            content = redact_sensitive_text(row["content"])
+            evidence = redact_sensitive_text(row["evidence"])
+            metadata = redact_sensitive_value(json_loads(row["metadata"], {}))
+            encoded_metadata = json_dumps(metadata)
+            if content != row["content"] or evidence != row["evidence"] or encoded_metadata != row["metadata"]:
+                content_changed = content != row["content"]
+                self._conn.execute(
+                    """UPDATE memories
+                       SET content=?, evidence=?, metadata=?,
+                           canonical_key=CASE WHEN ? THEN '' ELSE canonical_key END,
+                           content_fingerprint=CASE WHEN ? THEN '' ELSE content_fingerprint END
+                       WHERE id=?""",
+                    (content, evidence, encoded_metadata, content_changed, content_changed, row["id"]),
+                )
+                if content_changed:
+                    self._conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id=?",
+                        (row["id"],),
+                    )
+                    refreshed = self._conn.execute(
+                        "SELECT * FROM memories WHERE id=?",
+                        (row["id"],),
+                    ).fetchone()
+                    self._upsert_memory_fts_row(refreshed)
+                rekeyed = rekeyed or content_changed
+        for row in self._conn.execute("SELECT id, content, metadata FROM timeline").fetchall():
+            content = redact_sensitive_text(row["content"])
+            metadata = redact_sensitive_value(json_loads(row["metadata"], {}))
+            encoded_metadata = json_dumps(metadata)
+            if content != row["content"] or encoded_metadata != row["metadata"]:
+                self._conn.execute(
+                    "UPDATE timeline SET content=?, metadata=? WHERE id=?",
+                    (content, encoded_metadata, row["id"]),
+                )
+        self._redact_legacy_auxiliary_tables_sync()
+        if rekeyed:
+            self._backfill_memory_atom_v2_sync()
+
+    def _redact_legacy_auxiliary_tables_sync(self) -> None:
+        """Scrub older secondary projections that can surface memory text."""
+        secret_node_ids: list[str] = []
+        for row in self._conn.execute("SELECT id,label FROM knowledge_nodes").fetchall():
+            if redact_sensitive_text(row["label"]) != row["label"]:
+                secret_node_ids.append(row["id"])
+        if secret_node_ids:
+            placeholders = ",".join("?" for _ in secret_node_ids)
+            self._conn.execute(
+                f"DELETE FROM knowledge_edges WHERE source_node_id IN ({placeholders}) OR target_node_id IN ({placeholders})",
+                [*secret_node_ids, *secret_node_ids],
+            )
+            self._conn.execute(
+                f"DELETE FROM knowledge_nodes WHERE id IN ({placeholders})",
+                secret_node_ids,
+            )
+
+        secret_fact_ids: list[str] = []
+        for row in self._conn.execute("SELECT id,claim_summary FROM portrait_facts").fetchall():
+            if redact_sensitive_text(row["claim_summary"]) != row["claim_summary"]:
+                secret_fact_ids.append(row["id"])
+        if secret_fact_ids:
+            placeholders = ",".join("?" for _ in secret_fact_ids)
+            self._conn.execute(
+                f"DELETE FROM portrait_learning_queue WHERE fact_id IN ({placeholders})",
+                secret_fact_ids,
+            )
+            self._conn.execute(
+                f"DELETE FROM portrait_facts WHERE id IN ({placeholders})",
+                secret_fact_ids,
+            )
+
+        table_columns = {
+            "identities": ((), ("profile",)),
+            "summary_failures": (("last_error",), ("metadata",)),
+            "chat_import_batches": (("error",), ("speaker_map", "options", "stats")),
+            "chat_import_segments": (("transcript", "error"), ("result",)),
+            "relationship_edges": (("evidence",), ("metadata",)),
+            "knowledge_nodes": (("label",), ("metadata",)),
+            "knowledge_edges": (("evidence",), ("metadata",)),
+            "cross_window_threads": (("topic", "content"), ("metadata",)),
+            "injection_logs": (("query",), ("blocked_reasons",)),
+            "portrait_people": ((), ("capability_summary",)),
+            "portrait_facts": (("claim_summary",), ("context_refs",)),
+            "portrait_suppressions": (("reason",), ()),
+            "portrait_operations": ((), ("snapshot",)),
+        }
+        for table, (text_columns, json_columns) in table_columns.items():
+            columns = [*text_columns, *json_columns]
+            if not columns:
+                continue
+            selected = ",".join(columns)
+            rows = self._conn.execute(
+                f"SELECT rowid AS _redact_rowid,{selected} FROM {table}"
+            ).fetchall()
+            for row in rows:
+                values: list[str] = []
+                changed = False
+                for column in text_columns:
+                    raw = str(row[column] or "")
+                    safe = redact_sensitive_text(raw)
+                    values.append(safe)
+                    changed = changed or safe != raw
+                for column in json_columns:
+                    raw = str(row[column] or "")
+                    decoded = json_loads(raw, {})
+                    safe = json_dumps(redact_sensitive_value(decoded))
+                    values.append(safe)
+                    changed = changed or safe != raw
+                if changed:
+                    assignments = ",".join(f"{column}=?" for column in columns)
+                    self._conn.execute(
+                        f"UPDATE {table} SET {assignments} WHERE rowid=?",
+                        [*values, row["_redact_rowid"]],
+                    )
+
 
     def _ensure_retrieval_revision_sync(self) -> None:
         self._conn.executescript(
@@ -859,6 +1059,7 @@ class MemoryStore:
             BEGIN
                 UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
             END;
+            DROP TRIGGER IF EXISTS trg_memories_retrieval_revision_update;
             CREATE TRIGGER IF NOT EXISTS trg_memories_retrieval_revision_update
             AFTER UPDATE OF
                 memory_type, subject_kind, subject_id, subject_name, subject_role,
@@ -866,7 +1067,10 @@ class MemoryStore:
                 platform, message_id, group_id, visibility, sayability, reality_level,
                 lifecycle, content, evidence, confidence, importance, review_status,
                 tags, metadata, created_at, updated_at, occurred_at, source_plugin,
-                import_batch_id, content_fingerprint, merged_count, supersedes_id
+                import_batch_id, content_fingerprint, merged_count, supersedes_id,
+                owner_bot_id, validity_status, valid_from, valid_to, salience,
+                durability, sensitivity, reinforcement_score, injection_count,
+                last_injected_at, canonical_key
             ON memories
             BEGIN
                 UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
@@ -1069,10 +1273,73 @@ class MemoryStore:
             "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
             "merged_count": "INTEGER NOT NULL DEFAULT 1",
             "supersedes_id": "TEXT NOT NULL DEFAULT ''",
+            "owner_bot_id": "TEXT NOT NULL DEFAULT ''",
+            "validity_status": (
+                "TEXT NOT NULL DEFAULT 'active' "
+                "CHECK(validity_status IN ('active','superseded','expired','archived','deleted','quarantined'))"
+            ),
+            "valid_from": "TEXT NOT NULL DEFAULT ''",
+            "valid_to": "TEXT NOT NULL DEFAULT ''",
+            "salience": "REAL NOT NULL DEFAULT 0.3 CHECK(salience >= 0 AND salience <= 1)",
+            "durability": (
+                "TEXT NOT NULL DEFAULT 'normal' "
+                "CHECK(durability IN ('ephemeral','short','normal','durable','pinned'))"
+            ),
+            "sensitivity": (
+                "TEXT NOT NULL DEFAULT 'private' "
+                "CHECK(sensitivity IN ('public','internal','private','restricted'))"
+            ),
+            "reinforcement_score": (
+                "REAL NOT NULL DEFAULT 0 CHECK(reinforcement_score >= 0 AND reinforcement_score <= 1)"
+            ),
+            "injection_count": "INTEGER NOT NULL DEFAULT 0 CHECK(injection_count >= 0)",
+            "last_injected_at": "TEXT NOT NULL DEFAULT ''",
+            "canonical_key": "TEXT NOT NULL DEFAULT ''",
         }
         for name, ddl in additions.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
+        self._backfill_memory_atom_v2_sync()
+
+    def _backfill_memory_atom_v2_sync(self) -> int:
+        """Populate v2 atom columns without rewriting legacy content or timestamps."""
+
+        rows = self._conn.execute("SELECT * FROM memories").fetchall()
+        updated = 0
+        columns = (
+            "owner_bot_id",
+            "validity_status",
+            "valid_from",
+            "valid_to",
+            "salience",
+            "durability",
+            "sensitivity",
+            "reinforcement_score",
+            "injection_count",
+            "last_injected_at",
+            "canonical_key",
+            "content_fingerprint",
+        )
+        for row in rows:
+            record = MemoryRecord.from_row(row)
+            values = record.to_db()
+            current = tuple(row[name] for name in columns)
+            desired = tuple(values[name] for name in columns)
+            if current == desired:
+                continue
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET owner_bot_id=?, validity_status=?, valid_from=?, valid_to=?,
+                    salience=?, durability=?, sensitivity=?, reinforcement_score=?,
+                    injection_count=?, last_injected_at=?, canonical_key=?,
+                    content_fingerprint=?
+                WHERE id=?
+                """,
+                [*desired, record.id],
+            )
+            updated += 1
+        return updated
 
     def _ensure_timeline_columns_sync(self) -> None:
         existing = {
@@ -1351,6 +1618,7 @@ class MemoryStore:
         return await asyncio.to_thread(self._upsert_portrait_fact_sync, deepcopy(fact))
 
     def _upsert_portrait_fact_sync(self, fact: dict[str, Any]) -> dict[str, Any]:
+        fact = redact_sensitive_value(fact)
         person_id = clean_text(fact.get("person_id"), 80)
         dimension = clean_text(fact.get("dimension"), 80)
         claim_hash = clean_text(fact.get("normalized_claim_hash"), 80)
@@ -2152,14 +2420,23 @@ class MemoryStore:
         backup = self.backup(".before_clear_all")
         tables = [
             "memory_fts",
+            "emotion_event_deliveries",
+            "emotion_events",
+            "portrait_learning_queue",
+            "portrait_daily_runs",
+            "portrait_suppressions",
+            "portrait_facts",
+            "portrait_evidence",
+            "portrait_operations",
+            "portrait_people",
             "review_queue",
             "injection_logs",
             "summary_failures",
             "chat_import_segments",
             "chat_import_batches",
             "relationship_edges",
-            "knowledge_nodes",
             "knowledge_edges",
+            "knowledge_nodes",
             "timeline",
             "cross_window_threads",
             "memory_acl_rules",
@@ -4608,6 +4885,20 @@ class MemoryStore:
                 self._embedding_candidate_cache_revision = ""
         return result
 
+    @staticmethod
+    def _memory_atom_record_for_row(
+        row: sqlite3.Row,
+        *,
+        reset_semantic_keys: bool = False,
+        **changes: Any,
+    ) -> MemoryRecord:
+        payload = dict(row)
+        payload.update(changes)
+        if reset_semantic_keys:
+            payload["canonical_key"] = ""
+            payload["content_fingerprint"] = ""
+        return MemoryRecord.from_row(payload)
+
     async def insert_memory(self, record: MemoryRecord, review_reason: str = "") -> str:
         return await self._run_recoverable_database_operation(
             self._insert_memory_sync,
@@ -4898,6 +5189,8 @@ class MemoryStore:
     ) -> str:
         now = utc_now()
         row_id = new_id("rel")
+        evidence = redact_sensitive_text(evidence)
+        metadata = redact_sensitive_value(metadata)
         with self._lock:
             old = self._conn.execute(
                 """
@@ -5055,7 +5348,8 @@ class MemoryStore:
         metadata: dict[str, Any],
     ) -> str:
         node_type = clean_text(node_type, 40)
-        label = clean_text(label, 160)
+        label = clean_text(redact_sensitive_text(label), 160)
+        metadata = redact_sensitive_value(metadata)
         scope = clean_text(scope, 40)
         session_id = clean_text(session_id, 200)
         group_id = clean_text(group_id, 120)
@@ -5151,6 +5445,8 @@ class MemoryStore:
         target_node_id = clean_text(target_node_id, 120)
         relation_type = clean_text(relation_type, 60)
         source_memory_id = clean_text(source_memory_id, 120)
+        evidence = redact_sensitive_text(evidence)
+        metadata = redact_sensitive_value(metadata)
         if not source_node_id or not target_node_id or not relation_type:
             return ""
         edge_id = "kg_edge_" + stable_fingerprint(source_node_id, target_node_id, relation_type, source_memory_id)[:16]
@@ -5560,6 +5856,8 @@ class MemoryStore:
         occurred_at: str,
     ) -> str:
         now = utc_now()
+        content = redact_sensitive_text(clean_text(content, 4000))
+        metadata = redact_sensitive_value(metadata)
         row_id = new_id("tl")
         event_type = clean_text(event_type, 80)
         session_id = clean_text(session_id, 200)
@@ -5657,8 +5955,8 @@ class MemoryStore:
                             clean_text(raw.get("scope"), 40),
                             subject_id,
                             clean_text(raw.get("object_id"), 120),
-                            clean_text(raw.get("content"), 4000),
-                            json_dumps(metadata),
+                            clean_text(redact_sensitive_text(raw.get("content")), 4000),
+                            json_dumps(redact_sensitive_value(metadata)),
                             message_id,
                             dedupe_key,
                             clean_text(raw.get("occurred_at"), 80) or now,
@@ -5687,6 +5985,7 @@ class MemoryStore:
             raise ValueError("chat import batch id is required")
         now = utc_now()
         json_fields = {"speaker_map", "options", "stats"}
+        payload = redact_sensitive_value(payload)
         values: dict[str, Any] = {
             "id": batch_id,
             "upload_id": clean_text(payload.get("upload_id"), 120),
@@ -5710,7 +6009,7 @@ class MemoryStore:
             "important_event_count": max(0, int(payload.get("important_event_count") or 0)),
             "relationship_observation_count": max(0, int(payload.get("relationship_observation_count") or 0)),
             "backup_path": clean_text(payload.get("backup_path"), 2000),
-            "error": clean_text(payload.get("error"), 1000),
+            "error": clean_text(redact_sensitive_text(payload.get("error")), 1000),
             "created_at": clean_text(payload.get("created_at"), 80) or now,
             "updated_at": now,
         }
@@ -5774,7 +6073,9 @@ class MemoryStore:
             "stats", "options", "speaker_map", "backup_path", "error",
         }
         json_fields = {"stats", "options", "speaker_map"}
-        selected = {key: value for key, value in changes.items() if key in allowed}
+        selected = redact_sensitive_value(
+            {key: value for key, value in changes.items() if key in allowed}
+        )
         if not selected:
             return self._get_chat_import_batch_sync(batch_id)
         selected["updated_at"] = utc_now()
@@ -5808,10 +6109,11 @@ class MemoryStore:
                             clean_text(raw.get("id"), 120), batch_id, max(0, int(raw.get("segment_index") or 0)),
                             clean_text(raw.get("start_at"), 80), clean_text(raw.get("end_at"), 80),
                             clean_text(raw.get("local_date"), 20), json_dumps(raw.get("message_ids") or []),
-                            str(raw.get("transcript") or ""), max(0, int(raw.get("char_count") or 0)),
+                            redact_sensitive_text(raw.get("transcript")), max(0, int(raw.get("char_count") or 0)),
                             max(0, int(raw.get("turn_count") or 0)), clean_text(raw.get("status"), 30) or "pending",
-                            max(0, int(raw.get("attempts") or 0)), json_dumps(raw.get("result") or {}),
-                            clean_text(raw.get("summary_memory_id"), 120), clean_text(raw.get("error"), 1000), now, now,
+                            max(0, int(raw.get("attempts") or 0)), json_dumps(redact_sensitive_value(raw.get("result") or {})),
+                            clean_text(raw.get("summary_memory_id"), 120),
+                            clean_text(redact_sensitive_text(raw.get("error")), 1000), now, now,
                         ),
                     )
         return len(segments)
@@ -5844,7 +6146,9 @@ class MemoryStore:
 
     def _update_chat_import_segment_sync(self, segment_id: str, changes: dict[str, Any]) -> bool:
         allowed = {"status", "attempts", "result", "summary_memory_id", "error"}
-        selected = {key: value for key, value in changes.items() if key in allowed}
+        selected = redact_sensitive_value(
+            {key: value for key, value in changes.items() if key in allowed}
+        )
         if not selected:
             return False
         selected["updated_at"] = utc_now()
@@ -6187,10 +6491,22 @@ class MemoryStore:
                     object_ref = rebound_entity(row, "object")
                     metadata = binding_metadata(row["metadata"])
                     metadata["owner_bot_id"] = bot_id
-                    fingerprint = stable_fingerprint(
-                        row["memory_type"], "private", session_id, "",
-                        subject[0], subject[1], object_ref[0], object_ref[1],
-                        row["visibility"], row["reality_level"], row["content"],
+                    atom = self._memory_atom_record_for_row(
+                        row,
+                        subject_kind=subject[0],
+                        subject_id=subject[1],
+                        subject_name=subject[2],
+                        subject_role=subject[3],
+                        object_kind=object_ref[0],
+                        object_id=object_ref[1],
+                        object_name=object_ref[2],
+                        object_role=object_ref[3],
+                        scope="private",
+                        session_id=session_id,
+                        platform=platform,
+                        group_id="",
+                        metadata=json_dumps(metadata),
+                        owner_bot_id=bot_id,
                     )
                     self._conn.execute(
                         """
@@ -6198,7 +6514,8 @@ class MemoryStore:
                         SET subject_kind=?, subject_id=?, subject_name=?, subject_role=?,
                             object_kind=?, object_id=?, object_name=?, object_role=?,
                             scope='private', session_id=?, platform=?, group_id='',
-                            metadata=?, content_fingerprint=?, updated_at=?
+                            metadata=?, owner_bot_id=?, canonical_key=?,
+                            content_fingerprint=?, updated_at=?
                         WHERE id=? AND import_batch_id=?
                         """,
                         (
@@ -6207,7 +6524,9 @@ class MemoryStore:
                             session_id,
                             platform,
                             json_dumps(metadata),
-                            fingerprint,
+                            atom.owner_bot_id,
+                            atom.canonical_key,
+                            atom.content_fingerprint,
                             now,
                             row["id"],
                             batch_id,
@@ -6474,20 +6793,35 @@ class MemoryStore:
                     session_changed = clean_text(row["session_id"], 200) != session_id
                     if not entity_changed and not session_changed:
                         continue
-                    fingerprint = stable_fingerprint(
-                        row["memory_type"], row["scope"], session_id, row["group_id"],
-                        subject[0], subject[1], object_ref[0], object_ref[1],
-                        row["visibility"], row["reality_level"], row["content"],
+                    atom = self._memory_atom_record_for_row(
+                        row,
+                        subject_kind=subject[0],
+                        subject_id=subject[1],
+                        subject_name=subject[2],
+                        subject_role=subject[3],
+                        object_kind=object_ref[0],
+                        object_id=object_ref[1],
+                        object_name=object_ref[2],
+                        object_role=object_ref[3],
+                        session_id=session_id,
                     )
                     self._conn.execute(
                         """
                         UPDATE memories
                         SET subject_kind=?, subject_id=?, subject_name=?, subject_role=?,
                             object_kind=?, object_id=?, object_name=?, object_role=?,
-                            session_id=?, content_fingerprint=?, updated_at=?
+                            session_id=?, canonical_key=?, content_fingerprint=?, updated_at=?
                         WHERE id=?
                         """,
-                        (*subject, *object_ref, session_id, fingerprint, now, row["id"]),
+                        (
+                            *subject,
+                            *object_ref,
+                            session_id,
+                            atom.canonical_key,
+                            atom.content_fingerprint,
+                            now,
+                            row["id"],
+                        ),
                     )
                     repaired_memories += 1
                     repaired_entities += int(entity_changed)
@@ -6544,18 +6878,26 @@ class MemoryStore:
                         continue
                     metadata.setdefault("legacy_perspective_summary", current)
                     metadata["summary_perspective"] = "neutral_third_person"
-                    fingerprint = stable_fingerprint(
-                        row["memory_type"], row["scope"], row["session_id"], row["group_id"],
-                        row["subject_kind"], row["subject_id"], row["object_kind"], row["object_id"],
-                        row["visibility"], row["reality_level"], canonical,
+                    atom = self._memory_atom_record_for_row(
+                        row,
+                        reset_semantic_keys=True,
+                        content=canonical,
+                        metadata=json_dumps(metadata),
                     )
                     self._conn.execute(
                         """
                         UPDATE memories
-                        SET content=?, metadata=?, content_fingerprint=?, updated_at=?
+                        SET content=?, metadata=?, canonical_key=?, content_fingerprint=?, updated_at=?
                         WHERE id=?
                         """,
-                        (canonical, json_dumps(metadata), fingerprint, now, row["id"]),
+                        (
+                            canonical,
+                            json_dumps(metadata),
+                            atom.canonical_key,
+                            atom.content_fingerprint,
+                            now,
+                            row["id"],
+                        ),
                     )
                     embeddings_removed += int(
                         self._conn.execute(
@@ -6621,18 +6963,26 @@ class MemoryStore:
                 metadata["canonical_summary"] = canonical_summary
                 metadata["summary_perspective"] = "neutral_third_person"
                 metadata["detail_schema_version"] = max(1, int(detail_schema_version or 1))
-                fingerprint = stable_fingerprint(
-                    row["memory_type"], row["scope"], row["session_id"], row["group_id"],
-                    row["subject_kind"], row["subject_id"], row["object_kind"], row["object_id"],
-                    row["visibility"], row["reality_level"], detailed_summary,
+                atom = self._memory_atom_record_for_row(
+                    row,
+                    reset_semantic_keys=True,
+                    content=detailed_summary,
+                    metadata=json_dumps(metadata),
                 )
                 self._conn.execute(
                     """
                     UPDATE memories
-                    SET content=?, metadata=?, content_fingerprint=?, updated_at=?
+                    SET content=?, metadata=?, canonical_key=?, content_fingerprint=?, updated_at=?
                     WHERE id=?
                     """,
-                    (detailed_summary, json_dumps(metadata), fingerprint, utc_now(), memory_id),
+                    (
+                        detailed_summary,
+                        json_dumps(metadata),
+                        atom.canonical_key,
+                        atom.content_fingerprint,
+                        utc_now(),
+                        memory_id,
+                    ),
                 )
                 removed = int(
                     self._conn.execute(
@@ -6703,19 +7053,29 @@ class MemoryStore:
                 ][:64]
                 metadata["summary_perspective"] = "neutral_third_person"
                 metadata["detail_schema_version"] = max(1, int(detail_schema_version or 1))
-                fingerprint = stable_fingerprint(
-                    row["memory_type"], row["scope"], row["session_id"], row["group_id"],
-                    row["subject_kind"], row["subject_id"], row["object_kind"], row["object_id"],
-                    row["visibility"], row["reality_level"], detailed_summary,
+                atom = self._memory_atom_record_for_row(
+                    row,
+                    reset_semantic_keys=True,
+                    content=detailed_summary,
+                    evidence="；".join(metadata["source_message_ids"]),
+                    metadata=json_dumps(metadata),
                 )
                 evidence = "；".join(metadata["source_message_ids"])
                 self._conn.execute(
                     """
                     UPDATE memories
-                    SET content=?, evidence=?, metadata=?, content_fingerprint=?, updated_at=?
+                    SET content=?, evidence=?, metadata=?, canonical_key=?, content_fingerprint=?, updated_at=?
                     WHERE id=?
                     """,
-                    (detailed_summary, evidence, json_dumps(metadata), fingerprint, utc_now(), row["id"]),
+                    (
+                        detailed_summary,
+                        evidence,
+                        json_dumps(metadata),
+                        atom.canonical_key,
+                        atom.content_fingerprint,
+                        utc_now(),
+                        row["id"],
+                    ),
                 )
                 removed = int(
                     self._conn.execute(
@@ -7118,8 +7478,8 @@ class MemoryStore:
                     clean_text(scope, 40),
                     clean_text(start_timeline_id, 120),
                     clean_text(end_timeline_id, 120),
-                    clean_text(error, 1000),
-                    json_dumps(metadata),
+                    clean_text(redact_sensitive_text(error), 1000),
+                    json_dumps(redact_sensitive_value(metadata)),
                     now,
                     now,
                 ),
@@ -7234,6 +7594,9 @@ class MemoryStore:
     ) -> str:
         now = utc_now()
         row_id = new_id("thread")
+        topic = redact_sensitive_text(topic)
+        content = redact_sensitive_text(content)
+        metadata = redact_sensitive_value(metadata)
         with self._lock:
             self._conn.execute(
                 """
@@ -7348,9 +7711,9 @@ class MemoryStore:
                     row_id,
                     clean_text(session_id, 200),
                     clean_text(scope, 40),
-                    clean_text(query, 1000),
+                    clean_text(redact_sensitive_text(query), 1000),
                     json_dumps(selected_memory_ids),
-                    json_dumps(blocked_reasons[:30]),
+                    json_dumps(redact_sensitive_value(blocked_reasons[:30])),
                     max(0, int(injection_chars or 0)),
                     utc_now(),
                 ),
@@ -7925,6 +8288,74 @@ class MemoryStore:
                 LIMIT ? OFFSET ?
                 """,
                 params + [max(1, int(limit)), max(0, int(offset))],
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    async def list_memories_by_validity(
+        self,
+        *,
+        validity_statuses: list[str] | tuple[str, ...] | None = None,
+        valid_at: str = "",
+        owner_bot_id: str = "",
+        platform: str = "",
+        scope: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[MemoryRecord]:
+        """Read a bounded Memory Atom set using reusable validity-time rules."""
+
+        return await self._run_recoverable_database_operation(
+            self._list_memories_by_validity_sync,
+            validity_statuses,
+            valid_at,
+            owner_bot_id,
+            platform,
+            scope,
+            limit,
+            offset,
+        )
+
+    def _list_memories_by_validity_sync(
+        self,
+        validity_statuses: list[str] | tuple[str, ...] | None,
+        valid_at: str,
+        owner_bot_id: str,
+        platform: str,
+        scope: str,
+        limit: int,
+        offset: int,
+    ) -> list[MemoryRecord]:
+        statuses = [
+            clean_text(value, 24).lower()
+            for value in (validity_statuses or ["active"])
+            if clean_text(value, 24).lower() in VALIDITY_STATUSES
+        ]
+        at = clean_text(valid_at, 80) or utc_now()
+        validity_where, params = validity_where_clause(statuses=statuses, valid_at=at)
+        where = [validity_where]
+        owner = clean_text(owner_bot_id, 120)
+        platform_value = clean_text(platform, 80)
+        scope_value = clean_text(scope, 40)
+        if owner:
+            where.append("owner_bot_id=?")
+            params.append(owner)
+        if platform_value:
+            where.append("platform=?")
+            params.append(platform_value)
+        if scope_value:
+            where.append("scope=?")
+            params.append(scope_value)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT *
+                FROM memories
+                WHERE {' AND '.join(where)}
+                ORDER BY salience DESC, importance DESC,
+                         COALESCE(NULLIF(valid_from, ''), NULLIF(occurred_at, ''), created_at) DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, max(1, int(limit or 1)), max(0, int(offset or 0))],
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
@@ -8756,6 +9187,12 @@ class MemoryStore:
         lifecycle: str | None = None,
         review_status: str | None = None,
         metadata: dict[str, Any] | None = None,
+        validity_status: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        salience: Any | None = None,
+        durability: str | None = None,
+        sensitivity: str | None = None,
     ) -> bool:
         return await self._run_recoverable_database_operation(
             self._update_memory_payload_sync,
@@ -8769,6 +9206,12 @@ class MemoryStore:
             lifecycle,
             review_status,
             metadata,
+            validity_status,
+            valid_from,
+            valid_to,
+            salience,
+            durability,
+            sensitivity,
         )
 
     def _update_memory_payload_sync(
@@ -8783,6 +9226,12 @@ class MemoryStore:
         lifecycle: str | None,
         review_status: str | None,
         metadata: dict[str, Any] | None,
+        validity_status: str | None,
+        valid_from: str | None,
+        valid_to: str | None,
+        salience: Any | None,
+        durability: str | None,
+        sensitivity: str | None,
     ) -> bool:
         memory_id = clean_text(memory_id, 120)
         with self._lock:
@@ -8791,8 +9240,14 @@ class MemoryStore:
                 if not row:
                     return False
                 next_type = clean_text(memory_type if memory_type is not None else row["memory_type"], 80) or row["memory_type"]
-                next_content = clean_text(content if content is not None else row["content"], 4000)
-                next_evidence = clean_text(evidence if evidence is not None else row["evidence"], 4000)
+                next_content = clean_text(
+                    redact_sensitive_text(content if content is not None else row["content"]),
+                    4000,
+                )
+                next_evidence = clean_text(
+                    redact_sensitive_text(evidence if evidence is not None else row["evidence"]),
+                    4000,
+                )
                 next_visibility = clean_text(visibility if visibility is not None else row["visibility"], 40) or row["visibility"]
                 next_lifecycle = clean_text(lifecycle if lifecycle is not None else row["lifecycle"], 40) or row["lifecycle"]
                 next_review_status = clean_text(
@@ -8802,6 +9257,7 @@ class MemoryStore:
                 next_metadata = metadata if isinstance(metadata, dict) else json_loads(row["metadata"], {})
                 if not isinstance(next_metadata, dict):
                     next_metadata = {}
+                next_metadata = redact_sensitive_value(next_metadata)
                 prospective = MemoryRecord.from_row(row)
                 prospective.memory_type = next_type
                 prospective.visibility = next_visibility
@@ -8823,18 +9279,59 @@ class MemoryStore:
                     next_confidence = max(0.0, min(1.0, float(confidence if confidence is not None else row["confidence"])))
                 except Exception:
                     next_confidence = float(row["confidence"] or 0.5)
-                fingerprint = stable_fingerprint(
-                    next_type,
-                    row["scope"],
-                    row["session_id"],
-                    row["group_id"],
-                    row["subject_kind"],
-                    row["subject_id"],
-                    row["object_kind"],
-                    row["object_id"],
-                    next_visibility,
-                    row["reality_level"],
-                    next_content,
+                current_validity = normalize_validity_status(row["validity_status"])
+                if validity_status is None:
+                    next_validity = current_validity
+                    if lifecycle is not None and next_lifecycle == "archived":
+                        next_validity = "archived"
+                    elif lifecycle is not None and current_validity == "archived" and next_lifecycle != "archived":
+                        next_validity = "active"
+                else:
+                    requested_validity = clean_text(validity_status, 24).lower()
+                    next_validity = normalize_validity_status(requested_validity, current_validity)
+                if next_lifecycle == "archived" or next_validity == "archived":
+                    next_lifecycle = "archived"
+                    next_validity = "archived"
+                next_valid_from = clean_text(
+                    valid_from if valid_from is not None else row["valid_from"],
+                    80,
+                )
+                next_valid_to = clean_text(
+                    valid_to if valid_to is not None else row["valid_to"],
+                    80,
+                )
+                next_salience = clamp_score(
+                    salience if salience is not None else row["salience"],
+                    float(row["salience"] or next_importance),
+                )
+                requested_durability = clean_text(
+                    durability if durability is not None else row["durability"],
+                    24,
+                ).lower()
+                next_durability = normalize_durability(
+                    requested_durability,
+                    clean_text(row["durability"], 24) if row["durability"] in DURABILITY_LEVELS else "normal",
+                )
+                requested_sensitivity = clean_text(
+                    sensitivity if sensitivity is not None else row["sensitivity"],
+                    24,
+                ).lower()
+                next_sensitivity = normalize_sensitivity(
+                    requested_sensitivity,
+                    clean_text(row["sensitivity"], 24) if row["sensitivity"] in SENSITIVITY_LEVELS else "private",
+                )
+                atom = self._memory_atom_record_for_row(
+                    row,
+                    reset_semantic_keys=memory_type is not None or content is not None,
+                    memory_type=next_type,
+                    content=next_content,
+                    evidence=next_evidence,
+                    visibility=next_visibility,
+                    lifecycle=next_lifecycle,
+                    review_status=next_review_status,
+                    metadata=json_dumps(next_metadata),
+                    importance=next_importance,
+                    confidence=next_confidence,
                 )
                 cur = self._conn.execute(
                     """
@@ -8846,8 +9343,15 @@ class MemoryStore:
                         confidence=?,
                         visibility=?,
                         lifecycle=?,
+                        validity_status=?,
+                        valid_from=?,
+                        valid_to=?,
+                        salience=?,
+                        durability=?,
+                        sensitivity=?,
                         review_status=?,
                         metadata=?,
+                        canonical_key=?,
                         content_fingerprint=?,
                         updated_at=?
                     WHERE id=?
@@ -8860,9 +9364,16 @@ class MemoryStore:
                         next_confidence,
                         next_visibility,
                         next_lifecycle,
+                        next_validity,
+                        next_valid_from,
+                        next_valid_to,
+                        next_salience,
+                        next_durability,
+                        next_sensitivity,
                         next_review_status,
                         json_dumps(next_metadata),
-                        fingerprint,
+                        atom.canonical_key,
+                        atom.content_fingerprint,
                         utc_now(),
                         memory_id,
                     ),
@@ -8905,7 +9416,7 @@ class MemoryStore:
     ) -> bool:
         memory_id = clean_text(memory_id, 120)
         reaction = clean_text(reaction, 60)
-        evidence = clean_text(evidence, 500)
+        evidence = clean_text(redact_sensitive_text(evidence), 500)
         with self._lock:
             row = self._conn.execute("SELECT metadata, confidence FROM memories WHERE id=?", (memory_id,)).fetchone()
             if not row:
@@ -9026,8 +9537,14 @@ class MemoryStore:
                 )
                 if not is_rule_profile:
                     self._conn.execute(
-                        "UPDATE memories SET review_status=?, lifecycle=?, updated_at=? WHERE id=?",
-                        (review_status, lifecycle, now, memory_id),
+                        "UPDATE memories SET review_status=?, lifecycle=?, validity_status=?, updated_at=? WHERE id=?",
+                        (
+                            review_status,
+                            lifecycle,
+                            "archived" if lifecycle == "archived" else "active",
+                            now,
+                            memory_id,
+                        ),
                     )
                     self._conn.execute(
                         "UPDATE review_queue SET status=?, updated_at=? WHERE memory_id=?",
@@ -9043,6 +9560,7 @@ class MemoryStore:
                     metadata["quality_gate_passed"] = False
                     record.metadata = metadata
                     record.lifecycle = "archived"
+                    record.validity_status = "archived"
                     record.review_status = "rejected"
                     record.updated_at = now
                     self._write_memory_record_sync(record)
@@ -9098,6 +9616,7 @@ class MemoryStore:
                 record.metadata = metadata
                 record.confidence = max(float(record.confidence or 0.0), 0.95)
                 record.lifecycle = "stable_memory"
+                record.validity_status = "active"
                 record.review_status = "auto"
                 record.updated_at = now
                 self._write_memory_record_sync(record)
@@ -9126,6 +9645,7 @@ class MemoryStore:
                         other_metadata["profile_status_updated_at"] = now
                         other.metadata = other_metadata
                         other.lifecycle = "archived"
+                        other.validity_status = "superseded"
                         other.review_status = "auto"
                         other.supersedes_id = record.id
                         other.updated_at = now
@@ -9232,9 +9752,9 @@ class MemoryStore:
                 WHERE id=? AND source_plugin='livingmemory'
                 """,
                 (
-                    clean_text(payload.get("content"), 4000),
-                    clean_text(payload.get("evidence"), 4000),
-                    json_dumps(payload.get("metadata") or {}),
+                    clean_text(redact_sensitive_text(payload.get("content")), 4000),
+                    clean_text(redact_sensitive_text(payload.get("evidence")), 4000),
+                    json_dumps(redact_sensitive_value(payload.get("metadata") or {})),
                     clean_text(payload.get("scope"), 40),
                     clean_text(payload.get("session_id"), 200),
                     clean_text(payload.get("group_id"), 120),
@@ -9282,10 +9802,16 @@ class MemoryStore:
         return await asyncio.to_thread(self._update_memory_lifecycle_sync, memory_id, lifecycle)
 
     def _update_memory_lifecycle_sync(self, memory_id: str, lifecycle: str) -> bool:
+        lifecycle = clean_text(lifecycle, 40)
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE memories SET lifecycle=?, updated_at=? WHERE id=?",
-                (clean_text(lifecycle, 40), utc_now(), clean_text(memory_id, 120)),
+                "UPDATE memories SET lifecycle=?, validity_status=?, updated_at=? WHERE id=?",
+                (
+                    lifecycle,
+                    "archived" if lifecycle == "archived" else "active",
+                    utc_now(),
+                    clean_text(memory_id, 120),
+                ),
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -9345,7 +9871,7 @@ class MemoryStore:
                         self._conn.execute(
                             """
                             UPDATE memories
-                            SET lifecycle='archived', supersedes_id=?, updated_at=?
+                            SET lifecycle='archived', validity_status='archived', supersedes_id=?, updated_at=?
                             WHERE id=?
                             """,
                             (keep["id"], utc_now(), row["id"]),
@@ -9433,6 +9959,7 @@ class MemoryStore:
                         """
                         UPDATE memories
                         SET lifecycle='archived',
+                            validity_status='archived',
                             metadata=?,
                             updated_at=?
                         WHERE id=? AND lifecycle='raw_event'
@@ -9545,6 +10072,7 @@ class MemoryStore:
                     """
                     UPDATE memories
                     SET lifecycle='archived',
+                        validity_status='archived',
                         supersedes_id=?,
                         metadata=?,
                         updated_at=?
@@ -9792,6 +10320,37 @@ class MemoryStore:
                 [now] + ids,
             )
             self._conn.commit()
+
+    async def mark_injected(self, memory_ids: list[str], when: str = "") -> int:
+        """Record only memories that reached the final injected context."""
+
+        return await asyncio.to_thread(self._mark_injected_sync, memory_ids, when)
+
+    def _mark_injected_sync(self, memory_ids: list[str], when: str = "") -> int:
+        ids = list(
+            dict.fromkeys(
+                clean_text(memory_id, 120)
+                for memory_id in memory_ids or []
+                if clean_text(memory_id, 120)
+            )
+        )
+        if not ids:
+            return 0
+        timestamp = clean_text(when, 80) or utc_now()
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            cur = self._conn.execute(
+                f"""
+                UPDATE memories
+                SET injection_count = injection_count + 1,
+                    last_injected_at = ?,
+                    reinforcement_score = min(1.0, reinforcement_score + 0.025)
+                WHERE id IN ({placeholders})
+                """,
+                [timestamp, *ids],
+            )
+            self._conn.commit()
+        return max(0, int(cur.rowcount or 0))
 
     async def stats(self) -> dict[str, Any]:
         return await self._run_recoverable_database_operation(self._stats_sync)

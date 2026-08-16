@@ -10,14 +10,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.bridge import MemoryCompanionBridge
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
-from astrbot_plugin_remember_you.core.service import MemoryCompanionService
-from astrbot_plugin_remember_you.core.summarizer import MemorySummarizer
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.bridge import MemoryCompanionBridge
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
+from astrbot_plugin_memory_companion.core.summarizer import MemorySummarizer
 
 
 class _Response:
@@ -832,7 +836,7 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "summary": "只总结实际看到的消息。",
                     "canonical_summary": "已消费事件摘要。",
-                    "key_facts": ["事件有明确证据"],
+                    "key_facts": [{"fact": "第1条很长的消息有明确证据", "refs": ["event-1"]}],
                     "importance": 0.6,
                 },
                 ensure_ascii=False,
@@ -982,7 +986,7 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
                     "summary": "网络恢复后完成了阶段总结。",
                     "canonical_summary": "用户确认网络恢复后可以继续总结。",
                     "persona_summary": "我在网络恢复后完成了阶段总结。",
-                    "key_facts": ["连接已恢复"],
+                    "key_facts": [{"fact": "网络恢复后可以自动完成总结", "refs": [timeline_id]}],
                     "topics": ["阶段总结"],
                     "importance": 0.6,
                 },

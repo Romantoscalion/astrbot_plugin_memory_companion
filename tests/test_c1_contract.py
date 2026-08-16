@@ -19,9 +19,10 @@ from astrabot_plugin_remember_you.core import bot_personal_contract as contract
 
 class C1ContractTests(unittest.TestCase):
     def test_frozen_contract_values_and_self_check(self) -> None:
-        self.assertEqual("0ffe3a1ab69b659c", contract.CONTRACT_FINGERPRINT)
-        self.assertEqual(2, contract.CONTRACT_REVISION)
-        self.assertEqual("1.2", contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION)
+        self.assertEqual("ecf1d69406a8445d", contract.CONTRACT_FINGERPRINT)
+        self.assertEqual(3, contract.CONTRACT_REVISION)
+        self.assertEqual("1.3", contract.BOT_PERSONAL_CAPABILITY_SCHEMA_VERSION)
+        self.assertEqual(3, contract.BOT_PERSONAL_CANONICAL_SCHEMA_VERSION)
         self.assertEqual("1.0", contract.BOT_PERSONAL_PAYLOAD_SCHEMA_VERSION)
         self.assertEqual("bot_self_schedule", contract.BOT_PERSONAL_MEMORY_DOMAIN)
         self.assertEqual(12, len(contract.BOT_PERSONAL_MEMORY_TYPES))
@@ -63,9 +64,10 @@ class C1ContractTests(unittest.TestCase):
         descriptor = contract.capability_descriptor()
         self.assertTrue(descriptor["available"])
         self.assertFalse(descriptor["read_only"])
-        self.assertEqual("0ffe3a1ab69b659c", descriptor["contract_fingerprint"])
-        self.assertEqual(2, descriptor["contract_revision"])
-        self.assertEqual("1.2", descriptor["capability_schema_version"])
+        self.assertEqual("ecf1d69406a8445d", descriptor["contract_fingerprint"])
+        self.assertEqual(3, descriptor["contract_revision"])
+        self.assertEqual("1.3", descriptor["capability_schema_version"])
+        self.assertEqual(3, descriptor["canonical_schema_version"])
         self.assertEqual("1.0", descriptor["payload_schema_version"])
         self.assertEqual("bot_self_schedule", descriptor["memory_domain"])
         self.assertEqual(list(contract.WINDOW_SLUGS), descriptor["windows"])

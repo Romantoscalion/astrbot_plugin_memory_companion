@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .identity import session_target_id
+from .memory_lifecycle import apply_lifecycle_score, evaluate_memory_lifecycle
 from .models import MemoryRecord, SearchResult, SessionContext, clean_text
 from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
 
@@ -224,12 +225,12 @@ class RetrievalEngine:
     ) -> tuple[list[SearchResult], list[dict[str, str]]]:
         results, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         results = await self._maybe_rerank_results(query, results, max(1, int(top_k or 1)))
+        results = self._mmr_diversify(results, max(1, int(top_k or 1)))
         selected = results[: max(1, int(top_k or 1))]
         selected, mutable_blocked = self._collapse_mutable_fact_results(query, ctx, selected)
         blocked.extend(mutable_blocked)
         selected, source_blocked = self._collapse_redundant_source_results(selected)
         blocked.extend(source_blocked)
-        await self.store.mark_accessed([item.memory.id for item in selected])
         return selected, blocked
 
     async def search_by_slots(
@@ -245,6 +246,7 @@ class RetrievalEngine:
         ranked, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         total = max(1, int(total_limit or 1))
         ranked = await self._maybe_rerank_results(query, ranked, total)
+        ranked = self._mmr_diversify(ranked, min(len(ranked), max(total * 6, 24)))
         allow_profile_fallback = self._query_allows_profile_fallback(query)
         block_profile_retrieval = self._query_blocks_profile_retrieval(query)
 
@@ -345,7 +347,6 @@ class RetrievalEngine:
         blocked.extend(mutable_blocked)
         selected, source_blocked, slot_map = self._collapse_redundant_source_slots(selected, slot_map)
         blocked.extend(source_blocked)
-        await self.store.mark_accessed([item.memory.id for item in selected])
         return selected, blocked, {slot: items for slot, items in slot_map.items() if items}
 
     async def _maybe_rerank_results(
@@ -504,6 +505,54 @@ class RetrievalEngine:
             return []
         anchors.sort(key=lambda item: item.score, reverse=True)
         return anchors[: max(1, min(len(anchors), int(final_limit or 1)))]
+
+    def _mmr_diversify(self, ranked: list[SearchResult], selection_limit: int) -> list[SearchResult]:
+        """Reorder the head with MMR while preserving every candidate."""
+        if len(ranked) < 2 or selection_limit <= 1:
+            return ranked
+        head_size = min(len(ranked), max(int(selection_limit or 1) * 4, 16))
+        pool = list(ranked[:head_size])
+        scores = [float(item.score) for item in pool]
+        minimum = min(scores)
+        maximum = max(scores)
+
+        def relevance(item: SearchResult) -> float:
+            if maximum <= minimum:
+                return 1.0
+            return (float(item.score) - minimum) / (maximum - minimum)
+
+        def features(item: SearchResult) -> set[str]:
+            memory = item.memory
+            text = re.sub(r"\s+", "", self._haystack(memory))
+            cjk = {text[index : index + 2] for index in range(max(0, len(text) - 1)) if text[index : index + 2]}
+            latin = set(re.findall(r"[a-z0-9_]{2,}", text))
+            tags = {f"tag:{clean_text(tag, 40).lower()}" for tag in (memory.tags or []) if clean_text(tag, 40)}
+            source = clean_text(memory.source_plugin, 60).lower()
+            return set(sorted(cjk)[:180]) | latin | tags | ({f"source:{source}"} if source else set())
+
+        feature_map = {id(item): features(item) for item in pool}
+
+        def similarity(left: SearchResult, right: SearchResult) -> float:
+            left_features = feature_map[id(left)]
+            right_features = feature_map[id(right)]
+            union = left_features | right_features
+            return (len(left_features & right_features) / len(union)) if union else 0.0
+
+        selected: list[SearchResult] = [pool.pop(0)]
+        target = min(len(ranked), max(1, int(selection_limit or 1)))
+        while pool and len(selected) < target:
+            best_index = 0
+            best_value = -math.inf
+            for index, item in enumerate(pool):
+                redundancy = max(similarity(item, chosen) for chosen in selected)
+                value = (0.84 * relevance(item)) - (0.16 * redundancy)
+                if value > best_value:
+                    best_value = value
+                    best_index = index
+            selected.append(pool.pop(best_index))
+        selected_ids = {id(item) for item in selected}
+        tail = [item for item in ranked if id(item) not in selected_ids]
+        return [*selected, *tail]
 
     def _strong_lexical_match(self, query: str, memory: MemoryRecord) -> bool:
         terms = self._terms(query)
@@ -1080,6 +1129,15 @@ class RetrievalEngine:
                 "keyword_candidates": len(keyword_candidates),
             }
         )
+        route_lists = (
+            ("fts", fts_candidates),
+            ("current_window", current_window_candidates),
+            ("keyword", keyword_candidates),
+            ("time_window", time_window_candidates),
+            ("vector", vector_candidates),
+            ("priority", ranked_candidates),
+        )
+        reciprocal_rank_scores = self._reciprocal_rank_scores(route_lists)
         candidates, candidate_sources = self._merge_candidate_memories(
             ranked_candidates,
             current_window_candidates,
@@ -1099,6 +1157,11 @@ class RetrievalEngine:
                 memory, ctx, acl_state
             )
             if visibility_reason:
+                lifecycle = evaluate_memory_lifecycle(memory, ctx)
+                if not lifecycle.eligible:
+                    key = clean_text(lifecycle.reason or "lifecycle_ineligible", 180)
+                    prefiltered[key] = prefiltered.get(key, 0) + 1
+                    continue
                 if memory_type in PROFILE_MEMORY_TYPES and block_profile_retrieval:
                     reason = "profile_intent_not_requested"
                     prefiltered[reason] = prefiltered.get(reason, 0) + 1
@@ -1143,6 +1206,7 @@ class RetrievalEngine:
                 profile,
                 term_stats,
                 vector_score=vector_score,
+                reciprocal_rank_score=reciprocal_rank_scores.get(clean_text(memory.id, 120), 0.0),
             )
             if score <= 0:
                 if len(blocked) < 40:
@@ -1711,6 +1775,23 @@ class RetrievalEngine:
                     changed = True
                     break
         return text
+
+    @staticmethod
+    def _reciprocal_rank_scores(
+        route_lists: tuple[tuple[str, list[MemoryRecord]], ...],
+        *,
+        rank_constant: int = 60,
+    ) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        for _route, memories in route_lists:
+            seen: set[str] = set()
+            for rank, memory in enumerate(memories or [], start=1):
+                memory_id = clean_text(getattr(memory, "id", ""), 120)
+                if not memory_id or memory_id in seen:
+                    continue
+                seen.add(memory_id)
+                scores[memory_id] = scores.get(memory_id, 0.0) + (1.0 / (rank_constant + rank))
+        return scores
 
     @staticmethod
     def _merge_candidate_memories(
@@ -2656,6 +2737,7 @@ class RetrievalEngine:
         term_stats: dict[str, float],
         *,
         vector_score: float = 0.0,
+        reciprocal_rank_score: float = 0.0,
     ) -> tuple[float, str]:
         haystack = self._haystack(memory)
         compact_haystack = re.sub(r"\s+", "", haystack)
@@ -2715,13 +2797,19 @@ class RetrievalEngine:
             else:
                 normalized_vector = vector_score
             vector_bonus = self.embedding_weight * max(0.0, min(1.0, normalized_vector))
-        score = lexical + scope_bonus + memory.importance * 0.55 + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus
+        rrf_bonus = min(0.55, max(0.0, float(reciprocal_rank_score)) * 12.0)
+        score = lexical + scope_bonus + memory.importance * 0.55 + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + rrf_bonus
         if not terms:
-            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus
+            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + rrf_bonus
+        lifecycle = evaluate_memory_lifecycle(memory, ctx)
+        score = apply_lifecycle_score(score, lifecycle)
         return score, (
             f"hits={term_hits};exact={int(exact_hit)};profile={int(profile_hit)};bm25={bm25:.2f};"
             f"vector={vector_score:.3f};importance={memory.importance:.2f};"
-            f"persona={persona_bonus:.2f};dynamics={dynamics_bonus:.2f};recency={age_bonus:.2f}"
+            f"rrf={reciprocal_rank_score:.4f};persona={persona_bonus:.2f};"
+            f"dynamics={dynamics_bonus:.2f};recency={age_bonus:.2f};"
+            f"decay={lifecycle.decay_factor:.3f};salience={lifecycle.salience:.2f};"
+            f"reinforcement={lifecycle.reinforcement:.2f};{lifecycle.reason}"
         )
 
     @staticmethod

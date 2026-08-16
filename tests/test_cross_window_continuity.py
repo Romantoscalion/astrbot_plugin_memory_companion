@@ -8,12 +8,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.models import SessionContext
-from astrbot_plugin_remember_you.core.service import MemoryCompanionService
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.models import SessionContext
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
 
 
 class CrossWindowContinuityTests(unittest.IsolatedAsyncioTestCase):

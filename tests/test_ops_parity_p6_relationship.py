@@ -6,22 +6,22 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if "astrbot_plugin_remember_you" not in sys.modules:
-    package = types.ModuleType("astrbot_plugin_remember_you")
-    package.__path__ = [str(ROOT)]
-    sys.modules["astrbot_plugin_remember_you"] = package
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.bridge import MemoryCompanionBridge
-from astrbot_plugin_remember_you.core.coordination_status import build_coordination_status, project_p6_status, project_runtime_health
-from astrbot_plugin_remember_you.core.p6_four_package_manifest import (
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.bridge import MemoryCompanionBridge
+from astrbot_plugin_memory_companion.core.coordination_status import build_coordination_status, project_p6_status, project_runtime_health
+from astrbot_plugin_memory_companion.core.p6_four_package_manifest import (
     FOUR_PACKAGE_IDS,
     FOUR_PACKAGE_MANIFEST_SCHEMA,
     verify_four_package_manifests,
 )
-from astrbot_plugin_remember_you.core.p6_readonly_projection import (
+from astrbot_plugin_memory_companion.core.p6_readonly_projection import (
     P6_READONLY_STATUS_FINGERPRINT,
     P6_READONLY_STATUS_SCHEMA,
     build_p6_readonly_status,

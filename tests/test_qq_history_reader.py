@@ -10,13 +10,17 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.chat_import import HistoricalChatImporter
-from astrbot_plugin_remember_you.core.qq_history import QQHistoryReader
-from astrbot_plugin_remember_you.core.store import MemoryStore
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.chat_import import HistoricalChatImporter
+from astrbot_plugin_memory_companion.core.qq_history import QQHistoryReader
+from astrbot_plugin_memory_companion.core.store import MemoryStore
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")

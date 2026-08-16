@@ -5139,3 +5139,371 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   }
   #view-persona .section-head{position:static}
 }
+
+/* ====== UI v2：全局双界面与后端契约状态 ====== */
+.ui-compatibility-banner{
+  display:none;
+  margin:0 0 14px;
+  border:1px solid color-mix(in srgb,var(--red) 34%,transparent);
+  border-radius:var(--radius);
+  background:color-mix(in srgb,var(--red) 8%,var(--panel));
+  color:var(--red);
+  padding:10px 12px;
+  font-size:13px;
+  line-height:1.5;
+}
+.ui-compatibility-banner.is-visible{display:block}
+:root[data-ui-contract="mismatch"] .overview-layout-switch{
+  border-color:color-mix(in srgb,var(--red) 40%,transparent);
+}
+.film-app.is-workspace{padding-top:72px}
+.film-app.is-workspace .overview-layout-switch{
+  visibility:visible;
+  opacity:1;
+  transform:none;
+  pointer-events:auto;
+}
+.memory-atom-panel{
+  display:grid;
+  gap:10px;
+  margin:12px 0;
+  border:1px solid var(--line-soft);
+  border-radius:var(--radius);
+  background:color-mix(in srgb,var(--panel) 76%,var(--page-bg));
+  padding:12px;
+}
+.memory-atom-panel>h4{margin:0}
+.memory-atom-panel-head{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.memory-atom-panel-head span{color:var(--muted);font-size:11px}
+.memory-atom-readonly,
+.memory-atom-readonly-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:8px;
+}
+.memory-atom-readonly span,
+.memory-atom-readonly-grid span{
+  display:grid;
+  gap:3px;
+  min-width:0;
+  border:1px solid var(--line-soft);
+  border-radius:7px;
+  background:rgba(var(--light-rgb),.62);
+  padding:8px;
+}
+.memory-atom-readonly small,
+.memory-atom-readonly-grid em{color:var(--muted);font-size:11px;font-style:normal}
+.memory-atom-readonly b,
+.memory-atom-readonly-grid strong{overflow-wrap:anywhere}
+.memory-atom-fields{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:9px;
+}
+.memory-atom-fields label,
+.memory-audit-controls label{
+  display:grid;
+  gap:5px;
+  color:var(--muted);
+  font-size:12px;
+}
+.memory-audit-action{grid-column:1/-1}
+.memory-audit-controls{
+  display:grid;
+  grid-template-columns:minmax(150px,1fr) auto;
+  align-items:end;
+  gap:8px;
+  margin-top:8px;
+}
+.memory-audit-result{display:grid;gap:8px;margin-top:10px}
+.memory-audit-result .inline-actions{justify-content:flex-start}
+.memory-audit-summary{
+  display:grid;
+  grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:8px;
+  border:1px solid var(--line-soft);
+  border-radius:7px;
+  background:rgba(var(--light-rgb),.58);
+  padding:9px 10px;
+  color:var(--ink);
+  line-height:1.55;
+  overflow-wrap:anywhere;
+}
+.memory-audit-summary span{display:grid;gap:3px}
+.memory-audit-summary em{color:var(--muted);font-size:11px;font-style:normal}
+.memory-audit-items{display:grid;gap:7px}
+.memory-audit-items article{border:1px solid var(--line-soft);border-radius:7px;background:rgba(var(--light-rgb),.52);padding:9px}
+.memory-audit-items article>div{display:flex;justify-content:space-between;gap:8px}
+.memory-audit-items p{margin:6px 0;color:var(--ink)}
+.memory-audit-items small{color:var(--muted);line-height:1.45}
+.thread-actions{display:flex;justify-content:flex-end;margin-top:8px}
+
+/* 简洁管理模式会贯穿总览、工作区与详情，不再回落到放映馆造型。 */
+:root[data-overview-layout="standard"] .film-app.is-workspace{
+  background:
+    radial-gradient(circle at 88% 6%,rgba(var(--edge-rgb),.10),transparent 28%),
+    linear-gradient(180deg,var(--page-bg),color-mix(in srgb,var(--page-bg) 82%,var(--panel)));
+  box-shadow:0 18px 52px rgba(var(--dark-rgb),.12);
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace::before,
+:root[data-overview-layout="standard"] .film-app.is-workspace::after,
+:root[data-overview-layout="standard"] .film-app.is-workspace .projection-stage,
+:root[data-overview-layout="standard"] .film-app.is-workspace .screen-film-wipe{display:none!important}
+:root[data-overview-layout="standard"] .film-app.is-workspace-entering .workspace-head,
+:root[data-overview-layout="standard"] .film-app.is-workspace-entering .object-rail,
+:root[data-overview-layout="standard"] .film-app.is-workspace-entering .workspace-main,
+:root[data-overview-layout="standard"] .film-app.is-workspace-entering .detail-drawer,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail,
+:root[data-overview-layout="standard"] .film-app.is-workspace .workspace-main,
+:root[data-overview-layout="standard"] .film-app.is-workspace .detail-drawer{
+  animation:none!important;
+  opacity:1!important;
+  filter:none!important;
+  transform:none!important;
+  transition:none!important;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .workspace-frame{max-height:none}
+:root[data-overview-layout="standard"] .film-app.is-workspace .workspace-head{
+  border-color:var(--line-soft);
+  background:rgba(var(--light-rgb),.82);
+  box-shadow:0 8px 24px rgba(var(--edge-rgb),.09);
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .workspace-tools{min-width:min(52vw,620px)}
+:root[data-overview-layout="standard"] .film-app.is-workspace .projection-controls{
+  border-color:var(--line-soft);
+  background:var(--panel);
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .workspace-grid{
+  grid-template-columns:minmax(210px,250px) minmax(0,1fr);
+  gap:14px;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail{
+  --rail-hole-gap:0;
+  --rail-hole-width:0;
+  top:14px;
+  overflow:auto;
+  border-color:var(--line-soft);
+  background:rgba(var(--light-rgb),.78);
+  box-shadow:0 8px 24px rgba(var(--edge-rgb),.09);
+  padding:16px;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail::before,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail::after,
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .workspace-main::before,
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .section-head::before{display:none!important}
+:root[data-overview-layout="standard"] .film-app.is-workspace .rail-head{color:var(--ink)}
+:root[data-overview-layout="standard"] .film-app.is-workspace .rail-head button{
+  border-color:var(--line-soft);
+  background:var(--page-bg);
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .bucket-window,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-secondary-nav .bucket-window,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-scoped-rail .bucket-window{
+  max-height:none;
+  overflow:visible;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .bucket-list,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-secondary-nav .bucket-list,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-scoped-rail .bucket-list{
+  max-height:none;
+  gap:7px;
+  overflow:visible;
+  padding:0;
+  transform:none!important;
+  transition:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .bucket,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-secondary-nav .bucket,
+:root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-scoped-rail .bucket{
+  min-height:64px;
+  border-color:transparent;
+  background:transparent;
+  box-shadow:none;
+  padding:10px 11px;
+  text-align:left;
+  transform:none!important;
+  opacity:1!important;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .bucket:hover{
+  border-color:var(--line-soft);
+  background:var(--panel);
+  box-shadow:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .bucket.is-active{
+  border-color:color-mix(in srgb,var(--accent) 46%,transparent);
+  background:var(--accent-soft);
+  box-shadow:inset 3px 0 0 var(--accent-strong);
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .bucket.date-reel{
+  min-height:64px;
+  padding-left:11px;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .bucket.date-reel::before,
+:root[data-overview-layout="standard"] .film-app.is-workspace .secondary-nav-item::before{display:none}
+:root[data-overview-layout="standard"] .film-app.is-workspace .workspace-main,
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .workspace-main{
+  overflow:hidden;
+  border-color:var(--line-soft);
+  background:rgba(var(--light-rgb),.82);
+  box-shadow:0 8px 24px rgba(var(--edge-rgb),.09);
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .view.is-active{
+  gap:12px;
+  padding:16px;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .section-head{
+  min-height:72px;
+  border-color:var(--line-soft);
+  background:var(--panel);
+  box-shadow:none;
+  padding:13px 15px;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .section-head h3{
+  color:var(--ink);
+  font-size:20px;
+  text-shadow:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .section-head p{color:var(--muted)}
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .object-card,
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .row-item,
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .search-card,
+:root[data-overview-layout="standard"] .film-app.is-workspace:not(.is-personal-memory) .config-card{
+  background:var(--page-bg);
+  box-shadow:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .memory-frame{
+  grid-template-columns:112px minmax(0,1fr);
+  min-height:98px;
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .memory-frame::before{left:112px}
+:root[data-overview-layout="standard"] .film-app.is-workspace .memory-frame-time{
+  background:var(--panel);
+  color:var(--ink);
+}
+:root[data-overview-layout="standard"] .film-app.is-workspace .memory-frame-time b{text-shadow:none}
+:root[data-overview-layout="standard"] .film-app.is-workspace .memory-frame-time span{color:var(--muted)}
+:root[data-overview-layout="standard"] .film-app.is-workspace .detail-drawer{
+  border-color:var(--line-soft);
+  background:rgba(var(--light-rgb),.88);
+  box-shadow:0 8px 24px rgba(var(--edge-rgb),.09);
+}
+
+/* 个人记忆的简洁模式使用普通列表，放映卷轴仅保留在放映馆。 */
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .workspace-main{
+  height:auto;
+  min-height:540px;
+  overflow:auto;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory #personalMemoryList{
+  max-height:none;
+  overflow:visible;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .personal-memory-workspace{gap:14px}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .companion-overview{
+  margin-top:0;
+  padding:14px;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film,
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film.is-rail-mounted{
+  position:relative;
+  left:auto;
+  top:auto;
+  width:100%;
+  min-width:0;
+  height:auto;
+  margin:0;
+  overflow:auto;
+  border:1px solid var(--line-soft);
+  background:var(--panel);
+  box-shadow:none;
+  cursor:default;
+  touch-action:auto;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film::before,
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-marker{display:none}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film-track{
+  width:100%;
+  min-width:0;
+  height:auto;
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:8px;
+  background:transparent;
+  -webkit-mask-image:none;
+  mask-image:none;
+  padding:10px;
+  transform:none!important;
+  transition:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film-track::before,
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film-track::after{display:none}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-frame{
+  height:auto;
+  min-height:58px;
+  border:1px solid var(--line-soft);
+  border-radius:7px;
+  background:var(--page-bg);
+  color:var(--ink);
+  box-shadow:none;
+  padding:10px;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-frame:hover,
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-frame.is-active{
+  border-color:var(--accent);
+  background:var(--accent-soft);
+  color:var(--accent-strong);
+  text-shadow:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-frame span{
+  font-size:14px;
+  text-shadow:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .album-card{
+  transform:none!important;
+  transform-style:flat;
+  animation:none!important;
+  box-shadow:none;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .album-card::before,
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .album-card::after{display:none}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .detail-drawer,
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .detail-drawer.is-album-detail,
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .detail-drawer.is-schedule-detail{
+  top:auto;
+  height:auto;
+  min-height:220px;
+  overflow:auto;
+}
+:root[data-overview-layout="standard"] .film-app.is-personal-memory .personal-detail-content>.selected-detail:first-child{
+  height:auto;
+  min-height:180px;
+  margin-top:0;
+}
+
+@media(max-width:1080px){
+  :root[data-overview-layout="standard"] .film-app.is-workspace .workspace-grid{
+    grid-template-columns:1fr;
+    grid-template-areas:"rail" "main" "detail";
+  }
+  :root[data-overview-layout="standard"] .film-app.is-workspace .object-rail{
+    position:relative;
+    top:auto;
+  }
+  :root[data-overview-layout="standard"] .film-app.is-workspace .bucket-list,
+  :root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-secondary-nav .bucket-list,
+  :root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-scoped-rail .bucket-list{
+    grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  }
+}
+@media(max-width:760px){
+  .film-app.is-workspace{padding-top:72px}
+  .memory-atom-readonly,.memory-atom-readonly-grid,.memory-atom-fields,.memory-audit-summary{grid-template-columns:1fr}
+  .memory-audit-controls{grid-template-columns:1fr}
+  :root[data-overview-layout="standard"] .film-app.is-workspace .workspace-tools{min-width:0}
+  :root[data-overview-layout="standard"] .film-app.is-workspace .workspace-grid{gap:10px}
+  :root[data-overview-layout="standard"] .film-app.is-workspace .bucket-list,
+  :root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-secondary-nav .bucket-list,
+  :root[data-overview-layout="standard"] .film-app.is-workspace .object-rail.is-scoped-rail .bucket-list{
+    grid-template-columns:1fr;
+  }
+}

@@ -8,6 +8,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from .memory_atom import (
+    clamp_score,
+    durability_for_memory_type,
+    durability_from_legacy_metadata,
+    nonnegative_int,
+    normalize_durability,
+    normalize_sensitivity,
+    normalize_validity_status,
+    row_value,
+    scoped_canonical_key,
+    scoped_content_fingerprint,
+)
+from .sensitive_data import redact_sensitive_text, redact_sensitive_value
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -73,6 +87,7 @@ class SessionContext:
     group_id: str = ""
     group_name: str = ""
     bot_id: str = ""
+    persona_id: str = ""
     message_id: str = ""
     message_text: str = ""
     strict_session_only: bool = False
@@ -135,6 +150,17 @@ class MemoryRecord:
     evidence: str = ""
     confidence: float = 0.5
     importance: float = 0.3
+    owner_bot_id: str = ""
+    validity_status: str = "active"
+    valid_from: str = ""
+    valid_to: str = ""
+    salience: float = 0.3
+    durability: str = "normal"
+    sensitivity: str = "private"
+    reinforcement_score: float = 0.0
+    injection_count: int = 0
+    last_injected_at: str = ""
+    canonical_key: str = ""
     review_status: str = "auto"
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -159,25 +185,85 @@ class MemoryRecord:
             self.updated_at = self.created_at
         if not self.occurred_at:
             self.occurred_at = self.created_at
-        self.content = clean_text(self.content, 4000)
-        self.evidence = clean_text(self.evidence, 4000)
+        self.content = clean_text(redact_sensitive_text(self.content), 4000)
+        self.evidence = clean_text(redact_sensitive_text(self.evidence), 4000)
         self.confidence = clamp_float(self.confidence, default=0.5)
         self.importance = clamp_float(self.importance, default=0.3)
+        if not isinstance(self.metadata, dict):
+            self.metadata = {}
+        self.metadata = redact_sensitive_value(self.metadata)
+        metadata = self.metadata
+        self.owner_bot_id = clean_text(
+            self.owner_bot_id or metadata.get("owner_bot_id"),
+            120,
+        )
+        validity_source = self.validity_status
+        if validity_source == "active" and metadata.get("validity_status"):
+            validity_source = metadata.get("validity_status")
+        if self.lifecycle == "archived" and validity_source == "active":
+            validity_source = "archived"
+        self.validity_status = normalize_validity_status(validity_source)
+        self.valid_from = clean_text(self.valid_from or metadata.get("valid_from"), 80)
+        self.valid_to = clean_text(self.valid_to or metadata.get("valid_to"), 80)
+        salience_source: Any = self.salience
+        if self.salience == 0.3:
+            salience_source = metadata.get("salience", self.importance)
+        self.salience = clamp_score(salience_source, self.importance)
+        durability_source = self.durability
+        if durability_source == "normal":
+            durability_source = durability_from_legacy_metadata(metadata)
+            if durability_source == "normal":
+                durability_source = durability_for_memory_type(self.memory_type, durability_source)
+        self.durability = normalize_durability(durability_source)
+        sensitivity_source = self.sensitivity
+        if sensitivity_source == "private" and metadata.get("sensitivity"):
+            sensitivity_source = metadata.get("sensitivity")
+        self.sensitivity = normalize_sensitivity(sensitivity_source)
+        reinforcement_source: Any = self.reinforcement_score
+        if self.reinforcement_score == 0.0 and metadata.get("reinforcement_score") is not None:
+            reinforcement_source = metadata.get("reinforcement_score")
+        self.reinforcement_score = clamp_score(reinforcement_source, 0.0)
+        injection_source: Any = self.injection_count
+        if self.injection_count == 0 and metadata.get("injection_count") is not None:
+            injection_source = metadata.get("injection_count")
+        self.injection_count = nonnegative_int(injection_source)
+        self.last_injected_at = clean_text(
+            self.last_injected_at or metadata.get("last_injected_at"),
+            80,
+        )
         self.tags = [clean_text(tag, 80) for tag in self.tags if clean_text(tag, 80)]
-        if not self.content_fingerprint:
-            self.content_fingerprint = stable_fingerprint(
-                self.memory_type,
-                self.scope,
-                self.session_id,
-                self.group_id,
-                self.subject.kind,
-                self.subject.id,
-                self.object.kind,
-                self.object.id,
-                self.visibility,
-                self.reality_level,
-                self.content,
-            )
+        canonical_seed = self.canonical_key or metadata.get("canonical_key") or ""
+        self.canonical_key = scoped_canonical_key(
+            owner_bot_id=self.owner_bot_id,
+            platform=self.platform,
+            scope=self.scope,
+            session_id=self.session_id,
+            group_id=self.group_id,
+            subject_kind=self.subject.kind,
+            subject_id=self.subject.id,
+            object_kind=self.object.kind,
+            object_id=self.object.id,
+            memory_type=self.memory_type,
+            content=self.content,
+            seed=canonical_seed,
+        )
+        self.content_fingerprint = scoped_content_fingerprint(
+            owner_bot_id=self.owner_bot_id,
+            platform=self.platform,
+            scope=self.scope,
+            session_id=self.session_id,
+            group_id=self.group_id,
+            subject_kind=self.subject.kind,
+            subject_id=self.subject.id,
+            object_kind=self.object.kind,
+            object_id=self.object.id,
+            memory_type=self.memory_type,
+            visibility=self.visibility,
+            reality_level=self.reality_level,
+            content=self.content,
+            canonical_key=self.canonical_key,
+            seed=self.content_fingerprint,
+        )
         self.merged_count = max(1, int(self.merged_count or 1))
         return self
 
@@ -207,6 +293,17 @@ class MemoryRecord:
             "evidence": self.evidence,
             "confidence": self.confidence,
             "importance": self.importance,
+            "owner_bot_id": self.owner_bot_id,
+            "validity_status": self.validity_status,
+            "valid_from": self.valid_from,
+            "valid_to": self.valid_to,
+            "salience": self.salience,
+            "durability": self.durability,
+            "sensitivity": self.sensitivity,
+            "reinforcement_score": self.reinforcement_score,
+            "injection_count": self.injection_count,
+            "last_injected_at": self.last_injected_at,
+            "canonical_key": self.canonical_key,
             "review_status": self.review_status,
             "tags": json_dumps(self.tags),
             "metadata": json_dumps(self.metadata),
@@ -224,39 +321,63 @@ class MemoryRecord:
 
     @classmethod
     def from_row(cls, row: Any) -> "MemoryRecord":
-        get = row.__getitem__
-        return cls(
-            id=get("id"),
-            memory_type=get("memory_type"),
-            subject=EntityRef(get("subject_kind"), get("subject_id"), get("subject_name"), get("subject_role")),
-            object=EntityRef(get("object_kind"), get("object_id"), get("object_name"), get("object_role")),
-            scope=get("scope"),
-            session_id=get("session_id"),
-            platform=get("platform"),
-            message_id=get("message_id"),
-            group_id=get("group_id"),
-            visibility=get("visibility"),
-            sayability=get("sayability"),
-            reality_level=get("reality_level"),
-            lifecycle=get("lifecycle"),
-            content=get("content"),
-            evidence=get("evidence"),
-            confidence=float(get("confidence") or 0.0),
-            importance=float(get("importance") or 0.0),
-            review_status=get("review_status"),
-            tags=json_loads(get("tags"), []),
-            metadata=json_loads(get("metadata"), {}),
-            created_at=get("created_at"),
-            updated_at=get("updated_at"),
-            occurred_at=get("occurred_at"),
-            last_accessed_at=get("last_accessed_at"),
-            access_count=int(get("access_count") or 0),
-            source_plugin=get("source_plugin"),
-            import_batch_id=get("import_batch_id"),
-            content_fingerprint=get("content_fingerprint"),
-            merged_count=int(get("merged_count") or 1),
-            supersedes_id=get("supersedes_id"),
+        metadata = json_loads(row_value(row, "metadata", "{}"), {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        record = cls(
+            id=row_value(row, "id", ""),
+            memory_type=row_value(row, "memory_type", "observation"),
+            subject=EntityRef(
+                row_value(row, "subject_kind", "user"),
+                row_value(row, "subject_id", ""),
+                row_value(row, "subject_name", ""),
+                row_value(row, "subject_role", "unknown"),
+            ),
+            object=EntityRef(
+                row_value(row, "object_kind", "user"),
+                row_value(row, "object_id", ""),
+                row_value(row, "object_name", ""),
+                row_value(row, "object_role", "unknown"),
+            ),
+            scope=row_value(row, "scope", "unknown"),
+            session_id=row_value(row, "session_id", ""),
+            platform=row_value(row, "platform", ""),
+            message_id=row_value(row, "message_id", ""),
+            group_id=row_value(row, "group_id", ""),
+            visibility=row_value(row, "visibility", "internal"),
+            sayability=row_value(row, "sayability", "indirect"),
+            reality_level=row_value(row, "reality_level", "imported_summary"),
+            lifecycle=row_value(row, "lifecycle", "raw_event"),
+            content=row_value(row, "content", ""),
+            evidence=row_value(row, "evidence", ""),
+            confidence=float(row_value(row, "confidence", 0.5) or 0.0),
+            importance=float(row_value(row, "importance", 0.3) or 0.0),
+            owner_bot_id=row_value(row, "owner_bot_id", ""),
+            validity_status=row_value(row, "validity_status", "active"),
+            valid_from=row_value(row, "valid_from", ""),
+            valid_to=row_value(row, "valid_to", ""),
+            salience=float(row_value(row, "salience", 0.3) or 0.0),
+            durability=row_value(row, "durability", "normal"),
+            sensitivity=row_value(row, "sensitivity", "private"),
+            reinforcement_score=float(row_value(row, "reinforcement_score", 0.0) or 0.0),
+            injection_count=int(row_value(row, "injection_count", 0) or 0),
+            last_injected_at=row_value(row, "last_injected_at", ""),
+            canonical_key=row_value(row, "canonical_key", ""),
+            review_status=row_value(row, "review_status", "auto"),
+            tags=json_loads(row_value(row, "tags", "[]"), []),
+            metadata=metadata,
+            created_at=row_value(row, "created_at", ""),
+            updated_at=row_value(row, "updated_at", ""),
+            occurred_at=row_value(row, "occurred_at", ""),
+            last_accessed_at=row_value(row, "last_accessed_at", ""),
+            access_count=int(row_value(row, "access_count", 0) or 0),
+            source_plugin=row_value(row, "source_plugin", "memory_companion"),
+            import_batch_id=row_value(row, "import_batch_id", ""),
+            content_fingerprint=row_value(row, "content_fingerprint", ""),
+            merged_count=int(row_value(row, "merged_count", 1) or 1),
+            supersedes_id=row_value(row, "supersedes_id", ""),
         )
+        return record.ensure_defaults()
 
 
 @dataclass(slots=True)
