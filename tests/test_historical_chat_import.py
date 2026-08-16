@@ -8,15 +8,19 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.chat_import import HistoricalChatImporter, HistoricalChatParser, HistoricalChatSegmenter
-from astrbot_plugin_remember_you.core.injection import InjectionComposer
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
-from astrbot_plugin_remember_you.core.store import MemoryStore
-from astrbot_plugin_remember_you.core.visibility import VisibilityPolicy
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.chat_import import HistoricalChatImporter, HistoricalChatParser, HistoricalChatSegmenter
+from astrbot_plugin_memory_companion.core.injection import InjectionComposer
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
+from astrbot_plugin_memory_companion.core.store import MemoryStore
+from astrbot_plugin_memory_companion.core.visibility import VisibilityPolicy
 
 
 class HistoricalChatParserTests(unittest.TestCase):

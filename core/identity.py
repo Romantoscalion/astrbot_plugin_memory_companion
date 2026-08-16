@@ -111,6 +111,11 @@ class IdentityResolver:
 
         user_name = await self._call(event, "get_sender_name")
         bot_id = await self._call(event, "get_self_id")
+        persona_id = clean_text(
+            getattr(event, "private_companion_persona_id", "")
+            or getattr(event, "persona_id", ""),
+            96,
+        )
         text = await self._message_text(event)
         message_id = self._message_id(event)
 
@@ -132,6 +137,7 @@ class IdentityResolver:
             group_id=clean_text(group_id, 120),
             group_name=clean_text(group_name, 80),
             bot_id=clean_text(bot_id, 120),
+            persona_id=persona_id,
             message_id=clean_text(message_id, 120),
             message_text=clean_text(text, 2000),
         )

@@ -7,18 +7,22 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.importance import ImportanceEvaluator
-from astrbot_plugin_remember_you.core.injection import InjectionComposer
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
-from astrbot_plugin_remember_you.core.retrieval import RetrievalEngine
-from astrbot_plugin_remember_you.core.service import MemoryCompanionService
-from astrbot_plugin_remember_you.core.summarizer import MemorySummarizer
-from astrbot_plugin_remember_you.core.time_intent import parse_time_intent
-from astrbot_plugin_remember_you.core.turn_signal import analyze_turn_signal
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.importance import ImportanceEvaluator
+from astrbot_plugin_memory_companion.core.injection import InjectionComposer
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
+from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
+from astrbot_plugin_memory_companion.core.summarizer import MemorySummarizer
+from astrbot_plugin_memory_companion.core.time_intent import parse_time_intent
+from astrbot_plugin_memory_companion.core.turn_signal import analyze_turn_signal
 
 
 class EpistemicCalibrationTests(unittest.TestCase):

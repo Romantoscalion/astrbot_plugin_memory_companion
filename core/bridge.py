@@ -1093,6 +1093,23 @@ class MemoryCompanionBridge:
             dto = build_bot_personal_archive(envelope)
         except Exception as exc:
             return {**base, "state": "invalid", "error_code": getattr(exc, "error_code", "invalid")}
+        if dto.canonical_schema_version >= bot_personal_contract.BOT_PERSONAL_CANONICAL_SCHEMA_VERSION:
+            capability = self._producer_capability_from(authority)
+            producer = getattr(capability, "_producer", None)
+            bot_getter = getattr(producer, "_memory_companion_bridge_bot_id", None)
+            persona_getter = getattr(producer, "_memory_companion_archive_persona_id", None)
+            try:
+                expected_bot_id = clean_text(bot_getter(), 120) if callable(bot_getter) else ""
+                expected_persona_id = clean_text(persona_getter(), 96) if callable(persona_getter) else ""
+            except Exception:
+                expected_bot_id = expected_persona_id = ""
+            if (
+                not expected_bot_id
+                or not expected_persona_id
+                or dto.owner_bot_id != expected_bot_id
+                or dto.persona_id != expected_persona_id
+            ):
+                return {**base, "state": "forbidden", "error_code": "producer_namespace_mismatch"}
         try:
             recorder = getattr(self._plugin, "record_bot_personal_archive", None)
         except Exception:
@@ -1141,9 +1158,31 @@ class MemoryCompanionBridge:
             producer_context=producer_context,
         )
 
-    async def read_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
+    async def read_bot_personal_profile(
+        self,
+        query: str = "",
+        *,
+        limit: int = 10,
+        producer_capability: Any = None,
+    ) -> dict[str, Any]:
         """Read only safe Bot Personal summaries; never return archive payloads."""
         base = {"ok": False, "read_only": True, "state": "degraded", "degraded": True, "pending": True, "items": []}
+        owner_bot_id = ""
+        persona_id = ""
+        if producer_capability is not None:
+            if not self._is_valid_private_companion_capability(producer_capability):
+                return {**base, "state": "forbidden", "degraded": False, "pending": False, "error_code": "producer_capability_required"}
+            capability = self._producer_capability_from(producer_capability)
+            producer = getattr(capability, "_producer", None)
+            bot_getter = getattr(producer, "_memory_companion_bridge_bot_id", None)
+            persona_getter = getattr(producer, "_memory_companion_archive_persona_id", None)
+            try:
+                owner_bot_id = clean_text(bot_getter(), 120) if callable(bot_getter) else ""
+                persona_id = clean_text(persona_getter(), 96) if callable(persona_getter) else ""
+            except Exception:
+                owner_bot_id = persona_id = ""
+            if not owner_bot_id or not persona_id:
+                return {**base, "state": "forbidden", "degraded": False, "pending": False, "error_code": "producer_namespace_unavailable"}
         try:
             getter = getattr(self._plugin, "read_bot_personal_profile", None)
         except Exception:
@@ -1151,7 +1190,12 @@ class MemoryCompanionBridge:
         if not callable(getter):
             return {**base, "error_code": "bridge_method_unavailable"}
         try:
-            result = await getter(query=query, limit=limit)
+            result = await getter(
+                query=query,
+                limit=limit,
+                owner_bot_id=owner_bot_id,
+                persona_id=persona_id,
+            )
         except Exception:
             return {**base, "error_code": "bridge_exception"}
         if not isinstance(result, dict):
@@ -1350,8 +1394,18 @@ class MemoryCompanionBridge:
             return {"ok": False, "code": "bridge_degraded"}
         return dict(result) if isinstance(result, dict) else {"ok": False, "code": "bridge_degraded"}
 
-    async def search_bot_personal_profile(self, query: str = "", *, limit: int = 10) -> dict[str, Any]:
-        return await self.read_bot_personal_profile(query=query, limit=limit)
+    async def search_bot_personal_profile(
+        self,
+        query: str = "",
+        *,
+        limit: int = 10,
+        producer_capability: Any = None,
+    ) -> dict[str, Any]:
+        return await self.read_bot_personal_profile(
+            query=query,
+            limit=limit,
+            producer_capability=producer_capability,
+        )
 
     async def read_bot_profile(
         self,
@@ -2473,6 +2527,18 @@ def serialize_memory(record: MemoryRecord, score: float | None = None, reason: s
         "sayability": record.sayability,
         "reality_level": record.reality_level,
         "lifecycle": record.lifecycle,
+        "owner_bot_id": record.owner_bot_id,
+        "persona_id": clean_text(metadata.get("persona_id"), 120),
+        "validity_status": record.validity_status,
+        "valid_from": record.valid_from,
+        "valid_to": record.valid_to,
+        "salience": record.salience,
+        "durability": record.durability,
+        "sensitivity": record.sensitivity,
+        "reinforcement_score": record.reinforcement_score,
+        "injection_count": record.injection_count,
+        "last_injected_at": record.last_injected_at,
+        "canonical_key": record.canonical_key,
         "content": record.content,
         "evidence_preview": clean_text(record.evidence, 520),
         "canonical_summary": clean_text(metadata.get("canonical_summary"), 420),

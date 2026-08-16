@@ -11,9 +11,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
+
+
+ROOT = bootstrap_package()
 
 if "quart" not in sys.modules:
     quart_stub = types.ModuleType("quart")
@@ -26,10 +30,10 @@ if "quart" not in sys.modules:
     quart_stub.send_file = _send_file
     sys.modules["quart"] = quart_stub
 
-import astrbot_plugin_remember_you.page_api as page_api_module
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
-from astrbot_plugin_remember_you.core.service import MemoryCompanionService
-from astrbot_plugin_remember_you.page_api import PluginPageApi
+import astrbot_plugin_memory_companion.page_api as page_api_module
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
+from astrbot_plugin_memory_companion.page_api import PluginPageApi
 
 
 class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):

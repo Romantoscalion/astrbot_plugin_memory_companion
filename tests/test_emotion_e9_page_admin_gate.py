@@ -10,9 +10,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
+
+
+ROOT = bootstrap_package()
 
 if "quart" not in sys.modules:
     quart_stub = types.ModuleType("quart")
@@ -21,18 +25,7 @@ if "quart" not in sys.modules:
     quart_stub.send_file = AsyncMock()
     sys.modules["quart"] = quart_stub
 
-PACKAGE_NAME = "astrbot_plugin_remember_you"
-if PACKAGE_NAME not in sys.modules:
-    package_spec = importlib.util.spec_from_file_location(
-        PACKAGE_NAME,
-        ROOT / "__init__.py",
-        submodule_search_locations=[str(ROOT)],
-    )
-    assert package_spec and package_spec.loader
-    package = importlib.util.module_from_spec(package_spec)
-    sys.modules[PACKAGE_NAME] = package
-    package_spec.loader.exec_module(package)
-
+PACKAGE_NAME = "astrbot_plugin_memory_companion"
 page_api_module = importlib.import_module(f"{PACKAGE_NAME}.page_api")
 PluginPageApi = page_api_module.PluginPageApi
 

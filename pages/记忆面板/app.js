@@ -1,5 +1,11 @@
 const API = "/astrbot_plugin_memory_companion/page";
 const PAGE_ENDPOINT_PREFIX = "page";
+const UI_CONTRACT_VERSION = "memory.page.ui.v2";
+const UI_DYNAMIC_ENDPOINTS = new Set([
+  "/companion/personal-photo-data",
+  "/maintenance/audit/apply",
+  "/maintenance/audit/rollback",
+]);
 const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
 
 const VIEWS = {
@@ -157,6 +163,8 @@ const state = {
   stats: {},
   buckets: [],
   overviewLayout: document.documentElement.dataset.overviewLayout === "cinema" ? "cinema" : "standard",
+  uiCapabilities: null,
+  uiContractWarning: "",
   activeView: "objects",
   activeBucketId: "all",
   userMemoryFilter: "all",
@@ -197,6 +205,7 @@ const state = {
   conversationImportSource: "qq",
   qqHistoryCapabilities: null,
   qqHistoryCapabilitiesLoading: false,
+  memoryAuditBatch: null,
 };
 
 const DEFAULT_THEME = "yuebai";
@@ -561,7 +570,46 @@ function showToast(text, tone = "info") {
   }, tone === "error" ? 4200 : 2400);
 }
 
-function loadingState(text = "正在读取胶片...") {
+function renderUiCompatibilityBanner(message = "") {
+  const banner = $("#uiCompatibilityBanner");
+  if (!banner) return;
+  state.uiContractWarning = String(message || "");
+  banner.hidden = !state.uiContractWarning;
+  banner.classList.toggle("is-visible", Boolean(state.uiContractWarning));
+  banner.textContent = state.uiContractWarning;
+}
+
+async function loadUiCapabilities() {
+  try {
+    const data = await apiGet("/ui/capabilities");
+    state.uiCapabilities = data;
+    const modes = new Set((data.modes || []).map((item) => item.id));
+    const views = new Set((data.views || []).map((item) => item.id));
+    const endpoints = new Set((data.endpoints || []).map((item) => item.path));
+    const missingModes = ["standard", "cinema"].filter((item) => !modes.has(item));
+    const missingViews = ["overview", "users", "groups", "personal", "knowledge", "microscope", "archive"]
+      .filter((item) => !views.has(item));
+    const missingDynamic = [...UI_DYNAMIC_ENDPOINTS].filter((item) => !endpoints.has(item));
+    const compatible = data.contract_version === UI_CONTRACT_VERSION
+      && !missingModes.length
+      && !missingViews.length
+      && !missingDynamic.length;
+    document.documentElement.dataset.uiContract = compatible ? "ready" : "mismatch";
+    if (!compatible) {
+      renderUiCompatibilityBanner("界面与后端能力版本不一致，部分管理操作可能不可用。请刷新插件缓存或确认前后端版本一致。");
+      return false;
+    }
+    renderUiCompatibilityBanner("");
+    return true;
+  } catch (error) {
+    state.uiCapabilities = null;
+    document.documentElement.dataset.uiContract = "unavailable";
+    renderUiCompatibilityBanner(`无法校验界面功能：${error.message || "能力接口不可用"}。当前页面仅按已知安全功能运行。`);
+    return false;
+  }
+}
+
+function loadingState(text = state.overviewLayout === "cinema" ? "正在读取胶片..." : "正在读取数据...") {
   return `<div class="loading-state"><span></span><b>${escapeHtml(text)}</b></div>`;
 }
 
@@ -1001,6 +1049,9 @@ function syncOverviewLayoutControls() {
   const layout = normalizeOverviewLayout(state.overviewLayout);
   state.overviewLayout = layout;
   document.documentElement.dataset.overviewLayout = layout;
+  $("#app")?.setAttribute("data-ui-mode", layout);
+  const eyebrow = $("#workspaceEyebrow");
+  if (eyebrow) eyebrow.textContent = layout === "cinema" ? "Locked Frame" : "Memory Management";
   $$(".overview-layout-option").forEach((button) => {
     const active = button.dataset.overviewLayout === layout;
     button.classList.toggle("is-active", active);
@@ -1033,9 +1084,12 @@ function setOverviewLayout(layout, { persist = true, announce = true } = {}) {
       window.setTimeout(() => app.classList.remove("is-standard-overview-entering"), 420);
     }
   }
+  if (app?.classList.contains("is-workspace") && state.activeView === "review") {
+    syncPersonalLayoutForUiMode();
+  }
   if (announce) {
     const live = $("#overviewLayoutAnnouncement");
-    if (live) live.textContent = next === "cinema" ? "已切换到放映馆视图" : "已切换到常规总览";
+    if (live) live.textContent = next === "cinema" ? "已切换到放映馆界面" : "已切换到简洁管理界面";
   }
 }
 
@@ -1643,7 +1697,7 @@ function playInitialOverviewEntrance() {
 
 async function playOverviewToWorkspace(view) {
   const app = $("#app");
-  if (!app || prefersReducedMotion()) return;
+  if (!app || state.overviewLayout !== "cinema" || prefersReducedMotion()) return;
   prepareOverviewStripExit(view);
   refreshTransitionFace();
   app.offsetHeight;
@@ -1654,7 +1708,7 @@ async function playOverviewToWorkspace(view) {
 async function playWorkspaceSwitchOut() {
   const app = $("#app");
   const rail = document.querySelector(".object-rail");
-  if (!app || prefersReducedMotion()) return;
+  if (!app || state.overviewLayout !== "cinema" || prefersReducedMotion()) return;
   app.classList.add("is-view-switching", "is-view-exiting");
   rail?.classList.add("is-reel-rolling-out");
   await waitForMotion(210);
@@ -1665,7 +1719,7 @@ async function playWorkspaceSwitchOut() {
 function playWorkspaceSwitchIn() {
   const app = $("#app");
   const rail = document.querySelector(".object-rail");
-  if (!app || prefersReducedMotion()) return;
+  if (!app || state.overviewLayout !== "cinema" || prefersReducedMotion()) return;
   app.classList.add("is-view-entering");
   rail?.classList.add("is-reel-rolling-in");
   window.setTimeout(() => {
@@ -1677,7 +1731,7 @@ function playWorkspaceSwitchIn() {
 async function playScopedRailSwitchOut() {
   const app = $("#app");
   const rail = document.querySelector(".object-rail");
-  if (!app || prefersReducedMotion()) return;
+  if (!app || state.overviewLayout !== "cinema" || prefersReducedMotion()) return;
   app.classList.add("is-scoped-view-switching", "is-scoped-view-exiting");
   rail?.classList.add("is-reel-rolling-out");
   await waitForMotion(210);
@@ -1688,7 +1742,7 @@ async function playScopedRailSwitchOut() {
 function playScopedRailSwitchIn() {
   const app = $("#app");
   const rail = document.querySelector(".object-rail");
-  if (!app || prefersReducedMotion()) return;
+  if (!app || state.overviewLayout !== "cinema" || prefersReducedMotion()) return;
   app.classList.add("is-scoped-view-entering");
   rail?.classList.add("is-reel-rolling-in");
   window.setTimeout(() => {
@@ -1701,7 +1755,8 @@ async function playRailRefreshTransition(task) {
   const app = $("#app");
   const button = $("#refreshBtn");
   const isWorkspace = app?.classList.contains("is-workspace");
-  const isPersonalRefresh = isWorkspace && state.activeView === "review";
+  const cinemaMotion = isWorkspace && state.overviewLayout === "cinema" && !prefersReducedMotion();
+  const isPersonalRefresh = cinemaMotion && state.activeView === "review";
   let armedPersonalRefresh = false;
   button.disabled = true;
   button.classList.add("is-loading");
@@ -1711,13 +1766,13 @@ async function playRailRefreshTransition(task) {
       state.animatePersonalDateRail = true;
       armedPersonalRefresh = true;
     }
-    if (isWorkspace && !prefersReducedMotion()) {
+    if (cinemaMotion) {
       document.querySelector(".object-rail")?.classList.add("is-reel-refreshing-out");
       await waitForMotion(180);
     }
     await task();
     armedPersonalRefresh = false;
-    if (isWorkspace && !prefersReducedMotion()) {
+    if (cinemaMotion) {
       const rail = document.querySelector(".object-rail");
       rail?.classList.remove("is-reel-refreshing-out");
       rail?.classList.add("is-reel-refreshing-in");
@@ -1726,7 +1781,7 @@ async function playRailRefreshTransition(task) {
       rail?.classList.remove("is-reel-refreshing-in");
       if (isPersonalRefresh) requestAnimationFrame(alignPersonalScheduleToReel);
     }
-    showToast("胶卷已刷新");
+    showToast(state.overviewLayout === "cinema" ? "胶卷已刷新" : "数据已刷新");
   } catch (error) {
     showToast(error.message || "刷新失败", "error");
   } finally {
@@ -1809,12 +1864,15 @@ async function openView(view, { preserveBucket = false } = {}) {
 async function returnHome() {
   const app = $("#app");
   if (!app.classList.contains("is-workspace") || homeReturnRunning) return;
+  const cinemaMotion = state.overviewLayout === "cinema" && !prefersReducedMotion();
   homeReturnRunning = true;
   workspaceTransitionToken++;
   $("#backHomeBtn").disabled = true;
-  refreshTransitionFace();
-  app.classList.add("is-home-wipe");
-  await waitForMotion(HOME_WIPE_SWAP_WAIT_MS);
+  if (cinemaMotion) {
+    refreshTransitionFace();
+    app.classList.add("is-home-wipe");
+    await waitForMotion(HOME_WIPE_SWAP_WAIT_MS);
+  }
   removeRailMountedScheduleFilm();
   app.classList.remove("is-workspace");
   app.classList.remove("is-personal-memory");
@@ -1824,13 +1882,15 @@ async function returnHome() {
   app.classList.remove("is-scoped-view-switching", "is-scoped-view-exiting", "is-scoped-view-entering");
   app.style.removeProperty("--secondary-nav-shift");
   delete app.dataset.workspaceView;
-  prepareOverviewStripReturn();
+  if (cinemaMotion) prepareOverviewStripReturn();
   $("#backHomeBtn").classList.add("hidden");
   $("#backHomeBtn").disabled = false;
   $$(".filmstrip").forEach((strip) => strip.classList.remove("is-locked"));
   requestRailCoverflow();
-  app.classList.add("is-overview-restoring");
-  await waitForMotion(HOME_WIPE_TOTAL_WAIT_MS);
+  if (cinemaMotion) {
+    app.classList.add("is-overview-restoring");
+    await waitForMotion(HOME_WIPE_TOTAL_WAIT_MS);
+  }
   app.classList.remove("is-overview-restoring", "is-home-wipe");
   homeReturnRunning = false;
 }
@@ -2148,12 +2208,26 @@ async function loadContextPanel() {
 }
 
 function bindKnowledgeGraphRows(target) {
+  target.querySelectorAll("[data-thread-id]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      withButton(button, "更新中", () => updateThreadStatus(button.dataset.threadId, button.dataset.threadNextStatus));
+    });
+  });
   target.querySelectorAll("[data-raw]").forEach((row) => {
     row.addEventListener("click", () => {
       const title = row.dataset.detailTitle || "图谱节点";
       showGenericDetail(title, JSON.parse(row.dataset.raw || "{}"));
     });
   });
+}
+
+async function updateThreadStatus(id, status) {
+  const result = await apiPost("/thread/status", { id, status });
+  if (!result.updated) throw new Error("线程不存在或状态未更新");
+  showToast(status === "closed" ? "线程已标记完成" : "线程已重新打开");
+  await loadContextPanel();
 }
 
 function rawAttr(value) {
@@ -2262,6 +2336,11 @@ function renderKnowledgeThreads(items, title = "跨窗口线程") {
                 <span class="badge ${item.status === "closed" ? "violet" : "teal"}">${escapeHtml(item.status || "open")}</span>
                 <span class="badge blue">${escapeHtml(shortId(item.from_session))} -> ${escapeHtml(shortId(item.to_session))}</span>
                 <span class="badge gold">${escapeHtml(item.visibility || "shareable")}</span>
+              </div>
+              <div class="thread-actions">
+                <button class="subtle" data-thread-id="${escapeHtml(item.id)}" data-thread-next-status="${item.status === "closed" ? "open" : "closed"}" type="button">
+                  ${item.status === "closed" ? "重新打开" : "标记完成"}
+                </button>
               </div>
             </div>
           </article>
@@ -2800,9 +2879,45 @@ function resetPersonalFilmLayout() {
 
 function mountScheduleFilmToRail(film) {
   const rail = document.querySelector(".object-rail");
-  if (!film || !rail || film.classList.contains("is-rail-mounted")) return;
+  if (state.overviewLayout !== "cinema" || !film || !rail || film.classList.contains("is-rail-mounted")) return;
   film.classList.add("is-rail-mounted");
   rail.appendChild(film);
+}
+
+function restoreScheduleFilmToPanel(film = document.querySelector("[data-schedule-film]")) {
+  const zone = document.querySelector(".personal-zone.companion-overview");
+  if (!film || !zone) return;
+  if (film.parentElement !== zone) zone.appendChild(film);
+  film.classList.remove("is-rail-mounted", "is-peeking", "is-retracting", "is-extended", "is-dragging");
+  film.style.removeProperty("width");
+  film.style.removeProperty("min-width");
+  film.style.removeProperty("transition");
+  film.style.removeProperty("--personal-film-top");
+  film.style.removeProperty("--personal-film-left");
+  film.style.removeProperty("--schedule-film-pull");
+  const track = film.querySelector("[data-schedule-track]");
+  track?.style.removeProperty("transform");
+  track?.style.removeProperty("transition");
+  resetPersonalFilmLayout();
+}
+
+function syncPersonalLayoutForUiMode() {
+  const film = document.querySelector("[data-schedule-film]");
+  if (!film || state.activeView !== "review") return;
+  const heading = document.querySelector(".personal-zone.companion-overview .personal-zone-head h4");
+  if (heading) heading.textContent = state.overviewLayout === "cinema" ? "时间胶片" : "日程时间表";
+  if (state.personalSnapshot) {
+    updateScheduleSummary(document, state.personalSnapshot);
+  }
+  if (state.overviewLayout === "standard") {
+    restoreScheduleFilmToPanel(film);
+    return;
+  }
+  mountScheduleFilmToRail(film);
+  requestAnimationFrame(() => {
+    centerScheduleFrame(film, state.selectedScheduleIndex, true);
+    alignPersonalScheduleToReel();
+  });
 }
 
 function removeRailMountedScheduleFilm() {
@@ -2891,7 +3006,7 @@ function alignPersonalScheduleToReel() {
   const app = $("#app");
   const film = document.querySelector("[data-schedule-film]");
   const reel = document.querySelector(".bucket.date-reel.is-active");
-  if (!app || !film || !reel || state.activeView !== "review") {
+  if (!app || !film || !reel || state.activeView !== "review" || state.overviewLayout !== "cinema") {
     app?.style.removeProperty("--personal-film-lift");
     app?.style.removeProperty("--personal-film-shift");
     app?.style.removeProperty("--personal-detail-offset");
@@ -2982,9 +3097,12 @@ function setupScheduleFilmDrag(film, selectSchedule) {
     lastSelected = nearest.dataset.scheduleIndex;
     selectSchedule(lastSelected, { preserveOffset: true });
   };
-  applyScheduleFilmOffset(film, Number(film.dataset.offset || 0), true);
-  selectNearestAtMarker();
+  if (state.overviewLayout === "cinema") {
+    applyScheduleFilmOffset(film, Number(film.dataset.offset || 0), true);
+    selectNearestAtMarker();
+  }
   film.addEventListener("pointerdown", (event) => {
+    if (state.overviewLayout !== "cinema") return;
     if (event.button !== undefined && event.button !== 0) return;
     isDown = true;
     moved = 0;
@@ -3030,6 +3148,7 @@ function setupScheduleFilmDrag(film, selectSchedule) {
     if (isDown) finish(event);
   });
   film.addEventListener("wheel", (event) => {
+    if (state.overviewLayout !== "cinema") return;
     event.preventDefault();
     const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
     applyScheduleFilmOffset(film, Number(film.dataset.offset || 0) + delta);
@@ -3041,6 +3160,7 @@ function setupScheduleFilmDrag(film, selectSchedule) {
     }, 160);
   }, { passive: false });
   window.addEventListener("resize", () => {
+    if (state.overviewLayout !== "cinema") return;
     applyScheduleFilmOffset(film, Number(film.dataset.offset || 0), true);
     alignPersonalScheduleToReel();
   });
@@ -3193,8 +3313,12 @@ function renderPersonalMemoryUnavailable(reason) {
 
 function renderPersonalMemoryWorkspace(snapshot, status) {
   const active = personalViewport();
+  const bridgeWarning = status?.bridge_available === false
+    ? `<div class="chat-import-callout is-warning" role="status"><b>联动已降级</b><span>当前展示包含陪伴插件本地数据，但记忆桥接并未健康连通（${escapeHtml(status.bridge_reason || status.bridge_state || "状态未知")}）。新数据可能尚未同步到记忆库。</span></div>`
+    : "";
   return `
     <section class="personal-memory-workspace">
+      ${bridgeWarning}
       ${renderPersonalViewportSwitch(active)}
       <div class="personal-viewport" data-personal-viewport-panel="${escapeHtml(active)}">
         ${renderPersonalViewportPanel(active, snapshot, status)}
@@ -3428,7 +3552,7 @@ function renderCompanionSchedulePanel(snapshot, status) {
   return `
     <section class="personal-zone companion-overview">
       <div class="personal-zone-head">
-        <h4>时间胶片</h4>
+        <h4>${state.overviewLayout === "cinema" ? "时间胶片" : "日程时间表"}</h4>
         <span>${escapeHtml(snapshot.bot_name || "Bot")} · ${escapeHtml(plan.date || status.selected_date || "-")}</span>
       </div>
       <div class="schedule-summary" data-schedule-summary>
@@ -3495,7 +3619,7 @@ function selectedScheduleItem(items, selectedIndex) {
 
 function renderScheduleSummary(item, items, index) {
   if (!item) {
-    return `<b>未选择时段</b><span>拖动胶片选择一段日程。</span>`;
+    return `<b>未选择时段</b><span>${state.overviewLayout === "cinema" ? "拖动胶片" : "点击时间段"}选择一段日程。</span>`;
   }
   const range = index >= 0 ? scheduleRange(items, index) : (item.time || "");
   const meta = [item.mood, item.message_seed].filter(Boolean).join(" · ");
@@ -4506,10 +4630,22 @@ async function showMemory(id) {
         <span class="badge teal">${escapeHtml(memory.visibility)}</span>
         <span class="badge blue">${escapeHtml(memory.reality_level)}</span>
         <span class="badge gold">${escapeHtml(memory.lifecycle)}</span>
+        <span class="badge ${memory.validity_status === "active" ? "teal" : "violet"}">${escapeHtml(memory.validity_status || "active")}</span>
       </div>
     </div>
     ${memory.source_plugin === "livingmemory" && isNumericOnlyContent(memory.content) ? `<div class="empty-state error-state"><b>导入内容未修复</b><span>这条记录目前只有旧库编号，请先在维护工具中执行“修复 LivingMemory 内容”。</span></div>` : ""}
     ${renderMemoryStructuredMetadata(memory)}
+    <section class="memory-atom-panel" aria-label="Memory Atom v2">
+      <div class="memory-atom-panel-head"><b>Memory Atom v2</b><span>归属与系统反馈字段为只读</span></div>
+      <div class="memory-atom-readonly-grid">
+        <span><em>Owner Bot</em><strong>${escapeHtml(memory.owner_bot_id || "未标记")}</strong></span>
+        <span><em>Persona</em><strong>${escapeHtml(memory.persona_id || "未标记")}</strong></span>
+        <span><em>强化分</em><strong>${escapeHtml(percentLabel(memory.reinforcement_score || 0))}</strong></span>
+        <span><em>实际注入</em><strong>${escapeHtml(memory.injection_count || 0)} 次</strong></span>
+        <span><em>最近注入</em><strong>${escapeHtml(formatTime(memory.last_injected_at) || "从未")}</strong></span>
+        <span><em>Canonical</em><strong title="${escapeHtml(memory.canonical_key || "")}">${escapeHtml(shortId(memory.canonical_key || "未生成"))}</strong></span>
+      </div>
+    </section>
     <form id="memoryManageForm" class="memory-manage-form" autocomplete="off">
       <label>
         <span>记忆类型</span>
@@ -4524,6 +4660,16 @@ async function showMemory(id) {
         <textarea name="evidence" rows="4">${escapeHtml(memory.evidence || "")}</textarea>
       </label>
       <div class="memory-manage-grid">
+        <label>
+          <span>有效状态</span>
+          <select name="validity_status">
+            ${memoryOption("active", "有效", memory.validity_status)}
+            ${memoryOption("superseded", "已被新事实替代", memory.validity_status)}
+            ${memoryOption("expired", "已过期", memory.validity_status)}
+            ${memoryOption("archived", "已归档", memory.validity_status)}
+            ${memoryOption("quarantined", "隔离待确认", memory.validity_status)}
+          </select>
+        </label>
         <label>
           <span>可见性</span>
           <select name="visibility">
@@ -4547,8 +4693,39 @@ async function showMemory(id) {
           <input name="importance" type="number" min="0" max="1" step="0.01" value="${escapeHtml(memory.importance ?? 0.3)}" />
         </label>
         <label>
+          <span>显著性</span>
+          <input name="salience" type="number" min="0" max="1" step="0.01" value="${escapeHtml(memory.salience ?? memory.importance ?? 0.3)}" />
+        </label>
+        <label>
           <span>置信度</span>
           <input name="confidence" type="number" min="0" max="1" step="0.01" value="${escapeHtml(memory.confidence ?? 0.5)}" />
+        </label>
+        <label>
+          <span>耐久度</span>
+          <select name="durability">
+            ${memoryOption("ephemeral", "短暂流水", memory.durability)}
+            ${memoryOption("short", "短期", memory.durability)}
+            ${memoryOption("normal", "普通", memory.durability)}
+            ${memoryOption("durable", "耐久", memory.durability)}
+            ${memoryOption("pinned", "固定保护", memory.durability)}
+          </select>
+        </label>
+        <label>
+          <span>敏感级别</span>
+          <select name="sensitivity">
+            ${memoryOption("public", "公开", memory.sensitivity)}
+            ${memoryOption("internal", "内部", memory.sensitivity)}
+            ${memoryOption("private", "私密", memory.sensitivity)}
+            ${memoryOption("restricted", "严格限制", memory.sensitivity)}
+          </select>
+        </label>
+        <label>
+          <span>生效时间（ISO-8601）</span>
+          <input name="valid_from" type="text" value="${escapeHtml(memory.valid_from || "")}" placeholder="2026-08-16T00:00:00+08:00" />
+        </label>
+        <label>
+          <span>失效时间（ISO-8601）</span>
+          <input name="valid_to" type="text" value="${escapeHtml(memory.valid_to || "")}" placeholder="留空表示不设截止" />
         </label>
       </div>
       <div class="memory-manage-actions">
@@ -4698,6 +4875,15 @@ async function saveMemoryManagement(id, form) {
     const value = Number(data.get(name));
     return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
   };
+  const validFrom = String(data.get("valid_from") || "").trim();
+  const validTo = String(data.get("valid_to") || "").trim();
+  if (validFrom && validTo) {
+    const start = Date.parse(validFrom);
+    const end = Date.parse(validTo);
+    if (Number.isFinite(start) && Number.isFinite(end) && start > end) {
+      throw new Error("生效时间不能晚于失效时间");
+    }
+  }
   await apiPost("/memory/update", {
     id,
     memory_type: String(data.get("memory_type") || ""),
@@ -4707,6 +4893,12 @@ async function saveMemoryManagement(id, form) {
     confidence: num("confidence", 0.5),
     visibility: String(data.get("visibility") || "internal"),
     lifecycle: String(data.get("lifecycle") || "stable_memory"),
+    validity_status: String(data.get("validity_status") || "active"),
+    valid_from: validFrom,
+    valid_to: validTo,
+    salience: num("salience", 0.3),
+    durability: String(data.get("durability") || "normal"),
+    sensitivity: String(data.get("sensitivity") || "private"),
   });
   showToast("这条记忆已保存");
   await refreshAll();
@@ -6446,6 +6638,81 @@ async function executeLivingMemoryImport(path) {
   showToast("导入已完成");
 }
 
+function renderMemoryAuditBatch(batch) {
+  const host = $("#memoryAuditResult");
+  if (!host) return;
+  state.memoryAuditBatch = batch && typeof batch === "object" ? batch : null;
+  if (!state.memoryAuditBatch) {
+    host.innerHTML = '<div class="empty-state">尚未读取审计批次。</div>';
+    return;
+  }
+  const items = Array.isArray(batch.items) ? batch.items : [];
+  const status = String(batch.status || "unknown");
+  host.innerHTML = `
+    <div class="memory-audit-summary">
+      <span><em>批次</em><strong>${escapeHtml(batch.batch_id || "-")}</strong></span>
+      <span><em>状态</em><strong>${escapeHtml(status)}</strong></span>
+      <span><em>候选</em><strong>${escapeHtml(batch.candidate_count || 0)}</strong></span>
+      <span><em>建议</em><strong>${escapeHtml(items.length)}</strong></span>
+    </div>
+    ${items.length ? `<div class="memory-audit-items">${items.map((item) => `
+      <article>
+        <div><b>${escapeHtml(item.action === "archive" ? "建议归档" : "建议修正")}</b><code>${escapeHtml(shortId(item.memory_id || ""))}</code></div>
+        <p>${escapeHtml(item.reason || "未提供原因")}</p>
+        ${item.proposed_content ? `<small>${escapeHtml(compact(item.proposed_content, ""))}</small>` : ""}
+      </article>
+    `).join("")}</div>` : '<div class="empty-state">该批次没有需要修改的建议。</div>'}
+    <div class="inline-actions memory-audit-result-actions">
+      ${status === "preview" ? '<button data-memory-audit-action="apply" class="danger subtle" type="button">应用此批次</button>' : ""}
+      ${["applied", "partial"].includes(status) ? '<button data-memory-audit-action="rollback" class="danger subtle" type="button">回滚此批次</button>' : ""}
+    </div>
+  `;
+  host.querySelector('[data-memory-audit-action="apply"]')?.addEventListener("click", () => confirmMemoryAuditAction("apply"));
+  host.querySelector('[data-memory-audit-action="rollback"]')?.addEventListener("click", () => confirmMemoryAuditAction("rollback"));
+}
+
+async function previewMemoryAudit() {
+  const limit = Math.max(0, Math.min(100, Number($("#memoryAuditLimit")?.value || 0)));
+  const data = await apiPost("/maintenance/audit/preview", { limit });
+  const batch = data.result || {};
+  if ($("#memoryAuditBatchId")) $("#memoryAuditBatchId").value = batch.batch_id || "";
+  renderMemoryAuditBatch(batch);
+  showToast("审计预览已生成");
+}
+
+async function loadMemoryAuditStatus() {
+  const batchId = String($("#memoryAuditBatchId")?.value || "").trim();
+  if (!batchId) throw new Error("请先填写审计批次 ID");
+  const data = await apiGet(`/maintenance/audit/status?batch_id=${encodeURIComponent(batchId)}`);
+  renderMemoryAuditBatch(data.result || {});
+}
+
+function confirmMemoryAuditAction(action) {
+  const batch = state.memoryAuditBatch;
+  if (!batch?.batch_id) return;
+  const rollback = action === "rollback";
+  showInlineConfirmation({
+    host: "#memoryAuditResult",
+    title: rollback ? "回滚记忆审计" : "应用记忆审计",
+    message: rollback
+      ? "将按该批次保存的变更前快照恢复记录。执行前会再次备份当前数据库。"
+      : `将应用 ${Array.isArray(batch.items) ? batch.items.length : 0} 条证据约束建议。执行前会自动备份数据库。`,
+    confirmLabel: rollback ? "确认回滚" : "确认应用",
+    busyText: rollback ? "正在回滚审计..." : "正在应用审计...",
+    dangerous: true,
+    onConfirm: () => executeMemoryAuditAction(action, batch.batch_id),
+    onCancel: () => renderMemoryAuditBatch(batch),
+  });
+}
+
+async function executeMemoryAuditAction(action, batchId) {
+  const endpoint = action === "rollback" ? "/maintenance/audit/rollback" : "/maintenance/audit/apply";
+  const data = await apiPost(endpoint, { batch_id: batchId, confirm: "确认" });
+  renderMemoryAuditBatch(data.result || {});
+  await loadStats();
+  showToast(action === "rollback" ? "审计批次已回滚" : "审计批次已应用");
+}
+
 async function refreshAll() {
   await loadCompanionAvailability();
   await loadStats();
@@ -6564,6 +6831,8 @@ function bindActions() {
   });
   $("#maintenanceBtn").addEventListener("click", () => withBusy("正在运行维护...", runMaintenance));
   $("#operationsDiagnosticsBtn").addEventListener("click", () => withBusy("正在生成运维诊断...", runOperationsDiagnostics));
+  $("#memoryAuditPreviewBtn")?.addEventListener("click", () => withBusy("正在生成记忆审计预览...", previewMemoryAudit));
+  $("#memoryAuditStatusBtn")?.addEventListener("click", () => withBusy("正在读取审计批次...", loadMemoryAuditStatus));
   $$('[data-operation-preset]').forEach((button) => {
     button.addEventListener("click", () => withBusy("正在应用运行预设...", () => applyOperationPreset(button.dataset.operationPreset)));
   });
@@ -7219,6 +7488,7 @@ async function init() {
   syncOverviewLayoutControls();
   bindActions();
   playInitialOverviewEntrance();
+  await loadUiCapabilities();
   await loadConfiguredTheme();
   try {
     await loadCompanionAvailability();

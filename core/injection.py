@@ -38,6 +38,7 @@ class InjectionComposer:
         address_hint: str = "",
         recent_fact_context: str = "",
         recent_cross_window_context: str = "",
+        included_memory_ids: list[str] | None = None,
     ) -> str:
         results, slot_sections = self._filter_injection_results(results, slot_sections)
         if not results and not intent_context and not recent_fact_context and not recent_cross_window_context:
@@ -145,6 +146,7 @@ class InjectionComposer:
             closing_lines=closing_lines,
             inner_limit=inner_limit,
             short_rest_check=bool(rest_check_hint),
+            included_memory_ids=included_memory_ids,
         )
         if memory_lines:
             lines.extend(memory_lines)
@@ -160,6 +162,8 @@ class InjectionComposer:
 
         text = "\n".join(lines)
         if len(text) > inner_limit:
+            if included_memory_ids is not None:
+                included_memory_ids.clear()
             text = self._minimal_body(ctx, inner_limit, has_results=bool(results))
         return f"{MEMORY_COMPANION_INJECTION_HEADER}\n{text}\n{MEMORY_COMPANION_INJECTION_FOOTER}"
 
@@ -201,6 +205,7 @@ class InjectionComposer:
         closing_lines: list[str],
         inner_limit: int,
         short_rest_check: bool = False,
+        included_memory_ids: list[str] | None = None,
     ) -> list[str]:
         if short_rest_check:
             return self._build_short_rest_memory_lines(
@@ -289,6 +294,13 @@ class InjectionComposer:
                         break
                 if line:
                     item_lines.append(line)
+                    memory_id = clean_text(getattr(item.memory, "id", ""), 160)
+                    if (
+                        included_memory_ids is not None
+                        and memory_id
+                        and memory_id not in included_memory_ids
+                    ):
+                        included_memory_ids.append(memory_id)
             if item_lines:
                 memory_lines.extend([*opening, *item_lines, f"</{tag}>"])
         return memory_lines

@@ -12,12 +12,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-from astrbot_plugin_remember_you.core.models import EntityRef, MemoryRecord, SessionContext
-from astrbot_plugin_remember_you.core.service import MemoryCompanionService
+
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SessionContext
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
 
 
 TARGETS = [
@@ -37,6 +41,16 @@ def percentile_95(values: list[float]) -> float:
 
 
 async def run(size: int, repeats: int) -> dict:
+    # Some minimal CI/container runtimes accept ``asyncio.to_thread`` work but
+    # never wake the awaiting Future.  This benchmark measures the deterministic
+    # local retrieval core, so execute the same synchronous store callables
+    # inline and exclude executor scheduling noise from the latency result.
+    original_to_thread = asyncio.to_thread
+
+    async def direct_to_thread(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    asyncio.to_thread = direct_to_thread
     with tempfile.TemporaryDirectory() as temp:
         service = MemoryCompanionService(
             context=None,
@@ -356,7 +370,8 @@ async def run(size: int, repeats: int) -> dict:
                 ],
             }
         finally:
-            service.close()
+            await service.aclose()
+            asyncio.to_thread = original_to_thread
 
 
 async def main() -> None:

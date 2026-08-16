@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+try:
+    from .package_bootstrap import bootstrap_package
+except ImportError:
+    from package_bootstrap import bootstrap_package
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT.parent) not in sys.path:
-    sys.path.insert(0, str(ROOT.parent))
 
-from astrbot_plugin_remember_you.core.models import SessionContext
-from astrbot_plugin_remember_you.core.service import MemoryCompanionService
+ROOT = bootstrap_package()
+
+from astrbot_plugin_memory_companion.core.models import SessionContext
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
 
 
 class RememberToolContractTests(unittest.IsolatedAsyncioTestCase):

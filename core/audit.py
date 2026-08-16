@@ -218,6 +218,12 @@ class MemoryAuditManager:
                     lifecycle=clean_text(before.get("lifecycle"), 40),
                     review_status=clean_text(before.get("review_status"), 40),
                     metadata=before.get("metadata") if isinstance(before.get("metadata"), dict) else {},
+                    validity_status=clean_text(before.get("validity_status"), 24) or None,
+                    valid_from=clean_text(before.get("valid_from"), 80),
+                    valid_to=clean_text(before.get("valid_to"), 80),
+                    salience=before.get("salience"),
+                    durability=clean_text(before.get("durability"), 24) or None,
+                    sensitivity=clean_text(before.get("sensitivity"), 24) or None,
                 )
                 refreshed = await self.service.store.get_memory(memory_id) if restored else None
                 if refreshed is not None:
@@ -510,6 +516,12 @@ class MemoryAuditManager:
             "confidence": record.confidence,
             "visibility": record.visibility,
             "lifecycle": record.lifecycle,
+            "validity_status": record.validity_status,
+            "valid_from": record.valid_from,
+            "valid_to": record.valid_to,
+            "salience": record.salience,
+            "durability": record.durability,
+            "sensitivity": record.sensitivity,
             "review_status": record.review_status,
             "metadata": record.metadata if isinstance(record.metadata, dict) else {},
         }

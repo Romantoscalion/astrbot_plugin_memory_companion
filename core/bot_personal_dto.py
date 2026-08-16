@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 
 from . import bot_personal_contract
 from .bot_personal_contract import (
+    BOT_PERSONAL_CANONICAL_SCHEMA_VERSION,
+    BOT_PERSONAL_LEGACY_CANONICAL_SCHEMA_VERSIONS,
     BOT_PERSONAL_MEMORY_DOMAIN,
     BOT_PERSONAL_MEMORY_TYPES,
     BOT_PERSONAL_MAX_PAYLOAD_BYTES,
@@ -29,7 +31,7 @@ BOT_PERSONAL_MAX_RECORD_VERSION = 1_000_000
 # Canonical C3 agenda fields are additive to the archive envelope.  The
 # archive's legacy evidence column only stores L0-L3; L4/L5 remain visible in
 # ``canonical_evidence_level`` together with an explicit lossy mapping.
-CANONICAL_SCHEMA_VERSION = 2
+CANONICAL_SCHEMA_VERSION = BOT_PERSONAL_CANONICAL_SCHEMA_VERSION
 CANONICAL_EVIDENCE_LEVELS = frozenset({"L0", "L1", "L2", "L3", "L4", "L5"})
 ARCHIVE_EVIDENCE_LEVELS = frozenset({"L0", "L1", "L2", "L3"})
 EVIDENCE_KINDS = frozenset({
@@ -366,8 +368,20 @@ def _derive_window(occurred_at: str) -> str:
     return bot_personal_contract.window_for_minutes(minutes)
 
 
-def _record_id(memory_type: str, idempotency_key: str) -> str:
-    digest = hashlib.sha256(f"{BOT_PERSONAL_MEMORY_DOMAIN}|{memory_type}|{idempotency_key}".encode("utf-8")).hexdigest()[:24]
+def _record_id(
+    memory_type: str,
+    idempotency_key: str,
+    *,
+    canonical_schema_version: int = 1,
+    owner_bot_id: str = "",
+    persona_id: str = "",
+) -> str:
+    identity = (
+        f"{BOT_PERSONAL_MEMORY_DOMAIN}|{owner_bot_id}|{persona_id}|{memory_type}|{idempotency_key}"
+        if canonical_schema_version >= BOT_PERSONAL_CANONICAL_SCHEMA_VERSION
+        else f"{BOT_PERSONAL_MEMORY_DOMAIN}|{memory_type}|{idempotency_key}"
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
     return f"botmem_{digest}"
 
 
@@ -427,10 +441,12 @@ class BotPersonalArchiveDTO:
     runtime_origin_refs: tuple[str, ...] = ()
     expires_at: str = ""
     decision_trace: tuple[dict[str, Any], ...] = ()
+    owner_bot_id: str = ""
+    persona_id: str = ""
     canonical_schema_version: int = CANONICAL_SCHEMA_VERSION
 
     def envelope(self) -> dict[str, Any]:
-        return {
+        result = {
             "record_id": self.record_id,
             "memory_domain": self.memory_domain,
             "memory_type": self.memory_type,
@@ -468,6 +484,10 @@ class BotPersonalArchiveDTO:
             "decision_trace": deepcopy(list(self.decision_trace)),
             "canonical_schema_version": self.canonical_schema_version,
         }
+        if self.canonical_schema_version >= BOT_PERSONAL_CANONICAL_SCHEMA_VERSION:
+            result["owner_bot_id"] = self.owner_bot_id
+            result["persona_id"] = self.persona_id
+        return result
 
     to_dict = envelope
 
@@ -511,6 +531,8 @@ def build_bot_personal_archive(
     runtime_origin_refs: Any = None,
     expires_at: str = "",
     decision_trace: Any = None,
+    owner_bot_id: str = "",
+    persona_id: str = "",
     canonical_schema_version: Any = None,
 ) -> BotPersonalArchiveDTO:
     if isinstance(envelope, BotPersonalArchiveDTO):
@@ -532,6 +554,7 @@ def build_bot_personal_archive(
         "source_actor_id": source_actor_id, "target_user_id": target_user_id,
         "participant_roles": participant_roles, "runtime_origin_refs": runtime_origin_refs,
         "expires_at": expires_at, "decision_trace": decision_trace,
+        "owner_bot_id": owner_bot_id, "persona_id": persona_id,
         "canonical_schema_version": canonical_schema_version,
     }.items() if value not in (None, "")}
     source.update(supplied)
@@ -548,7 +571,39 @@ def build_bot_personal_archive(
         raise BotPersonalValidationError("invalid", "subject", "Bot Personal subject is fixed")
 
     key = validate_bot_personal_idempotency_key(source.get("idempotency_key"))
-    derived_record_id = _record_id(kind, key)
+    try:
+        requested_canonical_schema = int(source.get("canonical_schema_version") or 1)
+    except (TypeError, ValueError) as exc:
+        raise BotPersonalValidationError(
+            "invalid", "canonical_schema_version", "canonical schema must be numeric"
+        ) from exc
+    supported_canonical_schemas = {
+        *BOT_PERSONAL_LEGACY_CANONICAL_SCHEMA_VERSIONS,
+        BOT_PERSONAL_CANONICAL_SCHEMA_VERSION,
+    }
+    if requested_canonical_schema not in supported_canonical_schemas:
+        raise BotPersonalValidationError(
+            "invalid", "canonical_schema_version", "unsupported canonical schema"
+        )
+    owner_bot_id = _check_string(_text(source.get("owner_bot_id"), 120), "owner_bot_id")
+    persona_id = _check_string(_text(source.get("persona_id"), 96), "persona_id")
+    if requested_canonical_schema >= BOT_PERSONAL_CANONICAL_SCHEMA_VERSION:
+        if not owner_bot_id or not persona_id:
+            raise BotPersonalValidationError(
+                "invalid_namespace",
+                "owner_bot_id",
+                "current Bot Personal schema requires owner_bot_id and persona_id",
+            )
+    else:
+        owner_bot_id = ""
+        persona_id = "legacy"
+    derived_record_id = _record_id(
+        kind,
+        key,
+        canonical_schema_version=requested_canonical_schema,
+        owner_bot_id=owner_bot_id,
+        persona_id=persona_id,
+    )
     supplied_record_id = source.get("record_id")
     if supplied_record_id not in (None, ""):
         if not isinstance(supplied_record_id, str):
@@ -860,7 +915,7 @@ def build_bot_personal_archive(
             "runtime_origin_refs": list(runtime_origin_refs),
             "expires_at": expires_at,
             "decision_trace": deepcopy(trace),
-            "canonical_schema_version": CANONICAL_SCHEMA_VERSION,
+            "canonical_schema_version": requested_canonical_schema,
             "source_refs": list(refs),
         }
     )
@@ -902,7 +957,9 @@ def build_bot_personal_archive(
         runtime_origin_refs=runtime_origin_refs,
         expires_at=expires_at,
         decision_trace=tuple(deepcopy(trace)),
-        canonical_schema_version=CANONICAL_SCHEMA_VERSION,
+        owner_bot_id=owner_bot_id,
+        persona_id=persona_id,
+        canonical_schema_version=requested_canonical_schema,
     )
 
 
