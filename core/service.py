@@ -1429,10 +1429,10 @@ class MemoryCompanionService:
             "payload_fingerprint": fingerprint,
             "payload": payload,
             "canonical_schema_version": dto.canonical_schema_version,
-            "window_date": dto.window_date or dto.date,
-            "created_at": dto.created_at,
-            "updated_at": dto.updated_at,
-            "temporal_phase": dto.temporal_phase,
+            "window_date": getattr(dto, "window_date", "") or dto.date,
+            "created_at": getattr(dto, "created_at", ""),
+            "updated_at": getattr(dto, "updated_at", ""),
+            "temporal_phase": getattr(dto, "temporal_phase", ""),
             "evidence_kind": dto.evidence_kind,
             "canonical_evidence_level": dto.canonical_evidence_level,
             "archive_evidence_level": dto.archive_evidence_level,
@@ -1776,7 +1776,6 @@ class MemoryCompanionService:
                 query="",
                 scope="private",
                 visibility="bot_self",
-                session_id="bot_personal",
             )
         except Exception:
             return {

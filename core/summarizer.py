@@ -359,10 +359,15 @@ class MemorySummarizer:
             self.max_summary_chars,
         )
         summary = self._normalize_relative_time_mentions(summary, rows)
-        key_facts, key_facts_with_refs = self._normalize_key_facts(
+        _readable_key_facts, key_facts_with_refs = self._normalize_key_facts(
             payload.get("key_facts") or payload.get("facts"),
             rows,
         )
+        # Legacy string facts remain readable through _normalize_key_facts(),
+        # but newly normalized summaries may only persist evidence-backed
+        # facts.  This preserves old data compatibility without weakening the
+        # source-reference gate for new memory writes.
+        key_facts = [item["fact"] for item in key_facts_with_refs]
         topics = self._clean_list(payload.get("topics"), 6, 80)
         associations = self._normalize_associations(payload.get("associations"), rows)
         participants = self._clean_list(payload.get("participants"), 10, 80)
@@ -444,6 +449,18 @@ class MemorySummarizer:
                 raw_fact = item.get("fact") or item.get("text") or item.get("content")
                 raw_refs = item.get("refs") or item.get("event_ids") or item.get("source_event_ids") or []
             else:
+                # Keep the legacy string shape readable for compatibility,
+                # but leave it untraced so summary_quality still rejects it
+                # from formal evidence-backed memory writes.
+                fact = self._normalize_relative_time_mentions(
+                    self._sanitize_generated_memory_text(clean_text(item, 160), 160),
+                    rows,
+                )
+                if len(fact) >= 2 and not self._looks_like_prompt_injection(fact):
+                    fact_key = fact.casefold()
+                    if fact_key not in seen_facts:
+                        seen_facts.add(fact_key)
+                        facts.append(fact)
                 continue
             fact = self._normalize_relative_time_mentions(
                 self._sanitize_generated_memory_text(clean_text(raw_fact, 160), 160),

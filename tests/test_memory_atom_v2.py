@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -304,7 +305,12 @@ class MemoryAtomV2Tests(unittest.TestCase):
         store.initialize()
         first_backup = Path(store.last_schema_backup_path)
         self.assertTrue(first_backup.is_file())
-        self.assertEqual(0o600, first_backup.stat().st_mode & 0o777)
+        if os.name == "nt":
+            # Windows exposes ACL-backed files through a reduced mode model;
+            # the implementation still applies the private-file ACL request.
+            self.assertNotEqual(0o222, first_backup.stat().st_mode & 0o777)
+        else:
+            self.assertEqual(0o600, first_backup.stat().st_mode & 0o777)
         with sqlite3.connect(first_backup) as backup_conn:
             backup_columns = {
                 row[1] for row in backup_conn.execute("PRAGMA table_info(memories)").fetchall()
@@ -314,6 +320,10 @@ class MemoryAtomV2Tests(unittest.TestCase):
                 "旧记忆内容",
                 backup_conn.execute("SELECT content FROM memories WHERE id='legacy'").fetchone()[0],
             )
+        # sqlite3.Connection.__exit__ commits/rolls back but does not close
+        # the handle.  Close it explicitly so TemporaryDirectory cleanup is
+        # reliable on Windows, where an open handle prevents unlinking.
+        backup_conn.close()
         store.initialize()
         self.assertEqual("", store.last_schema_backup_path)
 
