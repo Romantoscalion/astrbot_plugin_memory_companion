@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+import hashlib
 from pathlib import Path
 
 
@@ -11,10 +12,15 @@ try:
 except ImportError:
     from package_bootstrap import bootstrap_package
 
-
 ROOT = bootstrap_package()
 
-from astrbot_plugin_memory_companion.core.models import MemoryRecord, SearchResult, SessionContext
+from astrbot_plugin_memory_companion.core.models import (
+    MemoryRecord,
+    SearchResult,
+    SessionContext,
+    memory_embedding_text,
+    memory_embedding_text_hash,
+)
 from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
 from astrbot_plugin_memory_companion.core.store import MemoryStore
 from astrbot_plugin_memory_companion.core.visibility import VisibilityPolicy
@@ -79,6 +85,30 @@ class _EmptyRerankProvider:
 
 
 class RetrievalPerformanceTests(unittest.IsolatedAsyncioTestCase):
+    def test_embedding_document_keeps_routine_check_notes_in_sync(self) -> None:
+        record = _memory("routine-note", "检查午间状态")
+        record.metadata = {
+            "canonical_summary": "完成午间例行检查",
+            "routine_check_notes": ["已确认用户午饭后状态正常"],
+            "topics": ["日常"],
+        }
+        engine = RetrievalEngine(
+            _CandidateStore(),
+            VisibilityPolicy(enable_acl_rules=False),
+            embedding_max_text_chars=1200,
+        )
+
+        self.assertEqual(
+            memory_embedding_text(record, max_chars=1200),
+            engine._embedding_document_text(record),
+        )
+        self.assertEqual(
+            engine._embedding_text_hash(record),
+            hashlib.sha1(
+                memory_embedding_text(record, max_chars=1200).encode("utf-8")
+            ).hexdigest(),
+        )
+
     async def test_rerank_filters_empty_documents_and_reports_safe_request_shape(self) -> None:
         provider = _EmptyRerankProvider()
         engine = RetrievalEngine(
@@ -177,6 +207,35 @@ class RetrievalPerformanceTests(unittest.IsolatedAsyncioTestCase):
                 await store.update_memory_payload(record.id, content="vector content v2")
                 third = await store.list_embedding_candidate_rows(provider_id="embedder")
                 self.assertEqual("vector content v2", third[0][0].content)
+                stale = await store.list_memories_missing_embeddings(
+                    provider_id="embedder",
+                    limit=1,
+                )
+                self.assertEqual([record.id], [item.id for item in stale])
+                scanned, next_offset, exhausted = await store.scan_memories_missing_embeddings(
+                    provider_id="embedder",
+                    limit=1,
+                    offset=0,
+                )
+                self.assertEqual([record.id], [item.id for item in scanned])
+                self.assertGreaterEqual(next_offset, 1)
+                self.assertTrue(exhausted)
+                await store.upsert_memory_embedding(
+                    memory_id=record.id,
+                    provider_id="embedder",
+                    text_hash=memory_embedding_text_hash(
+                        third[0][0],
+                        max_chars=1200,
+                    ),
+                    vector=[1.0, 0.0],
+                )
+                self.assertEqual(
+                    [],
+                    await store.list_memories_missing_embeddings(
+                        provider_id="embedder",
+                        limit=1,
+                    ),
+                )
             finally:
                 store.close()
 

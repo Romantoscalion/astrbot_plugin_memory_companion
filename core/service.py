@@ -59,6 +59,8 @@ from .models import (
     clean_text,
     json_dumps,
     json_loads,
+    memory_embedding_text,
+    memory_embedding_text_hash,
     stable_fingerprint,
     utc_now,
 )
@@ -191,6 +193,8 @@ class MemoryRouteDecision:
 
 
 class MemoryCompanionService:
+    _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
+
     def __init__(self, *, context: Any, config: Any, plugin_root: Path, data_dir: Path):
         self.context = context
         self.config = ConfigView(config)
@@ -249,6 +253,7 @@ class MemoryCompanionService:
         self._embedding_backfill_inflight: set[str] = set()
         self._embedding_memory_inflight: set[str] = set()
         self._embedding_backfill_last_run: dict[str, float] = {}
+        self._embedding_backfill_offsets: dict[str, int] = {}
         self._embedding_background_semaphore = asyncio.Semaphore(
             max(1, self.config.int("retrieval.embedding_background_concurrency", 2))
         )
@@ -275,8 +280,12 @@ class MemoryCompanionService:
         self._emotional_event_queue: dict[str, list[dict[str, Any]]] = {}
         self._EMOTIONAL_EVENT_MAX_PER_SESSION = 10
         self._EMOTIONAL_EVENT_TTL = 3600.0
+        self._emotional_event_last_cleanup: float = 0.0
         self._relationship_phase_state: dict[str, dict[str, Any]] = {}
         self._RELATIONSHIP_PHASE_FILE = self.data_dir / "memory_companion_relationship_phase.json"
+        self._RELATIONSHIP_PHASE_STATE_TTL = 180 * 86400.0
+        self._RELATIONSHIP_PHASE_STATE_MAX = 4096
+        self._relationship_phase_last_cleanup: float = 0.0
         self._load_relationship_phase_state()
         self.provenance_ledger = ProvenanceLedger(self.data_dir / "provenance_ledger.json")
         self._last_p5_gate_status: dict[str, Any] = {"state": "disabled", "enabled": False}
@@ -288,6 +297,22 @@ class MemoryCompanionService:
             else "private_companion_bridge.enable_p5_b1_bridge_gate"
         )
         return self.config.bool(key, False)
+
+    def _scope_feature_enabled(self, scope_or_ctx: str | SessionContext, feature: str) -> bool:
+        scope = (
+            scope_or_ctx.scope
+            if isinstance(scope_or_ctx, SessionContext)
+            else clean_text(scope_or_ctx, 40)
+        )
+        scope = clean_text(scope, 40).lower()
+        feature = clean_text(feature, 40).lower()
+        if scope not in {"private", "group"} or feature not in self._SCOPE_CONTROL_FEATURES:
+            return True
+        config = getattr(self, "config", None)
+        config_bool = getattr(config, "bool", None)
+        if not callable(config_bool):
+            return True
+        return bool(config_bool(f"scope_control.{scope}_{feature}_enabled", True))
 
     async def _p5_gate(
         self,
@@ -622,11 +647,14 @@ class MemoryCompanionService:
 
         self._apply_remember_tool_contract(req)
 
-        await self.note_identity(ctx)
+        capture_enabled = self._scope_feature_enabled(ctx, "capture")
+        if capture_enabled:
+            await self.note_identity(ctx)
         reply_chain = await self._reply_chain_for_event(event)
 
-        await self._apply_user_reaction_feedback(ctx)
-        self._update_address_evolution(ctx, ctx.message_text or "")
+        if capture_enabled:
+            await self._apply_user_reaction_feedback(ctx)
+            self._update_address_evolution(ctx, ctx.message_text or "")
 
         try:
             await self.inject_memories(ctx, req, event=event)
@@ -640,6 +668,8 @@ class MemoryCompanionService:
 
         self._apply_reconstruction_contract(req, ctx, event=event)
 
+        if not capture_enabled:
+            return
         if not self.config.bool("memory_capture.enabled", True):
             return
         if not self.config.bool("memory_capture.capture_user_messages", True):
@@ -647,7 +677,19 @@ class MemoryCompanionService:
         record = self.classifier.from_user_message(ctx)
         if not record:
             return
-        memory_id = await self._existing_timeline_message_id(ctx, "user_message")
+        recent_timeline_rows: list[dict[str, Any]] | None = None
+        if ctx.scope == "group":
+            recent_timeline_rows = await self.store.recent_timeline(
+                limit=20,
+                scope=ctx.scope,
+                session_id=ctx.session_id,
+                entity_id=ctx.current_target_id,
+            )
+        memory_id = await self._existing_timeline_message_id(
+            ctx,
+            "user_message",
+            recent_rows=recent_timeline_rows,
+        )
         if not memory_id:
             event_metadata = {
                 "memory_id": memory_id,
@@ -659,9 +701,11 @@ class MemoryCompanionService:
             event_metadata.update(self._cross_window_event_metadata(ctx))
             event_metadata.update(self._reply_chain_metadata(reply_chain))
             if ctx.scope == "group":
-                event_metadata.update(
-                    await self._conversation_memory_metadata(ctx, source="llm_request")
-                )
+                event_metadata.update(await self._conversation_memory_metadata(
+                    ctx,
+                    source="llm_request",
+                    recent_rows=recent_timeline_rows,
+                ))
             memory_id = await self.store.add_timeline_event(
                 event_type="user_message",
                 session_id=ctx.session_id,
@@ -768,6 +812,8 @@ class MemoryCompanionService:
         ctx = await self.identity.resolve_event_context(event)
         self._sanitize_session_context_message_text(ctx)
         if ctx.scope != "group":
+            return
+        if not self._scope_feature_enabled(ctx, "capture"):
             return
         if looks_like_command(ctx.message_text):
             return
@@ -964,10 +1010,15 @@ class MemoryCompanionService:
             return
 
         ctx = await self.identity.resolve_event_context(event)
+        if not self._scope_feature_enabled(ctx, "capture"):
+            return
         if looks_like_command(ctx.message_text):
             return
         record = self.classifier.from_bot_response(ctx, text)
         if not record:
+            return
+
+        if await self._timeline_already_has_message(ctx, "bot_response", content=text):
             return
 
         memory_id = ""
@@ -981,26 +1032,36 @@ class MemoryCompanionService:
             content=text,
             metadata={
                 "memory_id": memory_id,
+                "message_id": clean_text(ctx.message_id, 120),
                 "memory_companion_injection_state": injection_state,
                 **self._cross_window_event_metadata(ctx),
             },
         )
         self._schedule_session_summary(ctx, reason="after_bot_response")
 
-    async def _timeline_already_has_message(self, ctx: SessionContext, event_type: str) -> bool:
-        return bool(await self._existing_timeline_message_id(ctx, event_type))
+    async def _timeline_already_has_message(
+        self, ctx: SessionContext, event_type: str, *, content: str = ""
+    ) -> bool:
+        return bool(await self._existing_timeline_message_id(ctx, event_type, content=content))
 
     async def _existing_timeline_message_id(
-        self, ctx: SessionContext, event_type: str
+        self,
+        ctx: SessionContext,
+        event_type: str,
+        *,
+        content: str = "",
+        recent_rows: list[dict[str, Any]] | None = None,
     ) -> str:
         message_id = clean_text(ctx.message_id, 120)
-        rows = await self.store.recent_timeline(
-            limit=20,
-            scope=ctx.scope,
-            session_id=ctx.session_id,
-            entity_id=ctx.current_target_id,
-        )
-        text = clean_text(ctx.message_text, 1000)
+        rows = recent_rows
+        if rows is None:
+            rows = await self.store.recent_timeline(
+                limit=20,
+                scope=ctx.scope,
+                session_id=ctx.session_id,
+                entity_id=ctx.current_target_id,
+            )
+        text = clean_text(content or ctx.message_text, 1000)
         subject_id = clean_text(
             self._bot_subject_id(ctx) if event_type == "bot_response" else ctx.user_id,
             120,
@@ -1028,17 +1089,25 @@ class MemoryCompanionService:
                         return clean_text(row.get("id"), 160)
         return ""
 
-    async def _conversation_memory_metadata(self, ctx: SessionContext, *, source: str) -> dict[str, Any]:
+    async def _conversation_memory_metadata(
+        self,
+        ctx: SessionContext,
+        *,
+        source: str,
+        recent_rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
             "source": clean_text(source, 80),
             "conversation_memory": True,
         }
-        rows = await self.store.recent_timeline(
-            limit=1,
-            scope=ctx.scope,
-            session_id=ctx.session_id,
-            entity_id=ctx.current_target_id,
-        )
+        rows = recent_rows
+        if rows is None:
+            rows = await self.store.recent_timeline(
+                limit=1,
+                scope=ctx.scope,
+                session_id=ctx.session_id,
+                entity_id=ctx.current_target_id,
+            )
         previous = rows[0] if rows else None
         idle_limit = max(1, self.config.int("conversation_memory.idle_gap_minutes", 20))
         previous_segment_id = ""
@@ -1308,6 +1377,8 @@ class MemoryCompanionService:
             event_metadata.setdefault("message_id", clean_text(message_id, 120))
         normalized_session_id = clean_text(session_id, 200)
         normalized_scope = clean_text(scope, 40)
+        if not self._scope_feature_enabled(normalized_scope, "capture"):
+            return ""
         event_id = await self.store.add_timeline_event(
             event_type=event_type,
             session_id=normalized_session_id,
@@ -2153,6 +2224,8 @@ class MemoryCompanionService:
     def bridge_get_emotional_events(self, *, session_id: str = "", limit: int = 5) -> list[dict[str, Any]]:
         """Consume a redacted exact-window queue during the capability migration."""
 
+        self._cleanup_emotional_event_queue()
+
         try:
             compatibility_enabled = self.config.bool(
                 "private_companion_bridge.legacy_emotion_compatibility_enabled",
@@ -2344,6 +2417,7 @@ class MemoryCompanionService:
             events.append(event)
         if not events:
             return
+        self._cleanup_emotional_event_queue(now=now)
         queue = self._emotional_event_queue.setdefault(ctx.session_id, [])
         existing_ids = {clean_text(item.get("id"), 80) for item in queue if isinstance(item, dict)}
         fresh_events = [event for event in events if clean_text(event.get("id"), 80) not in existing_ids]
@@ -2354,6 +2428,32 @@ class MemoryCompanionService:
         queue[:] = [e for e in queue if (now - e.get("ts", 0)) < self._EMOTIONAL_EVENT_TTL]
         if len(queue) > self._EMOTIONAL_EVENT_MAX_PER_SESSION:
             queue[:] = queue[-self._EMOTIONAL_EVENT_MAX_PER_SESSION:]
+
+    def _cleanup_emotional_event_queue(self, *, now: float | None = None) -> None:
+        """Drop expired session buckets so long-lived processes do not retain old keys."""
+
+        current = time.time() if now is None else float(now)
+        if now is None and current - self._emotional_event_last_cleanup < 60.0:
+            return
+        self._emotional_event_last_cleanup = current
+        for session_id, queue in list(self._emotional_event_queue.items()):
+            if not isinstance(queue, list):
+                self._emotional_event_queue.pop(session_id, None)
+                continue
+            fresh: list[dict[str, Any]] = []
+            for item in queue:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    age = current - float(item.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if 0.0 <= age < self._EMOTIONAL_EVENT_TTL:
+                    fresh.append(item)
+            if fresh:
+                self._emotional_event_queue[session_id] = fresh[-self._EMOTIONAL_EVENT_MAX_PER_SESSION:]
+            elif session_id in self._emotional_event_queue:
+                self._emotional_event_queue.pop(session_id, None)
 
     @staticmethod
     def _same_private_emotion_domain(event: Any, ctx: SessionContext) -> bool:
@@ -2502,6 +2602,8 @@ class MemoryCompanionService:
             "enable_acl_rules": self.config.bool("visibility.enable_acl_rules", True),
             "hide_pending_review": self.config.bool("visibility.hide_pending_review", True),
             "include_raw_events": self.config.bool("memory_injection.include_raw_events", False),
+            "private_topology_enabled": self._scope_feature_enabled("private", "topology"),
+            "group_topology_enabled": self._scope_feature_enabled("group", "topology"),
         }
         payload = {
             "kind": clean_text(kind, 40),
@@ -2585,6 +2687,14 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
     ):
         ctx = self._normalized_session_context(ctx)
+        if not admin_read_all and not self._scope_feature_enabled(ctx, "recall"):
+            self._last_retrieval_path_info = {
+                "mode": "disabled",
+                "path": "skipped",
+                "reason": "scope_recall_disabled",
+                "scope": clean_text(ctx.scope, 40),
+            }
+            return []
         cache_key = await self._retrieval_cache_key(
             "search",
             query,
@@ -2618,6 +2728,14 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
     ):
         ctx = self._normalized_session_context(ctx)
+        if not admin_read_all and not self._scope_feature_enabled(ctx, "recall"):
+            self._last_retrieval_path_info = {
+                "mode": "disabled",
+                "path": "skipped",
+                "reason": "scope_recall_disabled",
+                "scope": clean_text(ctx.scope, 40),
+            }
+            return [], []
         cache_key = await self._retrieval_cache_key(
             "diagnostics",
             query,
@@ -2660,6 +2778,14 @@ class MemoryCompanionService:
         time_intent: TimeIntent | None = None,
     ):
         ctx = self._normalized_session_context(ctx)
+        if not admin_read_all and not self._scope_feature_enabled(ctx, "recall"):
+            self._last_retrieval_path_info = {
+                "mode": "disabled",
+                "path": "skipped",
+                "reason": "scope_recall_disabled",
+                "scope": clean_text(ctx.scope, 40),
+            }
+            return [], [], {}
         slot_query = clean_text(query, 1000) or clean_text(ctx.message_text, 1000)
         slot_limits = self._slot_limits(top_k, query=slot_query, time_intent=time_intent)
         capped_slots = self._slot_capped_slots(
@@ -2748,6 +2874,8 @@ class MemoryCompanionService:
             retrieval_mode="basic",
             embedding_enabled=False,
             knowledge_graph_enabled=False,
+            private_topology_enabled=self._scope_feature_enabled("private", "topology"),
+            group_topology_enabled=self._scope_feature_enabled("group", "topology"),
         )
 
     async def _retrieval_engine(self, ctx: SessionContext, *, admin_read_all: bool = False) -> RetrievalEngine:
@@ -2789,6 +2917,8 @@ class MemoryCompanionService:
             ),
             knowledge_graph_enabled=self.config.bool("knowledge_graph.retrieval_expansion_enabled", True),
             knowledge_graph_expansion_limit=self.config.int("knowledge_graph.expansion_limit", 12),
+            private_topology_enabled=self._scope_feature_enabled("private", "topology"),
+            group_topology_enabled=self._scope_feature_enabled("group", "topology"),
             usage_recorder=self._record_token_usage,
         )
 
@@ -3281,11 +3411,17 @@ class MemoryCompanionService:
                 1,
                 min(200, self.config.int("retrieval.embedding_backfill_batch_size", 50)),
             )
-            records = await self.store.list_memories_missing_embeddings(
+            offset = self._embedding_backfill_offsets.get(provider_id, 0)
+            records, next_offset, exhausted = await self.store.scan_memories_missing_embeddings(
                 provider_id=provider_id,
                 limit=batch_size,
                 include_pending=self.config.bool("retrieval.embedding_index_pending", False),
+                embedding_max_text_chars=self.config.int(
+                    "retrieval.embedding_max_text_chars", 1200
+                ),
+                offset=offset,
             )
+            self._embedding_backfill_offsets[provider_id] = 0 if exhausted else next_offset
             for record in records:
                 if await self._embed_memory_record(provider, provider_id, record):
                     indexed += 1
@@ -3451,29 +3587,16 @@ class MemoryCompanionService:
         return [value / norm for value in values]
 
     def _memory_embedding_text(self, record: MemoryRecord) -> str:
-        metadata = record.metadata if isinstance(record.metadata, dict) else {}
-        parts = [
-            f"类型: {record.memory_type}",
-            f"范围: {record.scope}/{record.visibility}",
-            f"标签: {' '.join(record.tags or [])}",
-            f"内容: {record.content}",
-        ]
-        for key in ("canonical_summary", "persona_summary", "key_facts", "routine_check_notes", "topics"):
-            value = metadata.get(key)
-            if isinstance(value, list):
-                value = " ".join(str(item) for item in value if item)
-            value_text = clean_text(value, 1000)
-            if value_text:
-                parts.append(f"{key}: {value_text}")
-        if record.evidence:
-            parts.append(f"证据: {record.evidence}")
-        return clean_text("\n".join(parts), max(200, self.config.int("retrieval.embedding_max_text_chars", 1200)))
+        return memory_embedding_text(
+            record,
+            max_chars=max(200, self.config.int("retrieval.embedding_max_text_chars", 1200)),
+        )
 
     def _memory_embedding_text_hash(self, record: MemoryRecord) -> str:
-        text = self._memory_embedding_text(record)
-        if not text:
-            return ""
-        return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+        return memory_embedding_text_hash(
+            record,
+            max_chars=max(200, self.config.int("retrieval.embedding_max_text_chars", 1200)),
+        )
 
     @staticmethod
     def _context_from_memory_record(record: MemoryRecord | None) -> SessionContext:
@@ -3520,6 +3643,8 @@ class MemoryCompanionService:
     def _schedule_session_summary(self, ctx: SessionContext, *, reason: str) -> None:
         if not self.config.bool("memory_summary.enabled", True):
             return
+        if not self._scope_feature_enabled(ctx, "capture"):
+            return
         snapshot = self._snapshot_context(ctx)
         session_id = snapshot.session_id
         if not session_id:
@@ -3558,6 +3683,8 @@ class MemoryCompanionService:
         session_id = ctx.session_id
         current_ctx = ctx
         current_reason = reason
+        if not self._scope_feature_enabled(ctx, "capture"):
+            return
         try:
             while True:
                 memory_id = await self.maybe_summarize_session(current_ctx)
@@ -4629,6 +4756,8 @@ class MemoryCompanionService:
         req.system_prompt = f"{current}\n\n{contract}" if current else contract
 
     def _should_offer_memory_reconstruction(self, ctx: SessionContext) -> bool:
+        if not self._scope_feature_enabled(ctx, "recall"):
+            return False
         if not self.config.bool("memory_reconstruction.enabled", True):
             return False
         if not self.config.bool("memory_tools.enable_reconstruction_tool", True):
@@ -4669,6 +4798,12 @@ class MemoryCompanionService:
         ctx = None
         try:
             ctx = await self.identity.resolve_event_context(event)
+            if not self._scope_feature_enabled(ctx, "capture"):
+                return {
+                    "ok": False,
+                    "error": "scope capture disabled",
+                    "scope": clean_text(ctx.scope, 40),
+                }
             visibility = "internal"
             if ctx.scope == "private":
                 visibility = "private_pair"
@@ -4730,6 +4865,13 @@ class MemoryCompanionService:
         query = clean_text(query, 1000)
         if not query:
             return {"ok": False, "error": "empty query", "memories": []}
+        if not self._scope_feature_enabled(ctx, "recall"):
+            return {
+                "ok": False,
+                "error": "scope recall disabled",
+                "scope": clean_text(ctx.scope, 40),
+                "memories": [],
+            }
         p5_gate = await self._p5_gate(
             event=event,
             sink="memory_recall",
@@ -4794,6 +4936,12 @@ class MemoryCompanionService:
             return {"ok": False, "error": "reconstruction tool disabled"}
 
         ctx = self._normalized_session_context(await self.identity.resolve_event_context(event))
+        if not self._scope_feature_enabled(ctx, "recall"):
+            return {
+                "ok": False,
+                "error": "scope recall disabled",
+                "scope": clean_text(ctx.scope, 40),
+            }
         action = clean_text(action, 40).casefold()
         query = clean_text(query, 1000)
         cue = clean_text(cue, 160)
@@ -6573,6 +6721,11 @@ class MemoryCompanionService:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map={})
             if self.config.bool("memory_injection.debug_log_injection_enabled", False):
                 logger.info("[MemoryCompanion] 记忆注入已关闭: session=%s", ctx.session_id)
+            return
+        if not self._scope_feature_enabled(ctx, "recall"):
+            self._mark_memory_companion_injection_state(
+                event, req, injected=False, conversation_memory=False, slot_map={}
+            )
             return
         p5_gate = await self._p5_gate(event=event, sink="memory_recall")
         if not p5_gate.get("ok"):
@@ -9905,10 +10058,43 @@ class MemoryCompanionService:
                 data = json_loads(self._RELATIONSHIP_PHASE_FILE.read_text(encoding="utf-8"), {})
                 if isinstance(data, dict):
                     self._relationship_phase_state = data
+                    self._cleanup_relationship_phase_state(force=True)
         except Exception:
             pass
 
+    def _cleanup_relationship_phase_state(self, *, force: bool = False) -> None:
+        """Bound persisted relationship state by age and count without touching active state."""
+
+        now = time.time()
+        if not force and now - self._relationship_phase_last_cleanup < 60.0:
+            return
+        self._relationship_phase_last_cleanup = now
+        stale_keys: list[str] = []
+        ranked: list[tuple[float, str]] = []
+        for key, state in self._relationship_phase_state.items():
+            if not isinstance(state, dict):
+                stale_keys.append(key)
+                continue
+            updated_at = clean_text(state.get("updated_at"), 80)
+            timestamp = 0.0
+            if updated_at:
+                try:
+                    timestamp = datetime.fromisoformat(updated_at.replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError, OverflowError):
+                    timestamp = 0.0
+            if timestamp and now - timestamp > self._RELATIONSHIP_PHASE_STATE_TTL:
+                stale_keys.append(key)
+            else:
+                ranked.append((timestamp, key))
+        for key in stale_keys:
+            self._relationship_phase_state.pop(key, None)
+        overflow = len(ranked) - self._RELATIONSHIP_PHASE_STATE_MAX
+        if overflow > 0:
+            for _timestamp, key in sorted(ranked)[:overflow]:
+                self._relationship_phase_state.pop(key, None)
+
     def _save_relationship_phase_state(self) -> None:
+        self._cleanup_relationship_phase_state()
         temp_path = self._RELATIONSHIP_PHASE_FILE.with_suffix(self._RELATIONSHIP_PHASE_FILE.suffix + ".tmp")
         try:
             temp_path.write_text(json_dumps(self._relationship_phase_state), encoding="utf-8")

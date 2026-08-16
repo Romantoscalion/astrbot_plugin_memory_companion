@@ -71,6 +71,49 @@
       }
     }
   },
+  "scope_control": {
+    "description": "私聊 / 群聊开关",
+    "hint": "分别控制私聊和群聊是否捕获新记忆、参与召回，以及是否出现在权限拓扑中。关闭只停止对应能力，不删除已有记忆。",
+    "type": "object",
+    "items": {
+      "private_capture_enabled": {
+        "description": "启用私聊记忆捕获",
+        "hint": "关闭后不再自动记录私聊用户消息、Bot 回复、稳定事实和关系素材；已有私聊记忆仍可管理。",
+        "type": "bool",
+        "default": true
+      },
+      "group_capture_enabled": {
+        "description": "启用群聊记忆捕获",
+        "hint": "关闭后不再记录群聊消息和连续对话素材；已有群聊记忆仍可管理。",
+        "type": "bool",
+        "default": true
+      },
+      "private_recall_enabled": {
+        "description": "启用私聊记忆召回",
+        "hint": "关闭后私聊不会自动注入长期记忆，也不会通过主动回忆工具读取私聊记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "group_recall_enabled": {
+        "description": "启用群聊记忆召回",
+        "hint": "关闭后群聊不会自动注入长期记忆，也不会通过主动回忆工具读取群聊记忆。",
+        "type": "bool",
+        "default": true
+      },
+      "private_topology_enabled": {
+        "description": "私聊参与权限拓扑",
+        "hint": "关闭后私聊窗口不显示在权限拓扑中，相关跨窗口 ACL 不再用于放行。",
+        "type": "bool",
+        "default": true
+      },
+      "group_topology_enabled": {
+        "description": "群聊参与权限拓扑",
+        "hint": "关闭后群聊窗口不显示在权限拓扑中，相关跨窗口 ACL 不再用于放行。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
   "portrait": {
     "description": "统一用户画像",
     "hint": "画像事实、证据、敏感等级和检索前隐私裁决由 Memory 维护；人物身份、关系和私聊权限仍由 Companion 维护。",

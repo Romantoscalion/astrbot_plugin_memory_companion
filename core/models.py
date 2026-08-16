@@ -385,3 +385,42 @@ class SearchResult:
     memory: MemoryRecord
     score: float
     reason: str = ""
+
+
+def memory_embedding_text(record: MemoryRecord, *, max_chars: int = 1200) -> str:
+    """Build the canonical text used for both embedding writes and retrieval validation."""
+
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    parts = [
+        f"类型: {record.memory_type}",
+        f"范围: {record.scope}/{record.visibility}",
+        f"标签: {' '.join(record.tags or [])}",
+        f"内容: {record.content}",
+    ]
+    for key in (
+        "canonical_summary",
+        "persona_summary",
+        "key_facts",
+        "routine_check_notes",
+        "topics",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            value = " ".join(str(item) for item in value if item)
+        value_text = clean_text(value, 1000)
+        if value_text:
+            parts.append(f"{key}: {value_text}")
+    if record.evidence:
+        parts.append(f"证据: {record.evidence}")
+    try:
+        limit = max(200, int(max_chars or 1200))
+    except (TypeError, ValueError):
+        limit = 1200
+    return clean_text("\n".join(parts), limit)
+
+
+def memory_embedding_text_hash(record: MemoryRecord, *, max_chars: int = 1200) -> str:
+    text = memory_embedding_text(record, max_chars=max_chars)
+    if not text:
+        return ""
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()

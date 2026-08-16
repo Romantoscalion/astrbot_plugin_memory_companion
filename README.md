@@ -4,7 +4,7 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`1.9.0`
+- 版本：`1.9.1`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.22.0`
 - 编码要求：UTF-8
@@ -396,6 +396,17 @@ python benchmarks/run_memory_benchmark.py --size 1000 --repeats 5
 ```
 
 输出包含 `hit_at_5`、逐查询命中率、私聊查询中的群聊隐私泄漏数、加载耗时、查询延迟和外部检索模型调用数；`active_reconstruction` 还会报告多跳与时间证据命中、平均步数、工具调用数、估算输出 Token、P95 延迟和未授权召回数。该脚本不代表 Embedding、Rerank、阶段总结或真实主模型决策成本；跨插件比较必须固定相同数据、模型、硬件与配置。
+
+召回质量还有一套离线评测流程，用于在调整评分权重前后对比 recall@k / MRR / hit@1：
+
+```text
+python benchmarks/run_recall_evaluation.py export --db <记忆库路径> --out eval_cases.jsonl
+# 人工标注 eval_cases.jsonl 中每行的 relevant_ids（不应召回的填 ["__none__"]）
+python benchmarks/run_recall_evaluation.py evaluate --db <记忆库路径> --cases eval_cases.jsonl --top-k 6
+python benchmarks/run_recall_evaluation.py synthetic   # 无生产数据时的自检
+```
+
+`export` 与 `evaluate` 均以只读方式打开数据库，不会改动访问计数。
 
 ## LivingMemory 迁移
 

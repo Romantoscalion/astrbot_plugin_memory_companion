@@ -5,7 +5,9 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,11 +17,10 @@ try:
 except ImportError:
     from package_bootstrap import bootstrap_package
 
-
 ROOT = bootstrap_package()
 
 from astrbot_plugin_memory_companion.core.bridge import MemoryCompanionBridge
-from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
+from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext, utc_now
 from astrbot_plugin_memory_companion.core.service import MemoryCompanionService
 from astrbot_plugin_memory_companion.core.summarizer import MemorySummarizer
 
@@ -62,6 +63,60 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addCleanup(service.close)
         return service
+
+    async def test_bot_response_capture_is_idempotent_for_replayed_events(self) -> None:
+        service = self.make_service({"memory_summary": {"enabled": False}})
+        ctx = SessionContext(
+            session_id="qq:FriendMessage:u1",
+            scope="private",
+            platform="qq",
+            user_id="u1",
+            user_name="用户",
+            bot_id="b1",
+            message_id="incoming-42",
+            message_text="你在吗",
+        )
+
+        async def resolve_event_context(_event):
+            return ctx
+
+        service.identity.resolve_event_context = resolve_event_context
+        event = SimpleNamespace()
+        response = SimpleNamespace(role="assistant", completion_text="我在，刚好看到你的消息。")
+
+        await service.handle_llm_response(event, response)
+        await service.handle_llm_response(event, response)
+
+        rows = await service.store.recent_timeline(
+            limit=10,
+            scope=ctx.scope,
+            session_id=ctx.session_id,
+            entity_id=ctx.current_target_id,
+        )
+        bot_rows = [row for row in rows if row.get("event_type") == "bot_response"]
+        self.assertEqual(1, len(bot_rows))
+        self.assertEqual("incoming-42", json.loads(bot_rows[0]["metadata"])["message_id"])
+
+    async def test_runtime_state_cleanup_removes_expired_session_and_relationship_entries(self) -> None:
+        service = self.make_service()
+        now = time.time()
+        service._emotional_event_queue = {
+            "expired": [{"id": "old", "ts": now - service._EMOTIONAL_EVENT_TTL - 1}],
+            "empty": [],
+            "fresh": [{"id": "new", "ts": now}],
+        }
+        service._cleanup_emotional_event_queue(now=now)
+        self.assertNotIn("expired", service._emotional_event_queue)
+        self.assertNotIn("empty", service._emotional_event_queue)
+        self.assertIn("fresh", service._emotional_event_queue)
+
+        old = datetime.now(timezone.utc) - timedelta(days=181)
+        service._relationship_phase_state = {
+            "old": {"updated_at": old.isoformat()},
+            "fresh": {"updated_at": utc_now()},
+        }
+        service._cleanup_relationship_phase_state(force=True)
+        self.assertEqual({"fresh"}, set(service._relationship_phase_state))
 
     async def test_async_close_finishes_background_cancellation_before_store_close(self) -> None:
         service = self.make_service()

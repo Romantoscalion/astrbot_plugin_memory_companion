@@ -4,13 +4,19 @@ import math
 import re
 import inspect
 import asyncio
-import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .identity import session_target_id
 from .memory_lifecycle import apply_lifecycle_score, evaluate_memory_lifecycle
-from .models import MemoryRecord, SearchResult, SessionContext, clean_text
+from .models import (
+    MemoryRecord,
+    SearchResult,
+    SessionContext,
+    clean_text,
+    memory_embedding_text,
+    memory_embedding_text_hash,
+)
 from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
 
 from .store import MemoryStore
@@ -20,6 +26,10 @@ from .visibility import VisibilityPolicy
 
 class RetrievalEngine:
     DEFAULT_MATERIALIZE_LIMIT = 2000
+    # Recall sources that were selected because of the query itself. The
+    # importance-priority and current-window scans are session state, not query
+    # evidence, so they stay out of IDF statistics and route agreement.
+    _QUERY_AWARE_ROUTE_SOURCES = frozenset({"fts", "keyword", "vector", "time_window"})
     def __init__(
         self,
         store: MemoryStore,
@@ -44,6 +54,8 @@ class RetrievalEngine:
         keyword_fallback_min_fts_candidates: int = 80,
         knowledge_graph_enabled: bool = True,
         knowledge_graph_expansion_limit: int = 12,
+        private_topology_enabled: bool = True,
+        group_topology_enabled: bool = True,
         usage_recorder: Any | None = None,
     ):
         self.store = store
@@ -72,6 +84,8 @@ class RetrievalEngine:
         )
         self.knowledge_graph_enabled = bool(knowledge_graph_enabled)
         self.knowledge_graph_expansion_limit = max(0, int(knowledge_graph_expansion_limit or 0))
+        self.private_topology_enabled = bool(private_topology_enabled)
+        self.group_topology_enabled = bool(group_topology_enabled)
         self.usage_recorder = usage_recorder if callable(usage_recorder) else None
         self._rank_path_info: dict[str, Any] = {}
         self.last_path_info: dict[str, Any] = {
@@ -82,6 +96,8 @@ class RetrievalEngine:
             "embedding_enabled": self.embedding_enabled,
             "embedding_provider_id": self.embedding_provider_id,
             "embedding_reason": "not_started",
+            "private_topology_enabled": self.private_topology_enabled,
+            "group_topology_enabled": self.group_topology_enabled,
         }
 
     async def search(
@@ -464,15 +480,17 @@ class RetrievalEngine:
         anchors = self._rerank_anchor_results(query_text, pool, final_limit)
         merged: list[SearchResult] = []
         seen: set[str] = set()
-        for item in [*anchors, *reranked]:
+        for item in [*reranked, *pool]:
             memory_id = item.memory.id
             if memory_id and memory_id in seen:
                 continue
             if memory_id:
                 seen.add(memory_id)
             merged.append(item)
-        tail = [item for item in pool if not item.memory.id or item.memory.id not in seen]
         rest = ranked[pool_size:]
+        anchor_floor_applied = self._apply_anchor_floor(
+            merged, anchors, reranked, max(1, int(final_limit or 1))
+        )
         self.last_path_info = {
             "mode": self.retrieval_mode,
             "path": "rerank",
@@ -483,10 +501,71 @@ class RetrievalEngine:
             "rerank_filtered": filtered_count,
             "reranked_count": len(reranked),
             "lexical_anchors": len(anchors),
+            "anchor_floor_applied": anchor_floor_applied,
             **request_shape,
             **self._rank_path_info,
         }
-        return merged + tail + rest
+        return merged + rest
+
+    def _apply_anchor_floor(
+        self,
+        merged: list[SearchResult],
+        anchors: list[SearchResult],
+        reranked: list[SearchResult],
+        final_limit: int,
+    ) -> int:
+        """Keep strong lexical matches inside the top-k window without letting
+        them outrank the rerank model.
+
+        Anchors used to be prepended, which locked the final order to lexical
+        matching whenever an anchor existed. Now they only act as a floor: an
+        anchor that the model pushed out of the window is swapped back into the
+        weakest slot, evicting the least supported non-anchor row.
+        """
+
+        if not anchors or len(merged) <= final_limit:
+            return 0
+        anchor_ids = {item.memory.id for item in anchors if item.memory.id}
+        top = merged[:final_limit]
+        tail = merged[final_limit:]
+        top_ids = {item.memory.id for item in top if item.memory.id}
+        missing = [item for item in anchors if item.memory.id and item.memory.id not in top_ids]
+        if not missing:
+            return 0
+        reranked_ids = {item.memory.id for item in reranked if item.memory.id}
+        evictable = [
+            item
+            for item in top
+            if not item.memory.id or item.memory.id not in anchor_ids
+        ]
+        # Evict rows the model did not return first (no rerank support at all),
+        # then the lowest combined score.
+        evictable.sort(
+            key=lambda item: (
+                1 if (item.memory.id and item.memory.id in reranked_ids) else 0,
+                item.score,
+            )
+        )
+        evicted: list[SearchResult] = []
+        applied = 0
+        for anchor, victim in zip(missing, evictable):
+            index = next(position for position, item in enumerate(top) if item is victim)
+            top[index] = anchor
+            evicted.append(victim)
+            applied += 1
+        # The swapped-in anchor may still sit later in the tail; rebuild once
+        # so the window, the evicted rows, and the tail stay duplicate free.
+        deduped: list[SearchResult] = []
+        seen_ids: set[str] = set()
+        for item in [*top, *evicted, *tail]:
+            memory_id = item.memory.id
+            if memory_id and memory_id in seen_ids:
+                continue
+            if memory_id:
+                seen_ids.add(memory_id)
+            deduped.append(item)
+        merged[:] = deduped
+        return applied
 
     def _rerank_anchor_results(
         self,
@@ -663,20 +742,34 @@ class RetrievalEngine:
             return []
         max_score = max(score for _index, _item, score in scored)
         min_score = min(score for _index, _item, score in scored)
-        ranked: list[SearchResult] = []
-        for rank_index, item, score in sorted(scored, key=lambda row: (-row[2], row[0])):
+        local_min = min((item.score for item in pool), default=0.0)
+        local_max = max((item.score for item in pool), default=0.0)
+        # Convex combination instead of additive stacking: the local score
+        # already contains vector similarity and importance, so adding the
+        # rerank score on top counted semantic relevance twice. Equal weights
+        # let the model reorder weak lexical leaders while anchored matches are
+        # still protected by the anchor floor.
+        combined_rows: list[tuple[float, int, SearchResult, float]] = []
+        for rank_index, item, score in scored:
             if max_score > min_score:
-                normalized = (score - min_score) / (max_score - min_score)
+                rerank_norm = (score - min_score) / (max_score - min_score)
             else:
-                normalized = 1.0 - (rank_index / max(1, len(scored) - 1)) if len(scored) > 1 else 1.0
-            ranked.append(
-                SearchResult(
-                    memory=item.memory,
-                    score=float(item.score) + (0.75 * max(0.0, min(1.0, normalized))),
-                    reason=f"{item.reason};retrieval_path=rerank;rerank_score={score:.4g}",
-                )
+                rerank_norm = 1.0 - (rank_index / max(1, len(scored) - 1)) if len(scored) > 1 else 1.0
+            if local_max > local_min:
+                local_norm = (item.score - local_min) / (local_max - local_min)
+            else:
+                local_norm = 0.5
+            combined = (0.5 * local_norm) + (0.5 * max(0.0, min(1.0, rerank_norm)))
+            combined_rows.append((combined, rank_index, item, score))
+        combined_rows.sort(key=lambda row: (-row[0], row[1]))
+        return [
+            SearchResult(
+                memory=item.memory,
+                score=combined,
+                reason=f"{item.reason};retrieval_path=rerank;rerank_score={raw_score:.4g};combined={combined:.4g}",
             )
-        return ranked
+            for combined, _rank_index, item, raw_score in combined_rows
+        ]
 
     def _extract_rerank_items(self, rerank_resp: Any) -> list[Any]:
         if rerank_resp is None:
@@ -766,6 +859,17 @@ class RetrievalEngine:
             parts.append(f"标签: {' '.join(tags)}")
         if content:
             parts.append(f"内容: {content}")
+        # Summaries carry their factual core in metadata; the reranker sees at
+        # least as much as the embedding channel does.
+        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        canonical = clean_text(metadata.get("canonical_summary"), 400)
+        if canonical:
+            parts.append(f"要点: {canonical}")
+        key_facts = metadata.get("key_facts")
+        if isinstance(key_facts, list):
+            facts_text = " ".join(clean_text(fact, 160) for fact in key_facts if clean_text(fact, 160))
+            if facts_text:
+                parts.append(f"事实: {facts_text[:400]}")
         if evidence:
             parts.append(f"证据: {evidence}")
         return clean_text("\n".join(parts), 1200)
@@ -1079,33 +1183,45 @@ class RetrievalEngine:
             )
         expanded_terms = self._merge_terms(terms, graph_terms)
         include_pending = not self.policy.hide_pending_review
-        # Keep the broad priority scan explicitly bounded.
-        ranked_candidates = await self.store.list_candidate_memories(
-            limit=self.DEFAULT_MATERIALIZE_LIMIT,
-            include_pending=include_pending,
-        )
-        current_window_candidates = await self.store.list_current_window_candidate_memories(
-            scope=ctx.scope,
-            session_id=ctx.session_id,
-            user_id=ctx.user_id,
-            group_id=ctx.group_id,
-            limit=self.current_window_candidate_limit,
-            include_pending=include_pending,
-        )
-        time_window_candidates: list[MemoryRecord] = []
+        keyword_terms = self._keyword_candidate_terms(query, expanded_terms)
+
+        # These reads do not depend on one another. Running them together lets
+        # the embedding provider's network wait overlap the store reads while
+        # preserving the same candidate sources and merge order below.
+        time_window_task = None
         if time_intent is not None and time_intent.active:
-            time_window_candidates = await self.store.list_time_window_candidate_memories(
+            time_window_task = self.store.list_time_window_candidate_memories(
                 time_intent.start_at,
                 time_intent.end_at,
                 limit=1600,
                 include_pending=include_pending,
             )
-        keyword_terms = self._keyword_candidate_terms(query, expanded_terms)
-        fts_candidates = await self.store.list_fts_candidate_memories(
-            keyword_terms,
-            limit=1200,
-            include_pending=include_pending,
+        ranked_candidates, current_window_candidates, fts_candidates, vector_result, time_result = await asyncio.gather(
+            self.store.list_candidate_memories(
+                limit=self.DEFAULT_MATERIALIZE_LIMIT,
+                include_pending=include_pending,
+            ),
+            self.store.list_current_window_candidate_memories(
+                scope=ctx.scope,
+                session_id=ctx.session_id,
+                user_id=ctx.user_id,
+                group_id=ctx.group_id,
+                limit=self.current_window_candidate_limit,
+                include_pending=include_pending,
+            ),
+            self.store.list_fts_candidate_memories(
+                keyword_terms,
+                limit=1200,
+                include_pending=include_pending,
+            ),
+            self._embedding_candidate_memories(
+                query,
+                include_pending=include_pending,
+            ),
+            time_window_task if time_window_task is not None else asyncio.sleep(0, result=[]),
         )
+        vector_candidates, vector_scores, embedding_info = vector_result
+        time_window_candidates = time_result
         use_keyword_fallback = len(fts_candidates) < self.keyword_fallback_min_fts_candidates
         keyword_candidates = (
             await self.store.list_keyword_candidate_memories(
@@ -1115,10 +1231,6 @@ class RetrievalEngine:
             )
             if use_keyword_fallback
             else []
-        )
-        vector_candidates, vector_scores, embedding_info = await self._embedding_candidate_memories(
-            query,
-            include_pending=include_pending,
         )
         self._rank_path_info = embedding_info
         self._rank_path_info.update(
@@ -1178,7 +1290,26 @@ class RetrievalEngine:
                 key = clean_text(prefilter_reason or "not_visible", 180)
                 prefiltered[key] = prefiltered.get(key, 0) + 1
         profile = self._query_profile(query, expanded_terms)
-        term_stats = self._term_document_stats([memory for memory, _reason in searchable], expanded_terms)
+        # IDF must describe the query-aware candidate pool (FTS/keyword/vector/
+        # time-window hits). Counting the importance-priority scan in the
+        # denominator lets unrelated high-importance rows dilute term weights.
+        query_aware_ids = {
+            memory_id
+            for memory_id, sources in candidate_sources.items()
+            if sources & self._QUERY_AWARE_ROUTE_SOURCES
+        }
+        term_pool = [
+            memory
+            for memory, _reason in searchable
+            if clean_text(memory.id, 120) in query_aware_ids
+        ]
+        if not term_pool:
+            term_pool = [memory for memory, _reason in searchable]
+        term_stats = self._term_document_stats(term_pool, expanded_terms)
+        route_families_by_id = {
+            memory_id: self._route_families(sources)
+            for memory_id, sources in candidate_sources.items()
+        }
         results: list[SearchResult] = []
         blocked: list[dict[str, str]] = []
         if prefiltered:
@@ -1207,6 +1338,7 @@ class RetrievalEngine:
                 term_stats,
                 vector_score=vector_score,
                 reciprocal_rank_score=reciprocal_rank_scores.get(clean_text(memory.id, 120), 0.0),
+                route_families=route_families_by_id.get(clean_text(memory.id, 120), frozenset()),
             )
             if score <= 0:
                 if len(blocked) < 40:
@@ -1477,29 +1609,10 @@ class RetrievalEngine:
         return max(-1.0, min(1.0, float(score)))
 
     def _embedding_document_text(self, memory: MemoryRecord) -> str:
-        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
-        parts = [
-            f"类型: {memory.memory_type}",
-            f"范围: {memory.scope}/{memory.visibility}",
-            f"标签: {' '.join(memory.tags or [])}",
-            f"内容: {memory.content}",
-        ]
-        for key in ("canonical_summary", "persona_summary", "key_facts", "topics"):
-            value = metadata.get(key)
-            if isinstance(value, list):
-                value = " ".join(str(item) for item in value if item)
-            value_text = clean_text(value, 1000)
-            if value_text:
-                parts.append(f"{key}: {value_text}")
-        if memory.evidence:
-            parts.append(f"证据: {memory.evidence}")
-        return clean_text("\n".join(parts), self.embedding_max_text_chars)
+        return memory_embedding_text(memory, max_chars=self.embedding_max_text_chars)
 
     def _embedding_text_hash(self, memory: MemoryRecord) -> str:
-        text = self._embedding_document_text(memory)
-        if not text:
-            return ""
-        return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+        return memory_embedding_text_hash(memory, max_chars=self.embedding_max_text_chars)
 
     def _keyword_candidate_terms(self, query: str, terms: list[str]) -> list[str]:
         keyword_terms = list(terms)
@@ -2255,6 +2368,14 @@ class RetrievalEngine:
         policies = await self.store.list_acl_policies()
         allow_pairs: set[tuple[str, str, str, str]] = set()
         deny_pairs: set[tuple[str, str, str, str]] = set()
+        disabled_scopes = {
+            scope
+            for scope, enabled in (
+                ("private", self.private_topology_enabled),
+                ("group", self.group_topology_enabled),
+            )
+            if not enabled
+        }
         for rule in rules:
             owner_scope = clean_text(rule.get("owner_scope"), 40)
             owner_id = clean_text(rule.get("owner_id"), 160)
@@ -2262,6 +2383,8 @@ class RetrievalEngine:
             reader_id = clean_text(rule.get("reader_id"), 160)
             effect = "deny" if clean_text(rule.get("effect"), 20).lower() == "deny" else "allow"
             if not (owner_scope and owner_id and reader_scope and reader_id):
+                continue
+            if owner_scope in disabled_scopes or reader_scope in disabled_scopes:
                 continue
             pair = (owner_scope, owner_id, reader_scope, reader_id)
             if effect == "deny":
@@ -2274,14 +2397,21 @@ class RetrievalEngine:
             window_id = clean_text(policy.get("window_id"), 160)
             if not scope or not window_id:
                 continue
+            if scope in disabled_scopes:
+                continue
             policy_map[(scope, window_id)] = {
                 "read_mode": self._normalize_acl_mode(policy.get("read_mode")),
                 "share_mode": self._normalize_acl_mode(policy.get("share_mode")),
             }
-        return {"allow": allow_pairs, "deny": deny_pairs, "policies": policy_map}
+        return {
+            "allow": allow_pairs,
+            "deny": deny_pairs,
+            "policies": policy_map,
+            "disabled_scopes": disabled_scopes,
+        }
 
     def _empty_acl_state(self) -> dict[str, object]:
-        return {"allow": set(), "deny": set(), "policies": {}}
+        return {"allow": set(), "deny": set(), "policies": {}, "disabled_scopes": set()}
 
     def _acl_deny_reason(
         self,
@@ -2293,6 +2423,9 @@ class RetrievalEngine:
         reader = self._reader_window(ctx)
         if not owner or not reader or owner == reader:
             return ""
+        disabled_scopes = acl_state.get("disabled_scopes", set())
+        if owner[0] in disabled_scopes or reader[0] in disabled_scopes:
+            return f"topology_disabled:{owner[0]}:{owner[1]}->{reader[0]}:{reader[1]}"
         deny_pairs = acl_state.get("deny", set())
         pair = (owner[0], owner[1], reader[0], reader[1])
         if pair in deny_pairs:
@@ -2311,6 +2444,9 @@ class RetrievalEngine:
         owner = self._memory_owner(memory)
         reader = self._reader_window(ctx)
         if not owner or not reader or owner == reader:
+            return ""
+        disabled_scopes = acl_state.get("disabled_scopes", set())
+        if owner[0] in disabled_scopes or reader[0] in disabled_scopes:
             return ""
         pair = (owner[0], owner[1], reader[0], reader[1])
         deny_pairs = acl_state.get("deny", set())
@@ -2728,6 +2864,25 @@ class RetrievalEngine:
             ]
         ).lower()
 
+    @staticmethod
+    def _route_families(sources: set[str]) -> frozenset[str]:
+        families: set[str] = set()
+        if sources & {"fts", "keyword"}:
+            families.add("lexical")
+        if "vector" in sources:
+            families.add("vector")
+        if "time_window" in sources:
+            families.add("time")
+        return frozenset(families)
+
+    @staticmethod
+    def _route_agreement_bonus(route_families: frozenset[str]) -> float:
+        # Agreement between independent recall channels (lexical + vector,
+        # optionally time) is stronger evidence than any single channel.
+        if len(route_families) < 2:
+            return 0.0
+        return min(0.12, 0.08 * (len(route_families) - 1))
+
     def _score(
         self,
         memory: MemoryRecord,
@@ -2738,6 +2893,7 @@ class RetrievalEngine:
         *,
         vector_score: float = 0.0,
         reciprocal_rank_score: float = 0.0,
+        route_families: frozenset[str] = frozenset(),
     ) -> tuple[float, str]:
         haystack = self._haystack(memory)
         compact_haystack = re.sub(r"\s+", "", haystack)
@@ -2790,6 +2946,7 @@ class RetrievalEngine:
         age_bonus = self._recency_bonus(memory.occurred_at or memory.created_at)
         persona_bonus = self._persona_relevance_bonus(memory, profile)
         dynamics_bonus = self._persona_dynamics_bonus(memory, profile)
+        route_bonus = self._route_agreement_bonus(route_families)
         vector_bonus = 0.0
         if vector_relevant:
             if self.embedding_score_threshold < 1.0:
@@ -2798,9 +2955,14 @@ class RetrievalEngine:
                 normalized_vector = vector_score
             vector_bonus = self.embedding_weight * max(0.0, min(1.0, normalized_vector))
         rrf_bonus = min(0.55, max(0.0, float(reciprocal_rank_score)) * 12.0)
-        score = lexical + scope_bonus + memory.importance * 0.55 + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + rrf_bonus
+        # Importance should not let unrelated high-priority rows crowd out
+        # query-supported memories.  Strong lexical/profile evidence keeps
+        # the historical weight; weak single-channel candidates are damped.
+        strong_query_evidence = exact_hit or profile_hit or (vector_relevant and term_hits >= min_hits)
+        importance_weight = 0.55 if strong_query_evidence else 0.28
+        score = lexical + scope_bonus + memory.importance * importance_weight + memory.confidence * 0.25 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
         if not terms:
-            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + rrf_bonus
+            score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
         lifecycle = evaluate_memory_lifecycle(memory, ctx)
         score = apply_lifecycle_score(score, lifecycle)
         return score, (
@@ -2810,6 +2972,7 @@ class RetrievalEngine:
             f"dynamics={dynamics_bonus:.2f};recency={age_bonus:.2f};"
             f"decay={lifecycle.decay_factor:.3f};salience={lifecycle.salience:.2f};"
             f"reinforcement={lifecycle.reinforcement:.2f};{lifecycle.reason}"
+            f"routes={'+'.join(sorted(route_families)) or '-'};route_bonus={route_bonus:.2f}"
         )
 
     @staticmethod

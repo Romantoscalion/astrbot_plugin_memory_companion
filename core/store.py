@@ -26,6 +26,7 @@ from .memory_atom import (
     validity_where_clause,
 )
 from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads, new_id, stable_fingerprint, utc_now
+from .models import memory_embedding_text_hash
 from .portrait import cross_scene_whitelisted_fact
 from .profile_quality import normalize_profile_value, profile_quality_decision
 from .portrait_namespace import portrait_scope_kind, portrait_scope_persona
@@ -10264,12 +10265,34 @@ class MemoryStore:
         provider_id: str,
         limit: int = 80,
         include_pending: bool = False,
+        embedding_max_text_chars: int = 1200,
     ) -> list[MemoryRecord]:
         return await self._run_recoverable_database_operation(
             self._list_memories_missing_embeddings_sync,
             provider_id,
             limit,
             include_pending,
+            embedding_max_text_chars,
+        )
+
+    async def scan_memories_missing_embeddings(
+        self,
+        *,
+        provider_id: str,
+        limit: int = 80,
+        include_pending: bool = False,
+        embedding_max_text_chars: int = 1200,
+        offset: int = 0,
+    ) -> tuple[list[MemoryRecord], int, bool]:
+        """Scan one bounded window and return (stale records, next offset, exhausted)."""
+
+        return await self._run_recoverable_database_operation(
+            self._scan_memories_missing_embeddings_sync,
+            provider_id,
+            limit,
+            include_pending,
+            embedding_max_text_chars,
+            offset,
         )
 
     def _list_memories_missing_embeddings_sync(
@@ -10277,29 +10300,69 @@ class MemoryStore:
         provider_id: str,
         limit: int,
         include_pending: bool,
+        embedding_max_text_chars: int,
     ) -> list[MemoryRecord]:
+        result, _next_offset, _exhausted = self._scan_memories_missing_embeddings_sync(
+            provider_id,
+            limit,
+            include_pending,
+            embedding_max_text_chars,
+            0,
+        )
+        return result
+
+    def _scan_memories_missing_embeddings_sync(
+        self,
+        provider_id: str,
+        limit: int,
+        include_pending: bool,
+        embedding_max_text_chars: int,
+        offset: int,
+    ) -> tuple[list[MemoryRecord], int, bool]:
         provider_id = clean_text(provider_id, 160)
         if not provider_id:
-            return []
+            return [], 0, True
         where = "m.lifecycle != 'archived'"
         params: list[Any] = [provider_id]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
+        safe_limit = max(1, int(limit or 1))
+        # Hash validation is intentionally done in Python because SQLite cannot
+        # evaluate the canonical embedding document. Keep the scan bounded; the
+        # existing importance/time ordering brings recently changed memories into
+        # the next backfill pass first.
+        scan_limit = max(safe_limit, min(2000, safe_limit * 8))
         with self._lock:
             rows = self._conn.execute(
                 f"""
                 SELECT m.*
+                    ,e.text_hash AS embedding_text_hash
                 FROM memories m
                 LEFT JOIN memory_embeddings e
                   ON e.memory_id=m.id AND e.provider_id=?
                 WHERE {where}
-                  AND (e.memory_id IS NULL OR e.text_hash='')
-                ORDER BY m.importance DESC, COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
-                LIMIT ?
+                  ORDER BY m.importance DESC, COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
+                  LIMIT ?
+                  OFFSET ?
                 """,
-                params + [max(1, int(limit or 1))],
+                params + [scan_limit, max(0, int(offset or 0))],
             ).fetchall()
-        return [MemoryRecord.from_row(row) for row in rows]
+        result: list[MemoryRecord] = []
+        processed = 0
+        for processed, row in enumerate(rows, start=1):
+            record = MemoryRecord.from_row(row)
+            stored_hash = clean_text(row["embedding_text_hash"], 80)
+            expected_hash = memory_embedding_text_hash(
+                record,
+                max_chars=embedding_max_text_chars,
+            )
+            if not stored_hash or stored_hash != expected_hash:
+                result.append(record)
+                if len(result) >= safe_limit:
+                    break
+        next_offset = max(0, int(offset or 0)) + processed
+        exhausted = processed >= len(rows) and len(rows) < scan_limit
+        return result, next_offset, exhausted
 
     async def mark_accessed(self, memory_ids: list[str]) -> None:
         await asyncio.to_thread(self._mark_accessed_sync, memory_ids)

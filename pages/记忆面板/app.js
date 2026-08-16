@@ -206,6 +206,14 @@ const state = {
   qqHistoryCapabilities: null,
   qqHistoryCapabilitiesLoading: false,
   memoryAuditBatch: null,
+  scopeControl: {
+    private_capture_enabled: true,
+    group_capture_enabled: true,
+    private_recall_enabled: true,
+    group_recall_enabled: true,
+    private_topology_enabled: true,
+    group_topology_enabled: true,
+  },
 };
 
 const DEFAULT_THEME = "yuebai";
@@ -553,8 +561,76 @@ async function loadConfiguredTheme() {
   try {
     const data = await apiGet("/context/config");
     applyTheme(data.appearance?.theme_key || data.appearance?.theme);
+    state.scopeControl = {
+      ...state.scopeControl,
+      ...(data.scope_control || {}),
+    };
+    renderScopeControls();
   } catch (error) {
     applyTheme(DEFAULT_THEME);
+    renderScopeControls();
+  }
+}
+
+function scopeControlStatus(key) {
+  return state.scopeControl[key] ? "已启用" : "已停用";
+}
+
+function renderScopeControlHost(host, keys) {
+  if (!host) return;
+  host.innerHTML = `
+    <div class="scope-control-grid">
+      ${keys.map((item) => `
+        <label class="scope-control-item">
+          <span>${escapeHtml(item.label)}<small data-scope-status="${escapeHtml(item.key)}">${scopeControlStatus(item.key)}</small></span>
+          <input type="checkbox" data-scope-control="${escapeHtml(item.key)}"${state.scopeControl[item.key] ? " checked" : ""} />
+        </label>
+      `).join("")}
+    </div>
+  `;
+  host.querySelectorAll("input[data-scope-control]").forEach((input) => {
+    input.addEventListener("change", () => updateScopeControl(input));
+  });
+}
+
+function renderScopeControls() {
+  renderScopeControlHost($("#groupScopeControl"), [
+    { key: "group_capture_enabled", label: "记录" },
+    { key: "group_recall_enabled", label: "召回" },
+  ]);
+  renderScopeControlHost($("#privateScopeControl"), [
+    { key: "private_capture_enabled", label: "记录" },
+    { key: "private_recall_enabled", label: "召回" },
+  ]);
+  renderScopeControlHost($("#privateLegacyScopeControl"), [
+    { key: "private_capture_enabled", label: "记录" },
+    { key: "private_recall_enabled", label: "召回" },
+  ]);
+  renderScopeControlHost($("#topologyScopeControl"), [
+    { key: "group_topology_enabled", label: "群聊参与" },
+    { key: "private_topology_enabled", label: "私聊参与" },
+  ]);
+}
+
+async function updateScopeControl(input) {
+  const key = input?.dataset?.scopeControl || "";
+  if (!key || !(key in state.scopeControl) || input.disabled) return;
+  const previous = Boolean(state.scopeControl[key]);
+  const next = Boolean(input.checked);
+  input.disabled = true;
+  try {
+    await apiPost("/config/module/update", { module: "scope_control", values: { [key]: next } });
+    state.scopeControl[key] = next;
+    renderScopeControls();
+    if (key.endsWith("_topology_enabled")) {
+      await loadAclTopology();
+    }
+    showToast(`${next ? "已启用" : "已停用"} ${key.startsWith("group_") ? "群聊" : "私聊"}${key.includes("capture") ? "记录" : key.includes("recall") ? "召回" : "拓扑参与"}`);
+  } catch (error) {
+    input.checked = previous;
+    showToast(error?.message || "开关保存失败", "error");
+  } finally {
+    input.disabled = false;
   }
 }
 

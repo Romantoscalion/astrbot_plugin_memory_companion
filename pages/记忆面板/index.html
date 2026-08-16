@@ -17,7 +17,7 @@
       document.documentElement.dataset.overviewLayout = layout;
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=1.9.0-ui-v2" />
+  <link rel="stylesheet" href="./app.css?v=1.9.1-ui-v2" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -204,6 +204,7 @@
                 <p id="groupMemoryHint">查看群聊范围内可被召回和管理的结构化记忆。</p>
               </div>
               <div class="section-actions scoped-clear-actions">
+                <div id="groupScopeControl" class="scope-control-host"></div>
                 <button id="clearCurrentGroupMemoryBtn" class="danger subtle" type="button" disabled>清空当前群</button>
                 <div class="group-member-clear">
                   <input id="clearGroupMemberUserId" type="text" inputmode="numeric" placeholder="群成员 QQ" disabled />
@@ -241,7 +242,10 @@
                 <h3 id="userMemoryTitle">用户档案与记忆</h3>
                 <p id="userMemoryHint">选择左侧用户后，在同一工作区查看私聊、画像、偏好和关系记忆。</p>
               </div>
-              <button id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>
+              <div class="section-actions">
+                <div id="privateScopeControl" class="scope-control-host"></div>
+                <button id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>
+              </div>
             </div>
             <div class="user-memory-filter" role="tablist" aria-label="用户记忆分类">
               <button class="is-active" data-user-memory-filter="all" type="button" role="tab" aria-selected="true">全部</button>
@@ -269,7 +273,10 @@
                 <h3 id="privateMemoryTitle">私聊记忆</h3>
                 <p id="privateMemoryHint">查看私聊范围内的对话、偏好、事实和稳定记忆。</p>
               </div>
-              <span class="compatibility-note">此旧入口已合并到“用户档案与记忆”。</span>
+              <div class="section-actions">
+                <div id="privateLegacyScopeControl" class="scope-control-host"></div>
+                <span class="compatibility-note">此旧入口已合并到“用户档案与记忆”。</span>
+              </div>
             </div>
             <div id="privateMemoryList" class="row-list"></div>
           </section>
@@ -464,7 +471,10 @@ Bot: 12-14 15:10:30
                 </div>
               </section>
               <section class="archive-section" data-archive-section="topology">
-                <h4>权限拓扑</h4>
+                <div class="archive-section-head">
+                  <h4>权限拓扑</h4>
+                  <div id="topologyScopeControl" class="scope-control-host"></div>
+                </div>
                 <div id="aclTopologyContainer" class="acl-topology-container"></div>
               </section>
             </div>
@@ -485,6 +495,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=1.9.0-ui-v2"></script>
+  <script src="./app.js?v=1.9.1-ui-v2"></script>
 </body>
 </html>

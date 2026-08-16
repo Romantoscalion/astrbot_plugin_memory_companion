@@ -808,6 +808,18 @@ class PluginPageApi:
         """Return all windows, ACL rules and policies in one shot for topology visualization."""
         try:
             store = self.plugin.service.store
+            scope_control = {
+                "private_capture_enabled": self.plugin.service.config.bool("scope_control.private_capture_enabled", True),
+                "group_capture_enabled": self.plugin.service.config.bool("scope_control.group_capture_enabled", True),
+                "private_recall_enabled": self.plugin.service.config.bool("scope_control.private_recall_enabled", True),
+                "group_recall_enabled": self.plugin.service.config.bool("scope_control.group_recall_enabled", True),
+                "private_topology_enabled": self.plugin.service.config.bool("scope_control.private_topology_enabled", True),
+                "group_topology_enabled": self.plugin.service.config.bool("scope_control.group_topology_enabled", True),
+            }
+            topology_scopes = {
+                scope for scope in ("private", "group")
+                if scope_control[f"{scope}_topology_enabled"]
+            }
             buckets = await store.list_memory_buckets(
                 limit=200,
                 include_raw_events=self.plugin.service.config.bool(
@@ -819,7 +831,7 @@ class PluginPageApi:
             for b in buckets:
                 scope = clean_text(b.get("scope"), 40)
                 tid = clean_text(b.get("target_id"), 160)
-                if scope in ("group", "private") and tid:
+                if scope in topology_scopes and tid:
                     windows.append({
                         "scope": scope,
                         "id": tid,
@@ -833,6 +845,7 @@ class PluginPageApi:
             rules = await store.list_acl_rules(enabled_only=False)
             policies = await store.list_acl_policies()
             return self._ok({
+                "scope_control": scope_control,
                 "windows": windows,
                 "rules": [
                     {
@@ -845,6 +858,8 @@ class PluginPageApi:
                         "enabled": bool(r.get("enabled", True)),
                     }
                     for r in rules
+                    if clean_text(r.get("owner_scope"), 40) in topology_scopes
+                    and clean_text(r.get("reader_scope"), 40) in topology_scopes
                 ],
                 "policies": [
                     {
@@ -854,6 +869,7 @@ class PluginPageApi:
                         "share_mode": p.get("share_mode") or ("blacklist" if clean_text(p.get("window_scope"), 40) == "group" else "whitelist"),
                     }
                     for p in policies
+                    if clean_text(p.get("window_scope"), 40) in topology_scopes
                 ],
             })
         except Exception as exc:
@@ -1333,6 +1349,14 @@ class PluginPageApi:
                     "group_actor_relevance_guard_enabled": config.bool(
                         "conversation_memory.group_actor_relevance_guard_enabled", True
                     ),
+                },
+                "scope_control": {
+                    "private_capture_enabled": config.bool("scope_control.private_capture_enabled", True),
+                    "group_capture_enabled": config.bool("scope_control.group_capture_enabled", True),
+                    "private_recall_enabled": config.bool("scope_control.private_recall_enabled", True),
+                    "group_recall_enabled": config.bool("scope_control.group_recall_enabled", True),
+                    "private_topology_enabled": config.bool("scope_control.private_topology_enabled", True),
+                    "group_topology_enabled": config.bool("scope_control.group_topology_enabled", True),
                 },
                 "provider_options": self._provider_options(),
                 "rerank_provider_options": await self._rerank_provider_options(),
