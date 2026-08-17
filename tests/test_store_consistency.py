@@ -29,6 +29,59 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(store.close)
         return store
 
+    async def test_initialize_repairs_incompatible_internal_control_tables(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        db_path = Path(temp_dir.name) / "memory.db"
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE schema_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    legacy_required TEXT NOT NULL
+                );
+                INSERT INTO schema_metadata(key,value,updated_at,legacy_required)
+                VALUES('schema_version','foreign-v1','','required');
+                CREATE TABLE retrieval_revision (
+                    singleton INTEGER PRIMARY KEY,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    legacy_required TEXT NOT NULL
+                );
+                INSERT INTO retrieval_revision(singleton,revision,legacy_required)
+                VALUES(1,7,'required');
+                """
+            )
+        finally:
+            conn.close()
+
+        store = MemoryStore(db_path)
+        self.addCleanup(store.close)
+        store.initialize()
+
+        schema_columns = {
+            row["name"] for row in store._conn.execute("PRAGMA table_info(schema_metadata)")
+        }
+        revision_columns = {
+            row["name"] for row in store._conn.execute("PRAGMA table_info(retrieval_revision)")
+        }
+        self.assertEqual({"key", "value", "updated_at"}, schema_columns)
+        self.assertEqual({"singleton", "revision"}, revision_columns)
+        self.assertEqual(
+            MemoryStore.SCHEMA_VERSION,
+            store._conn.execute(
+                "SELECT value FROM schema_metadata WHERE key='schema_version'"
+            ).fetchone()[0],
+        )
+        self.assertGreaterEqual(
+            store._conn.execute(
+                "SELECT revision FROM retrieval_revision WHERE singleton=1"
+            ).fetchone()[0],
+            7,
+        )
+
     async def test_connection_uses_conservative_wal_and_busy_settings(self) -> None:
         store = self.make_store()
 

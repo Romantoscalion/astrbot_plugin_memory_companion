@@ -202,15 +202,33 @@ class MemoryCompanionService:
         self.data_dir = Path(data_dir)
 
         self.store = MemoryStore(self.data_dir / "memory_companion.db")
-        self.store.initialize()
-        self.scoped_store = ScopedStore(self.data_dir / "req041_scoped.db")
+        try:
+            self.store.initialize()
+        except Exception as exc:
+            self.store.close()
+            raise RuntimeError(
+                f"记忆主库初始化失败 [primary_store.initialize]: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            self.scoped_store = ScopedStore(self.data_dir / "req041_scoped.db")
+        except Exception as exc:
+            self.store.close()
+            raise RuntimeError(
+                f"作用域记忆库初始化失败 [scoped_store.initialize]: {type(exc).__name__}: {exc}"
+            ) from exc
         self.portraits = PortraitService(self.store, self.config)
-        normalized = self.store.normalize_legacy_manual_visibility()
-        if normalized:
-            logger.info("[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s", normalized)
-        internal_normalized = self.store.normalize_internal_bot_self_scopes()
-        if internal_normalized:
-            logger.info("[MemoryCompanion] 已将内部 Bot 梦境移出私聊用户范围: count=%s", internal_normalized)
+        try:
+            normalized = self.store.normalize_legacy_manual_visibility()
+            if normalized:
+                logger.info("[MemoryCompanion] 已收回早期过宽的手动记忆可见性: count=%s", normalized)
+            internal_normalized = self.store.normalize_internal_bot_self_scopes()
+            if internal_normalized:
+                logger.info("[MemoryCompanion] 已将内部 Bot 梦境移出私聊用户范围: count=%s", internal_normalized)
+        except Exception as exc:
+            self.store.close()
+            raise RuntimeError(
+                f"旧记忆规范化失败 [legacy_memory.normalize]: {type(exc).__name__}: {exc}"
+            ) from exc
 
         self.identity = IdentityResolver()
         self.reply_chain = ReplyChainResolver()

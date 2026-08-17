@@ -791,6 +791,7 @@ class MemoryStore:
 
                 """
             )
+            self._repair_internal_control_tables_sync()
             self._ensure_memory_columns_sync()
             self._ensure_timeline_columns_sync()
             self._ensure_acl_columns_sync()
@@ -906,7 +907,8 @@ class MemoryStore:
         }
         if not tables:
             return ""
-        if "schema_metadata" in tables:
+        schema_columns = self._table_column_names_sync("schema_metadata")
+        if schema_columns == {"key", "value", "updated_at"}:
             row = self._conn.execute(
                 "SELECT value FROM schema_metadata WHERE key='schema_version'"
             ).fetchone()
@@ -921,6 +923,66 @@ class MemoryStore:
             self._conn.backup(backup_conn)
         backup_path.chmod(0o600)
         return str(backup_path)
+
+    def _table_column_names_sync(self, table: str) -> set[str]:
+        return {
+            clean_text(row["name"], 160)
+            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
+    def _repair_internal_control_tables_sync(self) -> None:
+        """Canonicalize disposable control tables left by interrupted/foreign upgrades."""
+
+        schema_columns = self._table_column_names_sync("schema_metadata")
+        if schema_columns != {"key", "value", "updated_at"}:
+            remembered_version = ""
+            if {"key", "value"}.issubset(schema_columns):
+                row = self._conn.execute(
+                    "SELECT value FROM schema_metadata WHERE key='schema_version'"
+                ).fetchone()
+                if row is not None:
+                    remembered_version = clean_text(row["value"], 80)
+            self._conn.execute("DROP TABLE schema_metadata")
+            self._conn.execute(
+                """
+                CREATE TABLE schema_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            if remembered_version:
+                self._conn.execute(
+                    "INSERT INTO schema_metadata(key,value,updated_at) VALUES('schema_version',?,?)",
+                    (remembered_version, utc_now()),
+                )
+
+        revision_columns = self._table_column_names_sync("retrieval_revision")
+        if revision_columns and revision_columns != {"singleton", "revision"}:
+            remembered_revision = 0
+            if {"singleton", "revision"}.issubset(revision_columns):
+                row = self._conn.execute(
+                    "SELECT revision FROM retrieval_revision WHERE singleton=1"
+                ).fetchone()
+                if row is not None:
+                    try:
+                        remembered_revision = max(0, int(row["revision"] or 0))
+                    except (TypeError, ValueError):
+                        remembered_revision = 0
+            self._conn.execute("DROP TABLE retrieval_revision")
+            self._conn.execute(
+                """
+                CREATE TABLE retrieval_revision (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    revision INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self._conn.execute(
+                "INSERT INTO retrieval_revision(singleton,revision) VALUES(1,?)",
+                (remembered_revision,),
+            )
 
     def _redact_existing_sensitive_rows_sync(self) -> None:
         """Idempotently scrub legacy rows before recall, embedding, or export."""
