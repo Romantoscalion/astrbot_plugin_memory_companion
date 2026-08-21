@@ -5402,6 +5402,39 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   box-shadow:0 8px 24px rgba(var(--edge-rgb),.09);
 }
 
+/* 关系视图包含标题、分类、画像治理和记忆列表四个纵向区块。
+   不使用通用的三行固定网格，避免画像内容被压入下方列表。 */
+.film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active{
+  display:flex;
+  flex-direction:column;
+  align-items:stretch;
+  gap:12px;
+  height:100%;
+  min-height:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+}
+.film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > .section-head,
+.film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > .user-memory-filter,
+.film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > #portraitGovernance,
+.film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > #relationList{
+  flex:0 0 auto;
+  min-height:0;
+}
+.film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > #portraitGovernance{
+  overflow:visible;
+}
+.film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > #relationList{
+  overflow:visible;
+}
+
+@media(max-width:720px){
+  .film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active{
+    height:auto;
+    overflow:visible;
+  }
+}
+
 /* 个人记忆的简洁模式使用普通列表，放映卷轴仅保留在放映馆。 */
 :root[data-overview-layout="standard"] .film-app.is-personal-memory .workspace-main{
   height:auto;

@@ -155,7 +155,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=1.9.1-ui-v2", page)
+        self.assertIn("app.css?v=1.9.2-ui-v3", page)
 
     def test_microscope_has_explicit_context_and_non_overlapping_results(self) -> None:
         page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
@@ -288,7 +288,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-workspace .object-rail', styles)
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film', styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=1.9.1-ui-v2", page)
+        self.assertIn("app.js?v=1.9.2-ui-v3", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")
@@ -324,6 +324,28 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn('scopedMemoryParams("private", { limit: 180 })', script)
         self.assertIn('params.delete("session_id")', script)
         self.assertNotIn('id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>\n            </div>\n            <div id="privateMemoryList"', page)
+
+    def test_relations_view_keeps_portrait_and_memory_sections_in_flow(self) -> None:
+        styles = (ROOT / "pages" / "记忆面板" / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn(
+            ".film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active{\n"
+            "  display:flex;\n"
+            "  flex-direction:column;",
+            styles,
+        )
+        self.assertIn(
+            ".film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > #portraitGovernance{\n"
+            "  overflow:visible;\n"
+            "}",
+            styles,
+        )
+        self.assertIn(
+            ".film-app.is-workspace:not(.is-personal-memory) #view-relations.is-active > #relationList{\n"
+            "  overflow:visible;\n"
+            "}",
+            styles,
+        )
 
 
 if __name__ == "__main__":
