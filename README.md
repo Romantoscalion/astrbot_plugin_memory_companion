@@ -4,7 +4,7 @@
 
 - 插件名：`astrbot_plugin_memory_companion`
 - 中文名：`我会牢牢记住你`
-- 版本：`1.9.1`
+- 版本：`1.9.2`
 - 适配平台：`aiocqhttp`
 - AstrBot 版本：`>=4.22.0`
 - 编码要求：UTF-8
@@ -31,7 +31,7 @@
 
 ## 核心能力
 
-- Token 可观测：独立记录阶段总结、重排、向量和维护整理的模型消耗，并可供陪伴插件 Token 页只读展示。
+- Token 可观测：独立记录阶段总结、重排、向量和维护整理的模型消耗；区分 Provider 已确认 Token、插件估算 Token 与失败调用，并可供陪伴插件 Token 页只读展示。
 - 运行预设：提供轻量、标准、陪伴三种一键配置，保留已有 Provider 选择。
 - 运维诊断：统一展示检索路径、缓存命中率、模型 Token、平均耗时和已知记忆插件共存风险。
 - 可移植数据：UTF-8 JSONL 导出和恢复记忆、身份、关系、时间线与 ACL，导入前自动备份。
@@ -319,7 +319,7 @@ internal       内部记录
 
 - 当前检索模式、Embedding 和最近实际检索路径。
 - 检索缓存命中率和当前缓存条数。
-- 记忆插件自身模型调用、Token、估算 Token 和平均耗时。
+- 记忆插件自身模型调用、已确认 Token、估算 Token、失败调用和平均耗时。
 - 已知记忆/人格插件目录及重复捕获、重复注入风险。
 
 目录扫描只说明插件文件存在，不代表 AstrBot 当前一定启用了该插件；诊断不会自动禁用其它插件。
@@ -533,7 +533,7 @@ blocked_count: ...
 
 主要数据存储在 SQLite 数据库中。插件保留旧版字段以兼容历史数据，但默认不再暴露记忆审核工作流。旧的 pending 数据不会参与普通检索和页面列表。
 
-睡眠维护会按配置归档过期 `raw_event` 长期记录，并删除过期的注入诊断日志。时间线只会清理已经成功生成长期总结的记录；未总结或进入总结死信状态的原始消息会一直保留，等待手动强制重试。相关配置为 `maintenance.retention_summarized_timeline_days`、`maintenance.retention_injection_log_days` 和 `maintenance.retention_cleanup_limit`。
+睡眠维护会按配置归档过期 `raw_event` 长期记录，并删除过期的注入诊断日志。时间线只会清理已经成功生成长期总结的记录；未总结的原始消息会一直保留。总结失败会按错误类型进入冷却并自动恢复探测，失败批次之外的新消息仍可继续总结；相关配置包括 `memory_summary.transient_retry_cooldown_minutes`、`memory_summary.non_transient_retry_cooldown_minutes`、`maintenance.retention_summarized_timeline_days`、`maintenance.retention_injection_log_days` 和 `maintenance.retention_cleanup_limit`。
 
 睡眠维护结束时会执行一次限频 `wal_checkpoint(PASSIVE)`，并记录 checkpoint 是否繁忙、WAL 总帧和已合并帧。正常写入不会逐次强制 checkpoint；Rerank 调试日志只记录 query/document/model 长度，不记录候选正文。
 

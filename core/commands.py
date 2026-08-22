@@ -328,7 +328,7 @@ class MemoryCompanionCommandHandler:
             f"配置预设：{report.get('preset_label')} ({report.get('preset')})",
             f"检索：mode={retrieval.get('mode')}｜Embedding={retrieval.get('embedding_enabled')}｜零外部检索调用={retrieval.get('zero_external_retrieval_calls')}",
             f"缓存：命中 {cache.get('hits', 0)}｜未命中 {cache.get('misses', 0)}｜命中率 {hit_label}｜当前 {cache.get('entries', 0)} 项",
-            f"模型消耗：调用 {usage.get('calls', 0)}｜Token {usage.get('total_tokens', 0)}｜估算 Token {usage.get('estimated_tokens', 0)}｜平均耗时 {avg_label}",
+            f"模型消耗：调用 {usage.get('calls', 0)}｜已确认 Token {usage.get('reported_tokens', 0)}｜估算 Token {usage.get('estimated_tokens', 0)}｜合计 {usage.get('total_tokens', 0)}｜失败 {usage.get('errors', 0)}｜平均耗时 {avg_label}",
         ]
         if conflicts:
             lines.append("插件共存：")

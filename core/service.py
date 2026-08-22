@@ -3119,7 +3119,7 @@ class MemoryCompanionService:
             if not self.token_usage_path.exists():
                 return {}
             payload = json.loads(self.token_usage_path.read_text(encoding="utf-8"))
-            return payload if isinstance(payload, dict) else {}
+            return self._normalize_token_usage(payload) if isinstance(payload, dict) else {}
         except Exception as exc:
             logger.warning("[MemoryCompanion] Token 统计读取失败，已从空统计开始: %s", exc)
             return {}
@@ -3142,16 +3142,17 @@ class MemoryCompanionService:
 
     def token_usage_summary(self) -> dict[str, Any]:
         usage = self._token_usage if isinstance(self._token_usage, dict) else {}
-        payload = json_loads(json_dumps(usage), {})
+        payload = self._normalize_token_usage(json_loads(json_dumps(usage), {}))
         if not isinstance(payload, dict):
             payload = {}
         payload.update(
             {
+                "token_usage_schema_version": 2,
                 "available": True,
                 "display_name": "我会牢牢记住你",
                 "plugin_name": "astrbot_plugin_memory_companion",
                 "counted_in_private_companion_budget": False,
-                "note": "仅展示记忆插件自身模型消耗，不计入陪伴插件每日 Token 限额。",
+                "note": "仅展示记忆插件自身模型调用；已确认 Token 来自 Provider 用量，估算 Token 只用于标记无用量返回或失败请求，不计入陪伴插件每日 Token 限额。",
             }
         )
         return payload
@@ -3171,6 +3172,36 @@ class MemoryCompanionService:
         ascii_chars = sum(1 for ch in raw if ord(ch) < 128)
         non_ascii_chars = max(0, len(raw) - ascii_chars)
         return max(1, int(ascii_chars / 4.0 + non_ascii_chars / 1.6))
+
+    @classmethod
+    def _normalize_token_usage(cls, payload: Any) -> dict[str, Any]:
+        """Add separated reported/estimated counters to legacy statistics."""
+        if not isinstance(payload, dict):
+            return {}
+
+        def visit(value: Any) -> None:
+            if not isinstance(value, dict):
+                return
+            if "calls" in value:
+                total = max(0, cls._safe_int(value.get("total_tokens")))
+                estimated = max(0, cls._safe_int(value.get("estimated_tokens")))
+                reported = cls._safe_int(value.get("reported_tokens"), -1)
+                if reported < 0:
+                    reported = max(0, total - estimated)
+                else:
+                    reported = max(0, reported)
+                if "estimated_tokens" not in value:
+                    estimated = max(0, total - reported)
+                value["total_tokens"] = total
+                value["reported_tokens"] = reported
+                value["estimated_tokens"] = estimated
+                value.setdefault("estimated_calls", 0)
+            for child in value.values():
+                visit(child)
+
+        visit(payload)
+        payload.setdefault("token_usage_schema_version", 2)
+        return payload
 
     @staticmethod
     def _usage_raw_value(usage: Any, key: str) -> Any:
@@ -3248,28 +3279,42 @@ class MemoryCompanionService:
         )
         if cached_tokens <= 0:
             cached_tokens = cache_read_tokens
+        reported_prompt_tokens = max(0, prompt_tokens)
+        reported_completion_tokens = max(0, completion_tokens)
+        reported_tokens = 0
+        estimated_tokens = 0
         if total_tokens <= 0:
-            prompt_estimated = prompt_tokens <= 0
-            completion_estimated = completion_tokens <= 0
+            prompt_estimated = reported_prompt_tokens <= 0
+            completion_estimated = reported_completion_tokens <= 0
             if prompt_estimated:
                 prompt_tokens = self._estimate_token_count(prompt)
             if completion_estimated:
                 completion_tokens = self._estimate_token_count(completion)
             total_tokens = prompt_tokens + completion_tokens
-            estimated = (not usage) or prompt_estimated or completion_estimated
+            reported_tokens = reported_prompt_tokens + reported_completion_tokens
+            estimated_tokens = max(0, total_tokens - reported_tokens)
         else:
-            estimated = not usage
-            if prompt_tokens <= 0 and completion_tokens <= 0:
-                prompt_tokens = self._estimate_token_count(prompt)
-                completion_tokens = max(0, total_tokens - prompt_tokens)
+            reported_tokens = total_tokens if usage else 0
+            estimated_tokens = 0 if usage else total_tokens
+        estimated = estimated_tokens > 0
+        usage_source = (
+            "mixed"
+            if reported_tokens > 0 and estimated_tokens > 0
+            else "provider"
+            if reported_tokens > 0
+            else "estimated"
+        )
         return {
             "prompt_tokens": max(0, prompt_tokens),
             "completion_tokens": max(0, completion_tokens),
             "total_tokens": max(0, total_tokens),
+            "reported_tokens": max(0, reported_tokens),
+            "estimated_tokens": max(0, estimated_tokens),
             "cached_tokens": max(0, cached_tokens),
             "cache_read_tokens": max(0, cache_read_tokens),
             "cache_write_tokens": max(0, cache_write_tokens),
             "estimated": bool(estimated),
+            "usage_source": usage_source,
         }
 
     def _record_token_usage(
@@ -3312,11 +3357,13 @@ class MemoryCompanionService:
             bucket["prompt_tokens"] = self._safe_int(bucket.get("prompt_tokens")) + usage["prompt_tokens"]
             bucket["completion_tokens"] = self._safe_int(bucket.get("completion_tokens")) + usage["completion_tokens"]
             bucket["total_tokens"] = self._safe_int(bucket.get("total_tokens")) + usage["total_tokens"]
+            bucket["reported_tokens"] = self._safe_int(bucket.get("reported_tokens")) + usage["reported_tokens"]
             bucket["cached_tokens"] = self._safe_int(bucket.get("cached_tokens")) + usage["cached_tokens"]
             bucket["cache_read_tokens"] = self._safe_int(bucket.get("cache_read_tokens")) + usage["cache_read_tokens"]
             bucket["cache_write_tokens"] = self._safe_int(bucket.get("cache_write_tokens")) + usage["cache_write_tokens"]
-            bucket["estimated_tokens"] = self._safe_int(bucket.get("estimated_tokens")) + (
-                usage["total_tokens"] if usage["estimated"] else 0
+            bucket["estimated_tokens"] = self._safe_int(bucket.get("estimated_tokens")) + usage["estimated_tokens"]
+            bucket["estimated_calls"] = self._safe_int(bucket.get("estimated_calls")) + (
+                1 if usage["estimated"] else 0
             )
             bucket["elapsed_ms"] = self._safe_int(bucket.get("elapsed_ms")) + max(0, int(elapsed_ms or 0))
             bucket["last_ts"] = now_ts
@@ -3343,6 +3390,9 @@ class MemoryCompanionService:
                 "prompt_tokens": usage["prompt_tokens"],
                 "completion_tokens": usage["completion_tokens"],
                 "total_tokens": usage["total_tokens"],
+                "reported_tokens": usage["reported_tokens"],
+                "estimated_tokens": usage["estimated_tokens"],
+                "usage_source": usage["usage_source"],
                 "cached_tokens": usage["cached_tokens"],
                 "cache_read_tokens": usage["cache_read_tokens"],
                 "cache_write_tokens": usage["cache_write_tokens"],
@@ -3826,6 +3876,12 @@ class MemoryCompanionService:
         minutes = max(0, self.config.int("memory_summary.transient_retry_cooldown_minutes", 10))
         return minutes * 60
 
+    def _summary_failure_cooldown_seconds(self, *, transient: bool) -> int:
+        if transient:
+            return self._summary_transient_cooldown_seconds()
+        minutes = max(0, self.config.int("memory_summary.non_transient_retry_cooldown_minutes", 30))
+        return minutes * 60
+
     def _summary_retry_backoff_seconds(self, retry_count: int) -> int:
         base = max(0, self.config.int("memory_summary.retry_backoff_seconds", 60))
         if base <= 0:
@@ -3833,6 +3889,34 @@ class MemoryCompanionService:
         exponent = max(0, min(8, int(retry_count or 1) - 1))
         cooldown = self._summary_transient_cooldown_seconds()
         return min(base * (2**exponent), cooldown) if cooldown > 0 else base * (2**exponent)
+
+    def _summary_window_ready(self, window: dict[str, Any], *, force: bool) -> bool:
+        total = int(window.get("total") or 0)
+        min_events = self.config.int("memory_summary.min_events", 8)
+        if total < (1 if force else min_events):
+            return False
+        if force:
+            return True
+        trigger_count = self.config.int("memory_summary.trigger_event_count", 12)
+        if total >= max(min_events, trigger_count):
+            return True
+        return self.summarizer.interval_elapsed(
+            str(window.get("first_occurred_at") or ""),
+            self.config.int("memory_summary.trigger_interval_minutes", 60),
+        )
+
+    async def _summary_window_after_failure(
+        self,
+        ctx: SessionContext,
+        failure: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return fresh work after a failed batch without discarding that batch."""
+        return await self.store.unsummarized_timeline_window(
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            limit=self.config.int("memory_summary.max_events_per_summary", 40),
+            after_timeline_id=clean_text(failure.get("end_timeline_id"), 160),
+        )
 
     async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
@@ -3857,20 +3941,11 @@ class MemoryCompanionService:
             )
             rows = list(window.get("rows") or [])
             total = int(window.get("total") or 0)
-            min_events = self.config.int("memory_summary.min_events", 8)
-            trigger_count = self.config.int("memory_summary.trigger_event_count", 12)
-            trigger_minutes = self.config.int("memory_summary.trigger_interval_minutes", 60)
-            if total < (1 if force else min_events):
-                return ""
-            count_ready = total >= max(min_events, trigger_count)
-            time_ready = self.summarizer.interval_elapsed(
-                str(window.get("first_occurred_at") or ""),
-                trigger_minutes,
-            )
-            if not force and not count_ready and not time_ready:
+            if not self._summary_window_ready(window, force=force):
                 return ""
 
             failure = await self.store.get_summary_failure(ctx.session_id)
+            bypassed_failed_batch = False
             max_retries = max(1, self.config.int("memory_summary.max_retries", 3))
             if failure and not force:
                 retries = int(failure.get("retry_count") or 0)
@@ -3880,43 +3955,53 @@ class MemoryCompanionService:
                 transient = self._summary_failure_is_transient(last_error)
                 age_seconds = self._summary_failure_age_seconds(failure)
                 if retries >= max_retries:
-                    if transient:
-                        cooldown_seconds = self._summary_transient_cooldown_seconds()
-                        if state != "transient_cooldown":
-                            await self.store.mark_summary_failure_cooldown(
-                                ctx.session_id,
-                                max_retries,
-                                cooldown_seconds,
-                            )
-                            logger.warning(
-                                "[MemoryCompanion] 阶段性总结连续遇到可恢复的 Provider 错误，已进入冷却并保留原始时间线；约 %s 分钟后自动探测，也可手动重试: session=%s retries=%s last_error=%s",
-                                max(0, cooldown_seconds // 60),
-                                ctx.session_id,
-                                retries,
-                                clean_text(last_error, 160),
-                            )
-                            return ""
-                        if age_seconds < cooldown_seconds:
-                            return ""
-                        await self.store.clear_summary_failure(ctx.session_id)
-                        logger.info(
-                            "[MemoryCompanion] 阶段性总结 Provider 冷却结束，开始自动恢复探测: session=%s",
+                    cooldown_seconds = self._summary_failure_cooldown_seconds(transient=transient)
+                    cooldown_state = "transient_cooldown" if transient else "retry_cooldown"
+                    if state not in {"transient_cooldown", "retry_cooldown", "dead_letter"}:
+                        await self.store.mark_summary_failure_cooldown(
                             ctx.session_id,
+                            max_retries,
+                            cooldown_seconds,
+                            state=cooldown_state,
+                        )
+                        logger.warning(
+                            "[MemoryCompanion] 阶段性总结连续失败，已隔离当前批次并进入 %s 分钟冷却；后续新批次仍可继续总结: session=%s retries=%s last_error=%s",
+                            max(0, cooldown_seconds // 60),
+                            ctx.session_id,
+                            retries,
+                            clean_text(last_error, 160),
+                        )
+                        return ""
+                    if age_seconds < cooldown_seconds:
+                        fresh_window = await self._summary_window_after_failure(ctx, failure)
+                        if not self._summary_window_ready(fresh_window, force=False):
+                            return ""
+                        window = fresh_window
+                        rows = list(window.get("rows") or [])
+                        total = int(window.get("total") or 0)
+                        bypassed_failed_batch = True
+                        logger.info(
+                            "[MemoryCompanion] 阶段性总结正在绕过冷却中的失败批次，继续处理后续消息: session=%s failed_end=%s fresh_events=%s",
+                            ctx.session_id,
+                            clean_text(failure.get("end_timeline_id"), 120),
+                            total,
                         )
                     else:
-                        if state != "dead_letter":
-                            await self.store.mark_summary_failure_dead_letter(ctx.session_id, max_retries)
-                            logger.warning(
-                                "[MemoryCompanion] 阶段性记忆总结连续失败已达上限，已暂停自动重试并保留原始时间线，可手动强制重试: session=%s retries=%s last_error=%s",
-                                ctx.session_id,
-                                retries,
-                                clean_text(last_error, 160),
-                            )
-                        return ""
+                        logger.info(
+                            "[MemoryCompanion] 阶段性总结失败批次冷却结束，开始自动恢复探测: session=%s state=%s",
+                            ctx.session_id,
+                            state or "legacy",
+                        )
                 else:
                     retry_delay = self._summary_retry_backoff_seconds(retries)
                     if age_seconds < retry_delay:
-                        return ""
+                        fresh_window = await self._summary_window_after_failure(ctx, failure)
+                        if not self._summary_window_ready(fresh_window, force=False):
+                            return ""
+                        window = fresh_window
+                        rows = list(window.get("rows") or [])
+                        total = int(window.get("total") or 0)
+                        bypassed_failed_batch = True
 
             summary_attempts = await self._summary_provider_attempts(ctx)
             if not summary_attempts:
@@ -3995,30 +4080,22 @@ class MemoryCompanionService:
                     },
                 )
                 if retries >= max_retries:
-                    if transient_failure:
-                        cooldown_seconds = self._summary_transient_cooldown_seconds()
-                        await self.store.mark_summary_failure_cooldown(
-                            ctx.session_id,
-                            max_retries,
-                            cooldown_seconds,
-                        )
-                        logger.warning(
-                            "[MemoryCompanion] 阶段性总结 Provider 暂不可用，已保留原始时间线并进入 %s 分钟冷却，之后会自动探测: session=%s retry=%s/%s error=%s",
-                            max(0, cooldown_seconds // 60),
-                            ctx.session_id,
-                            retries,
-                            max_retries,
-                            clean_text(failure_error, 160),
-                        )
-                    else:
-                        await self.store.mark_summary_failure_dead_letter(ctx.session_id, max_retries)
-                        logger.warning(
-                            "[MemoryCompanion] 阶段性总结失败达到上限，已保留原始时间线并暂停自动重试，可手动强制重试: session=%s retry=%s/%s error=%s",
-                            ctx.session_id,
-                            retries,
-                            max_retries,
-                            clean_text(failure_error, 160),
-                        )
+                    cooldown_seconds = self._summary_failure_cooldown_seconds(transient=transient_failure)
+                    cooldown_state = "transient_cooldown" if transient_failure else "retry_cooldown"
+                    await self.store.mark_summary_failure_cooldown(
+                        ctx.session_id,
+                        max_retries,
+                        cooldown_seconds,
+                        state=cooldown_state,
+                    )
+                    logger.warning(
+                        "[MemoryCompanion] 阶段性总结失败达到上限，已隔离当前批次并进入 %s 分钟冷却；后续消息不受阻塞，冷却结束后会自动重试: session=%s retry=%s/%s error=%s",
+                        max(0, cooldown_seconds // 60),
+                        ctx.session_id,
+                        retries,
+                        max_retries,
+                        clean_text(failure_error, 160),
+                    )
                 else:
                     retry_delay = self._summary_retry_backoff_seconds(retries)
                     logger.warning(
@@ -4141,7 +4218,8 @@ class MemoryCompanionService:
             await self._record_verified_group_bot_self_facts(ctx, rows, payload or {}, memory_id)
             await self._index_summary_knowledge_graph(ctx, record, payload or {}, memory_id)
             marked = await self.store.mark_timeline_summarized([str(row.get("id") or "") for row in rows])
-            await self.store.clear_summary_failure(ctx.session_id)
+            if not bypassed_failed_batch:
+                await self.store.clear_summary_failure(ctx.session_id)
             logger.info(
                 "[MemoryCompanion] 已生成阶段性长期记忆: session=%s memory=%s events=%s marked=%s",
                 ctx.session_id,

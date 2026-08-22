@@ -946,7 +946,141 @@ class SummaryAndRelationshipTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual("", row["summarized_at"])
         failure = await service.store.get_summary_failure(ctx.session_id)
-        self.assertEqual("dead_letter", failure["metadata"]["state"])
+        self.assertEqual("retry_cooldown", failure["metadata"]["state"])
+
+    def test_summary_parser_accepts_json_fence_and_preamble(self) -> None:
+        summarizer = MemorySummarizer()
+        payload = summarizer._parse_response(
+            '模型结果如下：\n```json\n{"summary":"可解析的总结","importance":0.6}\n```\n'
+        )
+        self.assertEqual("可解析的总结", payload["summary"])
+
+    async def test_failed_batch_does_not_block_later_batch(self) -> None:
+        service = self.make_service(
+            {
+                "memory_summary": {
+                    "enabled": True,
+                    "min_events": 1,
+                    "trigger_event_count": 1,
+                    "max_retries": 1,
+                    "non_transient_retry_cooldown_minutes": 60,
+                }
+            }
+        )
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:g2",
+            scope="group",
+            platform="qq",
+            group_id="g2",
+            user_id="u1",
+        )
+        first_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.user_id,
+            object_id=ctx.group_id,
+            content="第一批会话内容",
+            metadata={"message_id": "m-first"},
+            occurred_at="2026-08-20T00:00:00+00:00",
+        )
+        second_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.user_id,
+            object_id=ctx.group_id,
+            content="第二批会话内容",
+            metadata={"message_id": "m-second"},
+            occurred_at="2026-08-20T01:00:00+00:00",
+        )
+        await service.store.record_summary_failure(
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            start_timeline_id=first_id,
+            end_timeline_id=first_id,
+            error="summary provider returned invalid JSON",
+        )
+        await service.store.mark_summary_failure_cooldown(ctx.session_id, 1, 3600, state="retry_cooldown")
+        provider = _TextProvider(
+            json.dumps(
+                {
+                    "summary": "第二批会话内容已被整理。",
+                    "canonical_summary": "群聊记录了第二批会话内容。",
+                    "key_facts": [{"fact": "第二批会话内容已被整理", "refs": [second_id]}],
+                    "importance": 0.6,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        async def attempts(*_args, **_kwargs):
+            return [{"source": "primary", "provider_id": "test-summary", "provider": provider}]
+
+        service._summary_provider_attempts = attempts
+        memory_id = await service.maybe_summarize_session(ctx)
+        self.assertTrue(memory_id)
+        rows = await service.store.get_timeline_by_ids([first_id, second_id])
+        self.assertEqual("", rows[first_id]["summarized_at"])
+        self.assertTrue(rows[second_id]["summarized_at"])
+        failure = await service.store.get_summary_failure(ctx.session_id)
+        self.assertEqual("retry_cooldown", failure["metadata"]["state"])
+
+    async def test_legacy_dead_letter_auto_recovers(self) -> None:
+        service = self.make_service(
+            {
+                "memory_summary": {
+                    "enabled": True,
+                    "min_events": 1,
+                    "trigger_event_count": 1,
+                    "max_retries": 1,
+                    "non_transient_retry_cooldown_minutes": 0,
+                }
+            }
+        )
+        ctx = SessionContext(
+            session_id="qq:GroupMessage:legacy",
+            scope="group",
+            platform="qq",
+            group_id="legacy",
+            user_id="u1",
+        )
+        timeline_id = await service.store.add_timeline_event(
+            event_type="user_message",
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            subject_id=ctx.user_id,
+            object_id=ctx.group_id,
+            content="历史死信状态应当自动恢复",
+            metadata={"message_id": "m-legacy"},
+        )
+        await service.store.record_summary_failure(
+            session_id=ctx.session_id,
+            scope=ctx.scope,
+            start_timeline_id=timeline_id,
+            end_timeline_id=timeline_id,
+            error="summary provider returned invalid JSON",
+        )
+        await service.store.mark_summary_failure_dead_letter(ctx.session_id, 1)
+        provider = _TextProvider(
+            json.dumps(
+                {
+                    "summary": "历史死信状态已自动恢复。",
+                    "canonical_summary": "群聊总结从历史死信状态恢复。",
+                    "key_facts": [{"fact": "历史死信状态应当自动恢复", "refs": [timeline_id]}],
+                    "importance": 0.6,
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        async def attempts(*_args, **_kwargs):
+            return [{"source": "primary", "provider_id": "test-summary", "provider": provider}]
+
+        service._summary_provider_attempts = attempts
+        memory_id = await service.maybe_summarize_session(ctx)
+        self.assertTrue(memory_id)
+        self.assertIsNone(await service.store.get_summary_failure(ctx.session_id))
 
     async def test_transient_summary_failure_enters_quiet_cooldown(self) -> None:
         service = self.make_service(

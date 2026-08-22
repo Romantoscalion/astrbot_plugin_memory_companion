@@ -1527,6 +1527,17 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
   color:var(--text);
 }
 .compatibility-note{color:var(--muted);font-size:13px}
+.portrait-mode-notice{
+  margin:0;
+  padding:10px 12px;
+  border:1px solid var(--line);
+  border-left:3px solid var(--accent);
+  border-radius:6px;
+  background:rgba(var(--light-rgb),.58);
+  color:var(--muted);
+  font-size:13px;
+  line-height:1.6;
+}
 .scoped-clear-actions{
   max-width:520px;
 }

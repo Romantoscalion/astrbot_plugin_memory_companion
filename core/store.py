@@ -87,6 +87,9 @@ class MemoryStore:
             tuple[str, bool, int],
             list[tuple[MemoryRecord, list[float], str]],
         ] = {}
+        self._acl_feature_override_cache: dict[
+            tuple[str, str], tuple[bool | None, bool | None]
+        ] = {}
         self._last_wal_health: dict[str, Any] = {}
         self._last_database_error: dict[str, Any] = {}
         self._database_recovery_attempts = 0
@@ -7447,16 +7450,44 @@ class MemoryStore:
         session_id: str,
         scope: str = "",
         limit: int = 40,
+        after_timeline_id: str = "",
     ) -> dict[str, Any]:
-        return await asyncio.to_thread(self._unsummarized_timeline_window_sync, session_id, scope, limit)
+        return await asyncio.to_thread(
+            self._unsummarized_timeline_window_sync,
+            session_id,
+            scope,
+            limit,
+            after_timeline_id,
+        )
 
-    def _unsummarized_timeline_window_sync(self, session_id: str, scope: str, limit: int) -> dict[str, Any]:
+    def _unsummarized_timeline_window_sync(
+        self,
+        session_id: str,
+        scope: str,
+        limit: int,
+        after_timeline_id: str = "",
+    ) -> dict[str, Any]:
         params: list[Any] = [clean_text(session_id, 200)]
         where = "session_id=? AND summarized_at=''"
         if scope:
             where += " AND scope=?"
             params.append(clean_text(scope, 40))
         with self._lock:
+            cursor = None
+            if clean_text(after_timeline_id, 160):
+                cursor = self._conn.execute(
+                    "SELECT occurred_at, created_at FROM timeline WHERE id=? AND session_id=?",
+                    (clean_text(after_timeline_id, 160), clean_text(session_id, 200)),
+                ).fetchone()
+            if cursor:
+                where += " AND (occurred_at > ? OR (occurred_at = ? AND created_at > ?))"
+                params.extend(
+                    [
+                        clean_text(cursor["occurred_at"], 80),
+                        clean_text(cursor["occurred_at"], 80),
+                        clean_text(cursor["created_at"], 80),
+                    ]
+                )
             total = self._conn.execute(
                 f"SELECT COUNT(*) FROM timeline WHERE {where}",
                 params,
@@ -7598,11 +7629,12 @@ class MemoryStore:
         session_id: str,
         max_retries: int,
         cooldown_seconds: int,
+        state: str = "transient_cooldown",
     ) -> bool:
         return await asyncio.to_thread(
             self._mark_summary_failure_state_sync,
             session_id,
-            "transient_cooldown",
+            clean_text(state, 40) or "transient_cooldown",
             {
                 "max_retries": max(1, int(max_retries or 1)),
                 "cooldown_seconds": max(0, int(cooldown_seconds or 0)),
@@ -9235,6 +9267,10 @@ class MemoryStore:
                 (window_scope, window_id),
             ).fetchone()
             self._conn.commit()
+            self._acl_feature_override_cache[(window_scope, window_id)] = (
+                next_capture,
+                next_recall,
+            )
         return self._acl_policy_from_row(row) if row else data
 
     @staticmethod
@@ -9275,23 +9311,38 @@ class MemoryStore:
         window_id = clean_text(window_id, 160)
         if scope not in {"private", "group"} or not window_id:
             return {"capture_enabled": None, "recall_enabled": None}
+        cache_key = (scope, window_id)
         with self._lock:
-            columns = {
-                row["name"]
-                for row in self._conn.execute("PRAGMA table_info(memory_acl_policies)").fetchall()
-            }
-            if not {"capture_enabled", "recall_enabled"}.issubset(columns):
-                return {"capture_enabled": None, "recall_enabled": None}
-            row = self._conn.execute(
-                "SELECT capture_enabled, recall_enabled FROM memory_acl_policies "
-                "WHERE window_scope=? AND window_id=?",
-                (scope, window_id),
-            ).fetchone()
-        if not row:
-            return {"capture_enabled": None, "recall_enabled": None}
+            cached = self._acl_feature_override_cache.get(cache_key)
+            if cached is not None:
+                capture_enabled, recall_enabled = cached
+                return {
+                    "capture_enabled": capture_enabled,
+                    "recall_enabled": recall_enabled,
+                }
+            try:
+                row = self._conn.execute(
+                    "SELECT capture_enabled, recall_enabled FROM memory_acl_policies "
+                    "WHERE window_scope=? AND window_id=?",
+                    (scope, window_id),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such column" not in str(exc).lower():
+                    raise
+                row = None
+            values = (
+                (None, None)
+                if not row
+                else (
+                    None if row["capture_enabled"] is None else bool(row["capture_enabled"]),
+                    None if row["recall_enabled"] is None else bool(row["recall_enabled"]),
+                )
+            )
+            self._acl_feature_override_cache[cache_key] = values
+        capture_enabled, recall_enabled = values
         return {
-            "capture_enabled": None if row["capture_enabled"] is None else bool(row["capture_enabled"]),
-            "recall_enabled": None if row["recall_enabled"] is None else bool(row["recall_enabled"]),
+            "capture_enabled": capture_enabled,
+            "recall_enabled": recall_enabled,
         }
 
     @staticmethod

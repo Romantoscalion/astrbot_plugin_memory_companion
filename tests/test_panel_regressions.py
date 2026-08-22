@@ -155,7 +155,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=1.9.2-ui-v3", page)
+        self.assertIn("app.css?v=1.9.2-ui-v4", page)
 
     def test_microscope_has_explicit_context_and_non_overlapping_results(self) -> None:
         page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
@@ -288,7 +288,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-workspace .object-rail', styles)
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film', styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=1.9.2-ui-v3", page)
+        self.assertIn("app.js?v=1.9.2-ui-v4", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")
@@ -323,6 +323,13 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn('if (state.activeView === "relations") return "private"', script)
         self.assertIn('scopedMemoryParams("private", { limit: 180 })', script)
         self.assertIn('params.delete("session_id")', script)
+        self.assertIn('正在读取画像详情...', script)
+        self.assertIn('当前同步结果显示统一画像能力全部关闭', script)
+        self.assertIn('.portrait-governance-detail, .portrait-governance-detail-slot', script)
+        self.assertLess(
+            script.index('${renderPortraitGovernanceDetail(state.portraitGovernanceDetail, state.portraitGovernanceLoading)}'),
+            script.index('${renderPortraitProfileList(items)}', script.index('async function loadPortraitGovernance()')),
+        )
         self.assertNotIn('id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>\n            </div>\n            <div id="privateMemoryList"', page)
 
     def test_relations_view_keeps_portrait_and_memory_sections_in_flow(self) -> None:
