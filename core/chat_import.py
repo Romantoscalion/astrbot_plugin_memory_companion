@@ -2081,7 +2081,7 @@ class HistoricalChatImporter:
                     ),
                     request_max_retries=1,
                 )
-                timeout = max(10, self.service.config.int("memory_summary.provider_timeout_seconds", 60))
+                timeout = max(10, self.service.config.int("memory_summary.provider_timeout_seconds", 180))
                 response = await asyncio.wait_for(call, timeout=timeout)
                 completion = str(getattr(response, "completion_text", "") or "")
                 self.service._record_token_usage(

@@ -240,7 +240,7 @@ class MemoryCompanionService:
         self.summarizer = MemorySummarizer(
             max_input_chars=self.config.int("memory_summary.max_input_chars", 6000),
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),
-            provider_timeout_seconds=self.config.int("memory_summary.provider_timeout_seconds", 60),
+            provider_timeout_seconds=self.config.int("memory_summary.provider_timeout_seconds", 180),
         )
         self.importance = ImportanceEvaluator()
         self._summary_locks: dict[str, asyncio.Lock] = {}

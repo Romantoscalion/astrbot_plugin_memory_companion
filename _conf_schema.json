@@ -286,7 +286,7 @@
         "description": "总结模型超时秒数",
         "hint": "单次调用总结模型的最长等待时间。超时会尝试备用模型并保留未总结时间线。0 表示不限制。",
         "type": "int",
-        "default": 60
+        "default": 180
       },
       "evidence_events": {
         "description": "证据事件条数",

@@ -31,7 +31,7 @@ class MemorySummarizer:
         *,
         max_input_chars: int = 6000,
         max_summary_chars: int = 1200,
-        provider_timeout_seconds: float = 60.0,
+        provider_timeout_seconds: float = 180.0,
     ):
         self.max_input_chars = max(1000, int(max_input_chars or 6000))
         self.max_summary_chars = max(300, int(max_summary_chars or 1200))
