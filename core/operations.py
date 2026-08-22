@@ -469,12 +469,16 @@ class PortableMemoryArchive:
                         note=clean_text(data.get("note"), 300),
                     )
                 elif kind == "acl_policy":
-                    await self.store.upsert_acl_policy(
-                        window_scope=clean_text(data.get("window_scope"), 40),
-                        window_id=clean_text(data.get("window_id"), 160),
-                        read_mode=clean_text(data.get("read_mode"), 20),
-                        share_mode=clean_text(data.get("share_mode"), 20),
-                    )
+                    policy_values = {
+                        "window_scope": clean_text(data.get("window_scope"), 40),
+                        "window_id": clean_text(data.get("window_id"), 160),
+                        "read_mode": clean_text(data.get("read_mode"), 20),
+                        "share_mode": clean_text(data.get("share_mode"), 20),
+                    }
+                    for feature in ("capture_enabled", "recall_enabled"):
+                        if feature in data:
+                            policy_values[feature] = data.get(feature)
+                    await self.store.upsert_acl_policy(**policy_values)
                 else:
                     skipped[kind or "unknown"] += 1
                     continue

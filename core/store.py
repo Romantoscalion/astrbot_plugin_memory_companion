@@ -33,6 +33,9 @@ from .portrait_namespace import portrait_scope_kind, portrait_scope_persona
 from .sensitive_data import redact_sensitive_text, redact_sensitive_value
 
 
+_ACL_UNSET = object()
+
+
 class MemoryStore:
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
     SCHEMA_VERSION = "memory-atom-v2"
@@ -602,6 +605,8 @@ class MemoryStore:
                     window_id TEXT NOT NULL DEFAULT '',
                     read_mode TEXT NOT NULL DEFAULT 'whitelist',
                     share_mode TEXT NOT NULL DEFAULT 'whitelist',
+                    capture_enabled INTEGER CHECK(capture_enabled IS NULL OR capture_enabled IN (0, 1)),
+                    recall_enabled INTEGER CHECK(recall_enabled IS NULL OR recall_enabled IN (0, 1)),
                     created_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT '',
                     UNIQUE(window_scope, window_id)
@@ -1440,6 +1445,18 @@ class MemoryStore:
         }
         if "effect" not in existing:
             self._conn.execute("ALTER TABLE memory_acl_rules ADD COLUMN effect TEXT NOT NULL DEFAULT 'allow'")
+        policy_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(memory_acl_policies)").fetchall()
+        }
+        if "capture_enabled" not in policy_columns:
+            self._conn.execute(
+                "ALTER TABLE memory_acl_policies ADD COLUMN capture_enabled INTEGER"
+            )
+        if "recall_enabled" not in policy_columns:
+            self._conn.execute(
+                "ALTER TABLE memory_acl_policies ADD COLUMN recall_enabled INTEGER"
+            )
 
     def _ensure_portrait_columns_sync(self) -> None:
         existing = {
@@ -9146,6 +9163,8 @@ class MemoryStore:
         window_id: str,
         read_mode: str = "",
         share_mode: str = "",
+        capture_enabled: Any = _ACL_UNSET,
+        recall_enabled: Any = _ACL_UNSET,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._upsert_acl_policy_sync,
@@ -9153,6 +9172,8 @@ class MemoryStore:
             window_id,
             read_mode,
             share_mode,
+            capture_enabled,
+            recall_enabled,
         )
 
     def _upsert_acl_policy_sync(
@@ -9161,12 +9182,24 @@ class MemoryStore:
         window_id: str,
         read_mode: str,
         share_mode: str,
+        capture_enabled: Any,
+        recall_enabled: Any,
     ) -> dict[str, Any]:
         window_scope = clean_text(window_scope, 40)
         window_id = clean_text(window_id, 160)
         current = self._get_acl_policy_sync(window_scope, window_id)
         read_mode = self._normalize_acl_mode(read_mode or current.get("read_mode"))
         share_mode = self._normalize_acl_mode(share_mode or current.get("share_mode"))
+        next_capture = (
+            current.get("capture_enabled")
+            if capture_enabled is _ACL_UNSET
+            else self._normalize_acl_feature_override(capture_enabled)
+        )
+        next_recall = (
+            current.get("recall_enabled")
+            if recall_enabled is _ACL_UNSET
+            else self._normalize_acl_feature_override(recall_enabled)
+        )
         now = utc_now()
         data = {
             "id": current.get("id") or new_id("acl_policy"),
@@ -9174,6 +9207,8 @@ class MemoryStore:
             "window_id": window_id,
             "read_mode": read_mode,
             "share_mode": share_mode,
+            "capture_enabled": next_capture,
+            "recall_enabled": next_recall,
             "created_at": current.get("created_at") or now,
             "updated_at": now,
         }
@@ -9181,12 +9216,16 @@ class MemoryStore:
             self._conn.execute(
                 """
                 INSERT INTO memory_acl_policies(
-                    id, window_scope, window_id, read_mode, share_mode, created_at, updated_at
+                    id, window_scope, window_id, read_mode, share_mode,
+                    capture_enabled, recall_enabled, created_at, updated_at
                 )
-                VALUES(:id, :window_scope, :window_id, :read_mode, :share_mode, :created_at, :updated_at)
+                VALUES(:id, :window_scope, :window_id, :read_mode, :share_mode,
+                       :capture_enabled, :recall_enabled, :created_at, :updated_at)
                 ON CONFLICT(window_scope, window_id) DO UPDATE SET
                     read_mode=excluded.read_mode,
                     share_mode=excluded.share_mode,
+                    capture_enabled=excluded.capture_enabled,
+                    recall_enabled=excluded.recall_enabled,
                     updated_at=excluded.updated_at
                 """,
                 data,
@@ -9207,6 +9246,8 @@ class MemoryStore:
             "window_id": window_id,
             "read_mode": default_mode,
             "share_mode": default_mode,
+            "capture_enabled": None,
+            "recall_enabled": None,
             "created_at": "",
             "updated_at": "",
         }
@@ -9216,7 +9257,42 @@ class MemoryStore:
         item = dict(row)
         item["read_mode"] = cls._normalize_acl_mode(item.get("read_mode"))
         item["share_mode"] = cls._normalize_acl_mode(item.get("share_mode"))
+        for key in ("capture_enabled", "recall_enabled"):
+            value = item.get(key)
+            item[key] = None if value is None else bool(value)
         return item
+
+    @staticmethod
+    def _normalize_acl_feature_override(value: Any) -> bool | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        return bool(value)
+
+    def get_scope_feature_override_sync(self, scope: str, window_id: str) -> dict[str, bool | None]:
+        scope = clean_text(scope, 40)
+        window_id = clean_text(window_id, 160)
+        if scope not in {"private", "group"} or not window_id:
+            return {"capture_enabled": None, "recall_enabled": None}
+        with self._lock:
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(memory_acl_policies)").fetchall()
+            }
+            if not {"capture_enabled", "recall_enabled"}.issubset(columns):
+                return {"capture_enabled": None, "recall_enabled": None}
+            row = self._conn.execute(
+                "SELECT capture_enabled, recall_enabled FROM memory_acl_policies "
+                "WHERE window_scope=? AND window_id=?",
+                (scope, window_id),
+            ).fetchone()
+        if not row:
+            return {"capture_enabled": None, "recall_enabled": None}
+        return {
+            "capture_enabled": None if row["capture_enabled"] is None else bool(row["capture_enabled"]),
+            "recall_enabled": None if row["recall_enabled"] is None else bool(row["recall_enabled"]),
+        }
 
     @staticmethod
     def _normalize_acl_effect(effect: Any) -> str:

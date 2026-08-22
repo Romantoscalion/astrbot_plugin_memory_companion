@@ -5137,6 +5137,16 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .topo-node-id{font-size:10px;fill:var(--muted);opacity:.86;pointer-events:none;user-select:none;font-family:monospace}
 .topo-node-group-badge{background:rgba(74,136,136,.12);color:var(--topo-group-color,#4a8);border:1px solid rgba(74,136,136,.25)}
 .topo-node-private-badge{background:rgba(136,102,204,.1);color:var(--topo-private-color,#86c);border:1px solid rgba(136,102,204,.25)}
+.topo-window-controls{display:grid;gap:10px;padding:12px 14px;border:1px solid var(--line-soft);border-radius:8px;background:var(--panel);}
+.topo-window-controls-empty{color:var(--muted);font-size:12px;}
+.topo-window-controls-title{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;color:var(--ink);}
+.topo-window-controls-title small,.topo-window-feature small{color:var(--muted);font-size:11px;font-weight:400;}
+.topo-window-feature-grid{display:flex;flex-wrap:wrap;gap:8px;}
+.topo-window-feature{display:flex;align-items:center;gap:8px;min-width:120px;padding:8px 10px;border:1px solid var(--line-soft);border-radius:7px;cursor:pointer;}
+.topo-window-feature span{display:grid;gap:2px;color:var(--ink);font-size:12px;}
+.topo-window-feature input{width:16px;height:16px;margin-left:auto;accent-color:var(--accent,#6d8f86);}
+.topo-window-reset{justify-self:start;padding:5px 9px;border:1px solid var(--line-soft);border-radius:6px;background:transparent;color:var(--muted);font-size:11px;cursor:pointer;}
+.topo-window-reset:hover{color:var(--accent-strong);border-color:var(--accent-strong);}
 .topo-state-allow{background:rgba(74,153,153,.15);color:var(--acl-allow)}
 .topo-state-deny{background:rgba(193,68,51,.12);color:var(--acl-deny)}
 .topo-state-default{background:rgba(233,153,85,.1);color:var(--acl-default-deny)}

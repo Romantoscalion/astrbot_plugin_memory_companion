@@ -44,6 +44,18 @@ class ScopeControlTests(unittest.IsolatedAsyncioTestCase):
             message_text="remember this",
         )
 
+    @staticmethod
+    def group_context(group_id: str = "g1") -> SessionContext:
+        return SessionContext(
+            session_id=f"qq:GroupMessage:{group_id}",
+            scope="group",
+            platform="qq",
+            user_id="u1",
+            group_id=group_id,
+            bot_id="b1",
+            message_text="remember this",
+        )
+
     async def test_scope_controls_default_to_enabled_and_can_be_disabled(self) -> None:
         service = self.make_service(
             {
@@ -90,6 +102,47 @@ class ScopeControlTests(unittest.IsolatedAsyncioTestCase):
         state = await engine._acl_state()
         self.assertIn("group", state["disabled_scopes"])
         self.assertFalse(state["allow"])
+
+    async def test_window_override_only_affects_one_group(self) -> None:
+        service = self.make_service({"group_capture_enabled": True, "group_recall_enabled": True})
+        await service.store.upsert_acl_policy(
+            window_scope="group",
+            window_id="g1",
+            capture_enabled=False,
+            recall_enabled=False,
+        )
+        self.assertFalse(service._scope_feature_enabled(self.group_context("g1"), "capture"))
+        self.assertFalse(service._scope_feature_enabled(self.group_context("g1"), "recall"))
+        self.assertTrue(service._scope_feature_enabled(self.group_context("g2"), "capture"))
+        self.assertTrue(service._scope_feature_enabled(self.group_context("g2"), "recall"))
+
+        await service.store.upsert_acl_policy(
+            window_scope="group",
+            window_id="g1",
+            capture_enabled=None,
+            recall_enabled=None,
+        )
+        self.assertTrue(service._scope_feature_enabled(self.group_context("g1"), "capture"))
+
+    async def test_window_override_blocks_bridge_capture_for_one_group(self) -> None:
+        service = self.make_service({"group_capture_enabled": True})
+        await service.store.upsert_acl_policy(
+            window_scope="group",
+            window_id="g1",
+            capture_enabled=False,
+        )
+        service.store.add_timeline_event = AsyncMock(side_effect=AssertionError("must not write"))
+        result = await service.record_visible_turn(
+            role="user",
+            content="blocked",
+            scope="group",
+            session_id="qq:GroupMessage:g1",
+            platform="qq",
+            user_id="u1",
+            group_id="g1",
+        )
+        self.assertEqual(result, "")
+        service.store.add_timeline_event.assert_not_awaited()
 
 
 if __name__ == "__main__":

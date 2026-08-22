@@ -867,6 +867,8 @@ class PluginPageApi:
                         "window_id": clean_text(p.get("window_id"), 160),
                         "read_mode": p.get("read_mode") or ("blacklist" if clean_text(p.get("window_scope"), 40) == "group" else "whitelist"),
                         "share_mode": p.get("share_mode") or ("blacklist" if clean_text(p.get("window_scope"), 40) == "group" else "whitelist"),
+                        "capture_enabled": p.get("capture_enabled"),
+                        "recall_enabled": p.get("recall_enabled"),
                     }
                     for p in policies
                     if clean_text(p.get("window_scope"), 40) in topology_scopes
@@ -1050,12 +1052,19 @@ class PluginPageApi:
         error = self._acl_window_error(window_scope, window_id)
         if error:
             return self._err(error, 400)
-        policy = await self.plugin.service.store.upsert_acl_policy(
-            window_scope=window_scope,
-            window_id=window_id,
-            read_mode=self._acl_mode(payload.get("read_mode")),
-            share_mode=self._acl_mode(payload.get("share_mode")),
-        )
+        policy_values: dict[str, Any] = {
+            "window_scope": window_scope,
+            "window_id": window_id,
+            "read_mode": self._acl_mode(payload.get("read_mode")),
+            "share_mode": self._acl_mode(payload.get("share_mode")),
+        }
+        for key in ("capture_enabled", "recall_enabled"):
+            if key in payload:
+                value = payload.get(key)
+                if value is not None and not isinstance(value, (bool, int, str)):
+                    return self._err(f"{key} must be a boolean or null", 400)
+                policy_values[key] = value
+        policy = await self.plugin.service.store.upsert_acl_policy(**policy_values)
         return self._ok({"policy": policy})
 
     async def acl_delete(self):

@@ -317,15 +317,28 @@ class MemoryCompanionService:
         return self.config.bool(key, False)
 
     def _scope_feature_enabled(self, scope_or_ctx: str | SessionContext, feature: str) -> bool:
+        window_id = ""
         scope = (
             scope_or_ctx.scope
             if isinstance(scope_or_ctx, SessionContext)
             else clean_text(scope_or_ctx, 40)
         )
+        if isinstance(scope_or_ctx, SessionContext):
+            window_id = clean_text(scope_or_ctx.current_target_id, 160)
         scope = clean_text(scope, 40).lower()
         feature = clean_text(feature, 40).lower()
         if scope not in {"private", "group"} or feature not in self._SCOPE_CONTROL_FEATURES:
             return True
+        if window_id and feature in {"capture", "recall"}:
+            getter = getattr(self.store, "get_scope_feature_override_sync", None)
+            if callable(getter):
+                try:
+                    override = getter(scope, window_id)
+                except Exception:
+                    override = {}
+                value = override.get(f"{feature}_enabled") if isinstance(override, dict) else None
+                if value is not None:
+                    return bool(value)
         config = getattr(self, "config", None)
         config_bool = getattr(config, "bool", None)
         if not callable(config_bool):
@@ -1395,7 +1408,17 @@ class MemoryCompanionService:
             event_metadata.setdefault("message_id", clean_text(message_id, 120))
         normalized_session_id = clean_text(session_id, 200)
         normalized_scope = clean_text(scope, 40)
-        if not self._scope_feature_enabled(normalized_scope, "capture"):
+        scope_ctx = SessionContext(
+            session_id=normalized_session_id,
+            scope=normalized_scope,
+            platform=clean_text(platform, 40),
+            user_id=clean_text(user_id, 120),
+            user_name=clean_text(user_name, 120),
+            group_id=clean_text(group_id, 120),
+            bot_id=clean_text(event_metadata.get("bot_id"), 120),
+            message_id=clean_text(message_id, 120),
+        )
+        if not self._scope_feature_enabled(scope_ctx, "capture"):
             return ""
         event_id = await self.store.add_timeline_event(
             event_type=event_type,

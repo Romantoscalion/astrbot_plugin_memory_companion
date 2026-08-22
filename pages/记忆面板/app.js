@@ -7225,9 +7225,57 @@ async function loadAclTopology() {
 
 function _policyFor(policies, scope, id) {
   const found = policies.find(p => p.window_scope === scope && p.window_id === id);
-  if (found) return { read_mode: found.read_mode, share_mode: found.share_mode };
+  if (found) {
+    return {
+      read_mode: found.read_mode,
+      share_mode: found.share_mode,
+      capture_enabled: found.capture_enabled ?? null,
+      recall_enabled: found.recall_enabled ?? null,
+    };
+  }
   const defaultMode = scope === "group" ? "blacklist" : "whitelist";
-  return { read_mode: defaultMode, share_mode: defaultMode };
+  return {
+    read_mode: defaultMode,
+    share_mode: defaultMode,
+    capture_enabled: null,
+    recall_enabled: null,
+  };
+}
+
+function _windowFeatureValue(data, node, feature) {
+  const policy = _policyFor(data?.policies || [], node.scope, node.id);
+  const override = policy[`${feature}_enabled`];
+  if (override !== null && override !== undefined) return Boolean(override);
+  return Boolean(data?.scope_control?.[`${node.scope}_${feature}_enabled`]);
+}
+
+function _renderWindowFeatureControls(data, windows) {
+  const selectedKey = _topologyState.selectedNode;
+  const node = (windows || []).find(item => _topologyNodeKey(item) === selectedKey);
+  if (!node) {
+    return '<div class="topo-window-controls topo-window-controls-empty">选择一个群聊或私聊窗口，可单独调整记录和召回。</div>';
+  }
+  const policy = _policyFor(data?.policies || [], node.scope, node.id);
+  const scopeLabel = node.scope === "group" ? "群聊" : "私聊";
+  const renderFeature = (feature, label) => {
+    const override = policy[`${feature}_enabled`];
+    const checked = _windowFeatureValue(data, node, feature);
+    const source = override === null || override === undefined ? "跟随全局" : "本窗口覆盖";
+    return `
+      <label class="topo-window-feature">
+        <span>${label}<small>${source}</small></span>
+        <input type="checkbox" data-window-feature="${feature}"${checked ? " checked" : ""} />
+      </label>`;
+  };
+  return `
+    <div class="topo-window-controls" data-window-scope="${escapeHtml(node.scope)}" data-window-id="${escapeHtml(node.id)}">
+      <div class="topo-window-controls-title"><b>${escapeHtml(scopeLabel)}：${escapeHtml(_shortId(node.label || node.id, 32))}</b><small>单独窗口设置</small></div>
+      <div class="topo-window-feature-grid">
+        ${renderFeature("capture", "记录")}
+        ${renderFeature("recall", "召回")}
+      </div>
+      <button type="button" class="topo-window-reset" data-window-feature-reset>恢复跟随全局</button>
+    </div>`;
 }
 
 function _findRule(rules, ownerScope, ownerId, readerScope, readerId) {
@@ -7324,8 +7372,8 @@ function renderAclTopology(data) {
   const rules = data.rules || [];
   const policies = data.policies || [];
 
-  if (windows.length < 2) {
-    return `<div class="empty-state">至少需要 2 个窗口才能配置权限。当前有 ${windows.length} 个窗口。</div>`;
+  if (!windows.length) {
+    return '<div class="empty-state">当前还没有可配置的群聊或私聊窗口。</div>';
   }
 
   const { nodes, width, height } = _layoutNodes(windows);
@@ -7445,6 +7493,7 @@ function renderAclTopology(data) {
           <g class="topo-nodes">${nodesHtml}</g>
         </svg>
       </div>
+      ${_renderWindowFeatureControls(data, windows)}
     </div>`;
 }
 
@@ -7465,6 +7514,13 @@ function bindAclTopologyInteractions(container) {
       }
       _rerenderTopology();
     });
+  });
+
+  container.querySelectorAll("input[data-window-feature]").forEach(input => {
+    input.addEventListener("change", () => _updateWindowFeature(input));
+  });
+  container.querySelectorAll("[data-window-feature-reset]").forEach(button => {
+    button.addEventListener("click", () => _resetWindowFeatures());
   });
 
   // Arrow click
@@ -7491,6 +7547,54 @@ function bindAclTopologyInteractions(container) {
     });
   });
 
+}
+
+async function _updateWindowFeature(input) {
+  const controls = input.closest("[data-window-scope][data-window-id]");
+  if (!controls || _topologyState.busy) return;
+  const feature = input.dataset.windowFeature || "";
+  if (!(feature === "capture" || feature === "recall")) return;
+  _topologyState.busy = true;
+  input.disabled = true;
+  try {
+    await apiPost("/acl/policy", {
+      scope: controls.dataset.windowScope,
+      id: controls.dataset.windowId,
+      [`${feature}_enabled`]: Boolean(input.checked),
+    });
+    const fresh = await apiGet("/acl/matrix");
+    _topologyState.data = fresh;
+    _topologyState.busy = false;
+    _rerenderTopology();
+    showToast(`已单独${input.checked ? "启用" : "停用"}${feature === "capture" ? "记录" : "召回"}`);
+  } catch (err) {
+    _topologyState.busy = false;
+    input.checked = !input.checked;
+    input.disabled = false;
+    showToast(err?.message || "窗口设置保存失败", "error");
+  }
+}
+
+async function _resetWindowFeatures() {
+  const controls = document.querySelector("#aclTopologyContainer [data-window-scope][data-window-id]");
+  if (!controls || _topologyState.busy) return;
+  _topologyState.busy = true;
+  try {
+    await apiPost("/acl/policy", {
+      scope: controls.dataset.windowScope,
+      id: controls.dataset.windowId,
+      capture_enabled: null,
+      recall_enabled: null,
+    });
+    const fresh = await apiGet("/acl/matrix");
+    _topologyState.data = fresh;
+    _topologyState.busy = false;
+    _rerenderTopology();
+    showToast("已恢复跟随全局设置");
+  } catch (err) {
+    _topologyState.busy = false;
+    showToast(err?.message || "窗口设置恢复失败", "error");
+  }
 }
 
 function _rerenderTopology() {
