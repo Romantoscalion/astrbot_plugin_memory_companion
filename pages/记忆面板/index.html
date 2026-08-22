@@ -17,7 +17,7 @@
       document.documentElement.dataset.overviewLayout = layout;
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=1.9.2-ui-v4" />
+  <link rel="stylesheet" href="./app.css?v=1.9.3-ui-v1" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -201,10 +201,13 @@
             <div class="section-head">
               <div>
                 <h3 id="groupMemoryTitle">群聊记忆</h3>
-                <p id="groupMemoryHint">查看群聊范围内可被召回和管理的结构化记忆。</p>
+                <p id="groupMemoryHint">查看群聊范围内可被召回和管理的结构化记忆。顶部开关作用于所有群聊窗口。</p>
               </div>
               <div class="section-actions scoped-clear-actions">
-                <div id="groupScopeControl" class="scope-control-host"></div>
+                <div class="scope-control-panel">
+                  <div id="groupScopeControl" class="scope-control-host"></div>
+                  <button class="scope-control-link" type="button" data-archive-jump="topology">按窗口设置</button>
+                </div>
                 <button id="clearCurrentGroupMemoryBtn" class="danger subtle" type="button" disabled>清空当前群</button>
                 <div class="group-member-clear">
                   <input id="clearGroupMemberUserId" type="text" inputmode="numeric" placeholder="群成员 QQ" disabled />
@@ -243,7 +246,10 @@
                 <p id="userMemoryHint">选择左侧用户后，在同一工作区查看私聊、画像、偏好和关系记忆。</p>
               </div>
               <div class="section-actions">
-                <div id="privateScopeControl" class="scope-control-host"></div>
+                <div class="scope-control-panel">
+                  <div id="privateScopeControl" class="scope-control-host"></div>
+                  <button class="scope-control-link" type="button" data-archive-jump="topology">按窗口设置</button>
+                </div>
                 <button id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>
               </div>
             </div>
@@ -495,6 +501,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=1.9.2-ui-v4"></script>
+  <script src="./app.js?v=1.9.3-ui-v1"></script>
 </body>
 </html>

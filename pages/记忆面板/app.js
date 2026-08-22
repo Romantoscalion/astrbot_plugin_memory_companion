@@ -10,12 +10,12 @@ const TRANSPARENT_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAA
 
 const VIEWS = {
   objects: { title: "知识图谱", hint: "查看关系边、跨窗口线程、时间线、记忆节点和互动协同概览。" },
-  film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。" },
+  film: { title: "群聊记忆", hint: "查看群聊范围内可召回、可管理的结构化记忆。顶部开关作用于所有群聊窗口；单个窗口请到权限拓扑设置。" },
   microscope: { title: "记忆显微镜", hint: "对比全库管理检索与指定会话中的实际召回和过滤。" },
-  relations: { title: "用户档案与记忆", hint: "按用户统一查看私聊、画像、偏好、称呼和关系记忆。" },
+  relations: { title: "用户档案与记忆", hint: "按用户统一查看私聊、画像、偏好、称呼和关系记忆。顶部开关作用于所有私聊窗口；单个窗口请到权限拓扑设置。" },
   review: { title: "个人记忆", hint: "查看 Bot 自身的每日生活日程、相册、主观记忆和细化片段。" },
   archive: { title: "维护 / 迁移 / 配置", hint: "执行维护、迁移、清理和导入修复。" },
-  maintain: { title: "私聊记忆", hint: "查看私聊范围内的对话、偏好、事实和稳定记忆。" },
+  maintain: { title: "私聊记忆", hint: "查看私聊范围内的对话、偏好、事实和稳定记忆。顶部开关作用于所有私聊窗口；单个窗口请到权限拓扑设置。" },
 };
 
 const PERSONAL_MEMORY_VIEW = {
@@ -215,6 +215,7 @@ const state = {
     private_topology_enabled: true,
     group_topology_enabled: true,
   },
+  windowScopePolicies: {},
 };
 
 const DEFAULT_THEME = "yuebai";
@@ -567,26 +568,71 @@ async function loadConfiguredTheme() {
       ...(data.scope_control || {}),
     };
     renderScopeControls();
+    void loadScopeFeatureOverrides();
   } catch (error) {
     applyTheme(DEFAULT_THEME);
     renderScopeControls();
   }
 }
 
-function scopeControlStatus(key) {
-  return state.scopeControl[key] ? "已启用" : "已停用";
+function scopeControlTarget(key) {
+  const bucket = activeBucket();
+  const scope = key.startsWith("group_") ? "group" : key.startsWith("private_") ? "private" : "";
+  return scope && isWindowBucket(bucket) && bucket.scope === scope ? bucket : null;
 }
 
-function renderScopeControlHost(host, keys) {
+function scopeControlFeature(key) {
+  return key.includes("capture") ? "capture" : key.includes("recall") ? "recall" : "";
+}
+
+function scopeControlValue(key) {
+  const target = scopeControlTarget(key);
+  const feature = scopeControlFeature(key);
+  const policy = target ? state.windowScopePolicies[`${target.scope}:${target.target_id}`] : null;
+  const override = policy && feature ? policy[`${feature}_enabled`] : null;
+  return override === null || override === undefined ? Boolean(state.scopeControl[key]) : Boolean(override);
+}
+
+function scopeControlStatus(key) {
+  const target = scopeControlTarget(key);
+  const feature = scopeControlFeature(key);
+  const policy = target ? state.windowScopePolicies[`${target.scope}:${target.target_id}`] : null;
+  const override = policy && feature ? policy[`${feature}_enabled`] : null;
+  return target && override !== null && override !== undefined
+    ? (override ? "本窗口已启用" : "本窗口已停用")
+    : (scopeControlValue(key) ? "已启用" : "已停用");
+}
+
+async function loadScopeFeatureOverrides() {
+  try {
+    const data = await apiGet("/acl/matrix");
+    state.windowScopePolicies = {};
+    for (const policy of data.policies || []) {
+      const scope = String(policy.window_scope || "").trim();
+      const id = String(policy.window_id || "").trim();
+      if (scope && id) state.windowScopePolicies[`${scope}:${id}`] = policy;
+    }
+    renderScopeControls();
+  } catch (_) {
+    // Global controls remain usable if per-window policy loading is unavailable.
+  }
+}
+
+function renderScopeControlHost(host, keys, options = {}) {
   if (!host) return;
+  const title = String(options.title || "").trim();
+  const hint = String(options.hint || "").trim();
   host.innerHTML = `
-    <div class="scope-control-grid">
+    <div class="scope-control-shell">
+      ${title ? `<div class="scope-control-copy"><b>${escapeHtml(title)}</b>${hint ? `<small>${escapeHtml(hint)}</small>` : ""}</div>` : ""}
+      <div class="scope-control-grid">
       ${keys.map((item) => `
         <label class="scope-control-item">
           <span>${escapeHtml(item.label)}<small data-scope-status="${escapeHtml(item.key)}">${scopeControlStatus(item.key)}</small></span>
-          <input type="checkbox" data-scope-control="${escapeHtml(item.key)}"${state.scopeControl[item.key] ? " checked" : ""} />
+          <input type="checkbox" data-scope-control="${escapeHtml(item.key)}"${scopeControlValue(item.key) ? " checked" : ""} />
         </label>
       `).join("")}
+      </div>
     </div>
   `;
   host.querySelectorAll("input[data-scope-control]").forEach((input) => {
@@ -595,38 +641,59 @@ function renderScopeControlHost(host, keys) {
 }
 
 function renderScopeControls() {
+  const groupTarget = scopeControlTarget("group_capture_enabled");
+  const privateTarget = scopeControlTarget("private_capture_enabled");
+  const groupLabel = groupTarget ? "本窗口记录" : "全局记录";
+  const groupRecallLabel = groupTarget ? "本窗口召回" : "全局召回";
+  const privateLabel = privateTarget ? "本窗口记录" : "全局记录";
+  const privateRecallLabel = privateTarget ? "本窗口召回" : "全局召回";
   renderScopeControlHost($("#groupScopeControl"), [
-    { key: "group_capture_enabled", label: "记录" },
-    { key: "group_recall_enabled", label: "召回" },
-  ]);
+    { key: "group_capture_enabled", label: groupLabel },
+    { key: "group_recall_enabled", label: groupRecallLabel },
+  ], { title: groupTarget ? `当前窗口：${bucketLabel(groupTarget)}` : "群聊范围开关", hint: groupTarget ? "只控制当前选中的群聊" : "所有未单独覆盖的群聊窗口" });
   renderScopeControlHost($("#privateScopeControl"), [
-    { key: "private_capture_enabled", label: "记录" },
-    { key: "private_recall_enabled", label: "召回" },
-  ]);
+    { key: "private_capture_enabled", label: privateLabel },
+    { key: "private_recall_enabled", label: privateRecallLabel },
+  ], { title: privateTarget ? `当前窗口：${bucketLabel(privateTarget)}` : "私聊范围开关", hint: privateTarget ? "只控制当前选中的私聊窗口" : "所有未单独覆盖的私聊窗口" });
   renderScopeControlHost($("#privateLegacyScopeControl"), [
-    { key: "private_capture_enabled", label: "记录" },
-    { key: "private_recall_enabled", label: "召回" },
-  ]);
+    { key: "private_capture_enabled", label: privateLabel },
+    { key: "private_recall_enabled", label: privateRecallLabel },
+  ], { title: privateTarget ? `当前窗口：${bucketLabel(privateTarget)}` : "私聊范围开关", hint: privateTarget ? "只控制当前选中的私聊窗口" : "所有未单独覆盖的私聊窗口" });
   renderScopeControlHost($("#topologyScopeControl"), [
     { key: "group_topology_enabled", label: "群聊参与" },
     { key: "private_topology_enabled", label: "私聊参与" },
-  ]);
+  ], { title: "拓扑参与范围", hint: "关闭后该范围不参与跨窗口权限" });
 }
 
 async function updateScopeControl(input) {
   const key = input?.dataset?.scopeControl || "";
   if (!key || !(key in state.scopeControl) || input.disabled) return;
-  const previous = Boolean(state.scopeControl[key]);
+  const previous = scopeControlValue(key);
   const next = Boolean(input.checked);
+  const target = scopeControlTarget(key);
+  const feature = scopeControlFeature(key);
   input.disabled = true;
   try {
-    await apiPost("/config/module/update", { module: "scope_control", values: { [key]: next } });
-    state.scopeControl[key] = next;
+    if (target && feature) {
+      await apiPost("/acl/policy", {
+        scope: target.scope,
+        id: target.target_id,
+        [`${feature}_enabled`]: next,
+      });
+      const policyKey = `${target.scope}:${target.target_id}`;
+      state.windowScopePolicies[policyKey] = {
+        ...(state.windowScopePolicies[policyKey] || { window_scope: target.scope, window_id: target.target_id }),
+        [`${feature}_enabled`]: next,
+      };
+    } else {
+      await apiPost("/config/module/update", { module: "scope_control", values: { [key]: next } });
+      state.scopeControl[key] = next;
+    }
     renderScopeControls();
     if (key.endsWith("_topology_enabled")) {
       await loadAclTopology();
     }
-    showToast(`${next ? "已启用" : "已停用"} ${key.startsWith("group_") ? "群聊" : "私聊"}${key.includes("capture") ? "记录" : key.includes("recall") ? "召回" : "拓扑参与"}`);
+    showToast(`${target ? "已单独" : ""}${next ? "启用" : "停用"} ${target ? bucketLabel(target) : (key.startsWith("group_") ? "群聊" : "私聊")}${feature === "capture" ? "记录" : feature === "recall" ? "召回" : "拓扑参与"}`);
   } catch (error) {
     input.checked = previous;
     showToast(error?.message || "开关保存失败", "error");
@@ -1421,6 +1488,7 @@ function renderScopedBucketRail(scope) {
   if (state.activeBucketId !== "all" && !scopedBuckets.some((bucket) => bucket.id === state.activeBucketId)) {
     state.activeBucketId = "all";
   }
+  renderScopeControls();
   const totalCount = scopedBuckets.reduce((sum, bucket) => sum + Number(bucket.memory_count || 0), 0);
   const allBucket = {
     id: "all",
@@ -6822,6 +6890,7 @@ async function refreshAll() {
 }
 
 function bindActions() {
+  bindArchiveJumpButtons(document);
   const stage = document.querySelector(".projection-stage");
   const layoutButtons = $$(".overview-layout-option");
   layoutButtons.forEach((button, index) => {
