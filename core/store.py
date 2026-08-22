@@ -1332,6 +1332,7 @@ class MemoryStore:
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(memories)").fetchall()
         }
+        salience_added = "salience" not in existing
         additions = {
             "content_fingerprint": "TEXT NOT NULL DEFAULT ''",
             "merged_count": "INTEGER NOT NULL DEFAULT 1",
@@ -1343,7 +1344,11 @@ class MemoryStore:
             ),
             "valid_from": "TEXT NOT NULL DEFAULT ''",
             "valid_to": "TEXT NOT NULL DEFAULT ''",
-            "salience": "REAL NOT NULL DEFAULT 0.3 CHECK(salience >= 0 AND salience <= 1)",
+            # SQLite cannot reliably add a NOT NULL column with a fractional
+            # default to a populated legacy table.  Use an integer default for
+            # the ALTER TABLE path; _backfill_memory_atom_v2_sync restores the
+            # legacy metadata/importance-derived value immediately afterwards.
+            "salience": "REAL NOT NULL DEFAULT 0 CHECK(salience >= 0 AND salience <= 1)",
             "durability": (
                 "TEXT NOT NULL DEFAULT 'normal' "
                 "CHECK(durability IN ('ephemeral','short','normal','durable','pinned'))"
@@ -1362,9 +1367,9 @@ class MemoryStore:
         for name, ddl in additions.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
-        self._backfill_memory_atom_v2_sync()
+        self._backfill_memory_atom_v2_sync(restore_legacy_salience=salience_added)
 
-    def _backfill_memory_atom_v2_sync(self) -> int:
+    def _backfill_memory_atom_v2_sync(self, *, restore_legacy_salience: bool = False) -> int:
         """Populate v2 atom columns without rewriting legacy content or timestamps."""
 
         rows = self._conn.execute("SELECT * FROM memories").fetchall()
@@ -1385,6 +1390,13 @@ class MemoryStore:
         )
         for row in rows:
             record = MemoryRecord.from_row(row)
+            if restore_legacy_salience and not row["salience"]:
+                metadata = json_loads(row["metadata"], {})
+                if isinstance(metadata, dict):
+                    # The migration default is deliberately zero for SQLite
+                    # compatibility; recover the legacy semantic default or
+                    # explicit metadata value before writing the atom fields.
+                    record.salience = metadata.get("salience", record.importance)
             values = record.to_db()
             current = tuple(row[name] for name in columns)
             desired = tuple(values[name] for name in columns)

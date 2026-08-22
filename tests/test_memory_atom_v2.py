@@ -339,6 +339,13 @@ class MemoryAtomV2Tests(unittest.TestCase):
         self.assertTrue(upgraded.canonical_key.startswith("mav2:"))
         self.assertTrue(upgraded.content_fingerprint.startswith("mav2:"))
         self.assertEqual("", unknown.owner_bot_id)
+        salience_column = store._conn.execute(
+            "PRAGMA table_info(memories)"
+        ).fetchall()
+        salience_definition = next(
+            row for row in salience_column if row[1] == "salience"
+        )
+        self.assertEqual("0", salience_definition[4])
         self.assertEqual(2, store._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
 
     def test_fingerprint_and_canonical_key_are_scoped_by_bot_and_platform(self) -> None:
