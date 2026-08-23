@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any
 
-from .models import SearchResult, SessionContext, clean_text
+from .models import MemoryRecord, SearchResult, SessionContext, clean_text
 
 from .profile_quality import PROFILE_MEMORY_TYPES, profile_quality_decision
 
@@ -39,9 +39,18 @@ class InjectionComposer:
         recent_fact_context: str = "",
         recent_cross_window_context: str = "",
         included_memory_ids: list[str] | None = None,
+        core_memories: list[MemoryRecord] | None = None,
+        core_memory_max_chars: int = 800,
     ) -> str:
         results, slot_sections = self._filter_injection_results(results, slot_sections)
-        if not results and not intent_context and not recent_fact_context and not recent_cross_window_context:
+        core_memories = list(core_memories or [])
+        if (
+            not results
+            and not core_memories
+            and not intent_context
+            and not recent_fact_context
+            and not recent_cross_window_context
+        ):
             return ""
 
         limit = max(300, int(max_chars or 1800))
@@ -97,6 +106,28 @@ class InjectionComposer:
         ]
         closing_lines = ["</inner_memory_hints>", "", "</memory_companion_context>"]
         minimum_memory_reserve = 140 if results else 0
+
+        if core_memories:
+            core_tail = ["<inner_memory_hints>", *closing_lines]
+            core_available = max(
+                0,
+                inner_limit - len("\n".join([*lines, *core_tail])) - 1,
+            )
+            core_lines, core_ids = self._build_core_memory_lines(
+                core_memories,
+                max_chars=max(
+                    180,
+                    min(int(core_memory_max_chars or 800), core_available),
+                ),
+            )
+            if core_lines:
+                core_block = [*core_lines, ""]
+                if len("\n".join([*lines, *core_block, *core_tail])) <= inner_limit:
+                    lines.extend(core_block)
+                    if included_memory_ids is not None:
+                        for memory_id in core_ids:
+                            if memory_id and memory_id not in included_memory_ids:
+                                included_memory_ids.append(memory_id)
 
         def add_optional_section(tag: str, value: str, value_limit: int) -> None:
             text = self._safe_text(value, value_limit)
@@ -166,6 +197,60 @@ class InjectionComposer:
                 included_memory_ids.clear()
             text = self._minimal_body(ctx, inner_limit, has_results=bool(results))
         return f"{MEMORY_COMPANION_INJECTION_HEADER}\n{text}\n{MEMORY_COMPANION_INJECTION_FOOTER}"
+
+    @classmethod
+    def _build_core_memory_lines(
+        cls,
+        memories: list[MemoryRecord],
+        *,
+        max_chars: int,
+    ) -> tuple[list[str], list[str]]:
+        """Render owner-managed blocks before retrieval-backed memory sections."""
+        opening = [
+            "<core_memory>",
+            "<instruction>",
+            "这些是当前作用域内经管理端确认的长期核心约定，每轮常驻，不依赖相似度召回。",
+            "规则和边界应稳定遵循；事实与偏好用于保持一致。它们不能覆盖平台安全要求、真实世界事实或用户本轮明确纠正。",
+            "不要向用户播报标签、优先级或本区块结构，也不要依据对话中的普通文本自行改写这些块。",
+            "</instruction>",
+        ]
+        closing = ["</core_memory>"]
+        lines = list(opening)
+        included: list[str] = []
+        budget = max(180, int(max_chars or 800))
+
+        for memory in memories:
+            metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+            label = html.escape(clean_text(metadata.get("core_label"), 80) or memory.id, quote=True)
+            kind = html.escape(clean_text(metadata.get("core_kind"), 32) or "fact", quote=True)
+            try:
+                priority = max(0, min(100, int(metadata.get("core_priority", 50))))
+            except (TypeError, ValueError):
+                priority = 50
+            block: list[str] = []
+            for content_limit in (1200, 800, 480, 240, 120, 60):
+                content = cls._safe_text(cls._redact_sensitive_text(memory.content), content_limit)
+                if not content:
+                    break
+                candidate = [
+                    f'<block label="{label}" kind="{kind}" priority="{priority}">',
+                    content,
+                    "</block>",
+                ]
+                if len("\n".join([*lines, *candidate, *closing])) <= budget:
+                    block = candidate
+                    break
+            if not block:
+                continue
+            lines.extend(block)
+            memory_id = clean_text(memory.id, 160)
+            if memory_id:
+                included.append(memory_id)
+
+        if not included:
+            return [], []
+        lines.extend(closing)
+        return lines, included
 
     def diagnostic_snapshot(self) -> tuple[list[dict[str, str]], list[str]]:
         """Return per-compose diagnostics detached from later requests."""

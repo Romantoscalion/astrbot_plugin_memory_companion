@@ -7900,6 +7900,110 @@ class MemoryStore:
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
 
+    async def list_core_memories(self, limit: int = 200) -> list[MemoryRecord]:
+        """Read active core blocks without routing them through similarity search."""
+        return await self._run_recoverable_database_operation(
+            self._list_core_memories_sync,
+            limit,
+        )
+
+    def _list_core_memories_sync(self, limit: int) -> list[MemoryRecord]:
+        now = utc_now()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM memories
+                WHERE memory_type='core_memory'
+                  AND lifecycle!='archived'
+                  AND review_status!='pending'
+                  AND validity_status='active'
+                  AND (valid_from='' OR julianday(valid_from) IS NULL OR julianday(valid_from)<=julianday(?))
+                  AND (valid_to='' OR julianday(valid_to) IS NULL OR julianday(valid_to)>=julianday(?))
+                ORDER BY
+                    CASE
+                        WHEN json_valid(metadata)
+                        THEN COALESCE(CAST(json_extract(metadata, '$.core_priority') AS INTEGER), 50)
+                        ELSE 50
+                    END DESC,
+                    updated_at DESC,
+                    id ASC
+                LIMIT ?
+                """,
+                (now, now, max(1, min(1000, int(limit or 200)))),
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    async def save_core_memory(
+        self,
+        record: MemoryRecord,
+        *,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        return await self._run_recoverable_database_operation(
+            self._save_core_memory_sync,
+            record,
+            expected_revision,
+        )
+
+    def _save_core_memory_sync(
+        self,
+        record: MemoryRecord,
+        expected_revision: int | None,
+    ) -> dict[str, Any]:
+        """Atomically create or replace one labeled core-memory block."""
+        record.memory_type = "core_memory"
+        record.ensure_defaults()
+        with self._lock:
+            with self._transaction_sync():
+                current = self._conn.execute(
+                    "SELECT * FROM memories WHERE id=?",
+                    (record.id,),
+                ).fetchone()
+                current_revision = 0
+                if current is not None:
+                    if clean_text(current["memory_type"], 80) != "core_memory":
+                        return {"ok": False, "code": "memory_type_conflict"}
+                    current_metadata = json_loads(current["metadata"], {})
+                    if isinstance(current_metadata, dict):
+                        try:
+                            current_revision = max(0, int(current_metadata.get("core_revision") or 0))
+                        except (TypeError, ValueError):
+                            current_revision = 0
+                    record.created_at = clean_text(current["created_at"], 80) or record.created_at
+                if expected_revision is not None and int(expected_revision) != current_revision:
+                    return {
+                        "ok": False,
+                        "code": "revision_conflict",
+                        "current_revision": current_revision,
+                    }
+
+                metadata = dict(record.metadata) if isinstance(record.metadata, dict) else {}
+                next_revision = current_revision + 1
+                metadata["core_revision"] = next_revision
+                metadata["core_memory"] = True
+                record.metadata = metadata
+                record.updated_at = utc_now()
+                record.canonical_key = ""
+                record.content_fingerprint = ""
+                data = record.to_db()
+                columns = ", ".join(data.keys())
+                placeholders = ", ".join(f":{key}" for key in data.keys())
+                updates = ", ".join(
+                    f"{key}=excluded.{key}" for key in data.keys() if key != "id"
+                )
+                self._conn.execute(
+                    f"INSERT INTO memories ({columns}) VALUES ({placeholders}) "
+                    f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                    data,
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM memories WHERE id=?",
+                    (record.id,),
+                ).fetchone()
+                self._upsert_memory_fts_row(row)
+        return {"ok": True, "id": record.id, "revision": next_revision}
+
     async def list_schedule_context_memories(
         self,
         *,

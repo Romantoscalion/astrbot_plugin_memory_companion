@@ -1988,6 +1988,8 @@ class RetrievalEngine:
         """Keep inactive and low-quality profile candidates out of every route."""
         memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+        if memory_type == "core_memory" or metadata.get("core_memory") is True:
+            return False, "static_core_memory"
         profile_state = clean_text(metadata.get("profile_state"), 40).lower()
         review_status = clean_text(getattr(memory, "review_status", ""), 40).lower()
         lifecycle = clean_text(getattr(memory, "lifecycle", ""), 40).lower()

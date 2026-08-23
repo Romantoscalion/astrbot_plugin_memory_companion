@@ -17,7 +17,7 @@
       document.documentElement.dataset.overviewLayout = layout;
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=1.9.3-ui-v1" />
+  <link rel="stylesheet" href="./app.css?v=1.10.0-ui-v1" />
 </head>
 <body>
   <main id="app" class="film-app">
@@ -293,6 +293,66 @@
               <p>执行维护、LivingMemory 迁移、清理和导入修复。</p>
             </div>
             <div class="archive-grid">
+              <section class="archive-section" data-archive-section="core-memory">
+                <div class="archive-section-head">
+                  <h4>核心记忆</h4>
+                  <button id="newCoreMemoryBtn" class="subtle" type="button">新建核心块</button>
+                </div>
+                <div class="core-memory-workspace">
+                  <form id="coreMemoryForm" class="context-form core-memory-form" autocomplete="off">
+                    <input name="id" type="hidden" />
+                    <input name="expected_revision" type="hidden" value="0" />
+                    <div class="core-memory-fields">
+                      <label>Label
+                        <input name="label" type="text" maxlength="80" placeholder="例如 preferred_address" required />
+                      </label>
+                      <label>类型
+                        <select name="kind">
+                          <option value="rule">规则</option>
+                          <option value="boundary">边界</option>
+                          <option value="preference">偏好</option>
+                          <option value="profile">画像</option>
+                          <option value="fact" selected>事实</option>
+                          <option value="state">稳定状态</option>
+                        </select>
+                      </label>
+                      <label>作用域
+                        <select name="scope">
+                          <option value="global">全局 / Bot</option>
+                          <option value="private">私聊用户</option>
+                          <option value="group">群聊</option>
+                        </select>
+                      </label>
+                      <label>目标 ID
+                        <input name="target_id" type="text" maxlength="160" placeholder="私聊用户或群聊 ID" />
+                      </label>
+                      <label>Bot ID
+                        <input name="bot_id" type="text" maxlength="120" placeholder="留空表示全部 Bot" />
+                      </label>
+                      <label>人格 ID
+                        <input name="persona_id" type="text" maxlength="120" placeholder="留空表示全部人格" />
+                      </label>
+                      <label>优先级
+                        <input name="priority" type="number" min="0" max="100" step="1" value="50" />
+                      </label>
+                      <label class="core-memory-enabled">启用
+                        <input name="enabled" type="checkbox" checked />
+                      </label>
+                    </div>
+                    <label>内容
+                      <textarea name="content" rows="5" maxlength="4000" required></textarea>
+                    </label>
+                    <div class="context-form-actions">
+                      <span id="coreMemoryFormState">新建核心块</span>
+                      <div class="inline-actions">
+                        <button id="cancelCoreMemoryEditBtn" class="subtle" type="button">重置</button>
+                        <button type="submit">保存核心块</button>
+                      </div>
+                    </div>
+                  </form>
+                  <div id="coreMemoryList" class="core-memory-list" aria-live="polite"></div>
+                </div>
+              </section>
               <section class="archive-section" data-archive-section="retrieval">
                 <h4>模块配置</h4>
                 <div id="selfMemoryList" class="config-panel-stack"></div>
@@ -501,6 +561,6 @@ Bot: 12-14 15:10:30
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=1.9.3-ui-v1"></script>
+  <script src="./app.js?v=1.10.0-ui-v1"></script>
 </body>
 </html>

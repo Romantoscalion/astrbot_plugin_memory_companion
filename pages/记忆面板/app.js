@@ -52,6 +52,8 @@ const SECONDARY_NAV = {
   archive: [
     { id: "maintenance", label: "维护 / 迁移 / 清理", sublabel: "维护、修复、导入与清理", badge: "维护" },
     { id: "conversation-import", label: "历史聊天导入", sublabel: "QQ 直读、文件与最近任务", badge: "导入" },
+    { id: "core-memory", label: "核心记忆", sublabel: "常驻规则、边界、偏好与事实", badge: "核心" },
+    { id: "config:core_memory", label: "核心记忆参数", sublabel: "启用状态、块数与字数预算", badge: "参数" },
     { id: "config:memory_capture", label: "记忆捕获", sublabel: "记录用户消息与稳定事实", badge: "捕获" },
     { id: "config:memory_summary", label: "长期总结", sublabel: "私聊 / 群聊模型与阈值", badge: "总结" },
     { id: "config:historical_chat_import", label: "导入参数", sublabel: "QQ 分页与分段上限", badge: "参数" },
@@ -207,6 +209,7 @@ const state = {
   qqHistoryCapabilities: null,
   qqHistoryCapabilitiesLoading: false,
   memoryAuditBatch: null,
+  coreMemoryBlocks: [],
   scopeControl: {
     private_capture_enabled: true,
     group_capture_enabled: true,
@@ -4250,6 +4253,10 @@ async function loadArchive() {
     await loadConversationImportView();
     return;
   }
+  if (section === "core-memory") {
+    await loadCoreMemoryBlocks();
+    return;
+  }
   if (section !== "retrieval") return;
   $("#selfMemoryList").innerHTML = loadingState("正在读取检索配置...");
   const config = await apiGet("/context/config");
@@ -7333,6 +7340,154 @@ function _policyFor(policies, scope, id) {
     capture_enabled: null,
     recall_enabled: null,
   };
+}
+
+const CORE_MEMORY_KIND_LABELS = {
+  rule: "规则",
+  boundary: "边界",
+  preference: "偏好",
+  profile: "画像",
+  fact: "事实",
+  state: "稳定状态",
+};
+
+const CORE_MEMORY_SCOPE_LABELS = {
+  global: "全局 / Bot",
+  private: "私聊用户",
+  group: "群聊",
+};
+
+function resetCoreMemoryForm() {
+  const form = $("#coreMemoryForm");
+  if (!form) return;
+  form.reset();
+  form.elements.id.value = "";
+  form.elements.expected_revision.value = "0";
+  form.elements.kind.value = "fact";
+  form.elements.scope.value = "global";
+  form.elements.priority.value = "50";
+  form.elements.enabled.checked = true;
+  $("#coreMemoryFormState").textContent = "新建核心块";
+  syncCoreMemoryTargetRequirement();
+}
+
+function syncCoreMemoryTargetRequirement() {
+  const form = $("#coreMemoryForm");
+  if (!form) return;
+  const scoped = ["private", "group"].includes(form.elements.scope.value);
+  form.elements.target_id.required = scoped;
+  form.elements.target_id.disabled = !scoped;
+  if (!scoped) form.elements.target_id.value = "";
+}
+
+function renderCoreMemoryBlocks() {
+  const host = $("#coreMemoryList");
+  if (!host) return;
+  const blocks = Array.isArray(state.coreMemoryBlocks) ? state.coreMemoryBlocks : [];
+  host.innerHTML = blocks.length ? blocks.map((block) => `
+    <article class="core-memory-row${block.enabled ? "" : " is-disabled"}">
+      <div class="core-memory-row-head">
+        <span>
+          <b>${escapeHtml(block.label || block.id)}</b>
+          <small>${escapeHtml(CORE_MEMORY_KIND_LABELS[block.kind] || block.kind || "事实")} · ${escapeHtml(CORE_MEMORY_SCOPE_LABELS[block.scope] || block.scope || "全局")} · P${escapeHtml(block.priority ?? 50)} · r${escapeHtml(block.revision ?? 0)}</small>
+        </span>
+        <div class="inline-actions">
+          <button class="subtle" type="button" data-core-memory-edit="${escapeHtml(block.id)}">编辑</button>
+          <button class="danger subtle" type="button" data-core-memory-delete="${escapeHtml(block.id)}">删除</button>
+        </div>
+      </div>
+      <p>${escapeHtml(block.content || "")}</p>
+      <div class="badges">
+        <span class="badge ${block.enabled ? "green" : "gray"}">${block.enabled ? "已启用" : "已停用"}</span>
+        ${block.target_id ? `<span class="badge blue">目标 ${escapeHtml(block.target_id)}</span>` : ""}
+        ${block.bot_id && block.bot_id !== "self" ? `<span class="badge blue">Bot ${escapeHtml(block.bot_id)}</span>` : ""}
+        ${block.persona_id ? `<span class="badge blue">人格 ${escapeHtml(block.persona_id)}</span>` : ""}
+      </div>
+    </article>
+  `).join("") : `<div class="empty-state">当前还没有核心记忆块。</div>`;
+  host.querySelectorAll("[data-core-memory-edit]").forEach((button) => {
+    button.addEventListener("click", () => editCoreMemoryBlock(button.dataset.coreMemoryEdit));
+  });
+  host.querySelectorAll("[data-core-memory-delete]").forEach((button) => {
+    button.addEventListener("click", () => deleteCoreMemoryBlock(button.dataset.coreMemoryDelete));
+  });
+}
+
+function editCoreMemoryBlock(memoryId) {
+  const block = state.coreMemoryBlocks.find((item) => item.id === memoryId);
+  const form = $("#coreMemoryForm");
+  if (!block || !form) return;
+  for (const key of ["id", "label", "kind", "scope", "target_id", "bot_id", "persona_id", "priority"]) {
+    if (form.elements[key]) form.elements[key].value = block[key] ?? "";
+  }
+  form.elements.expected_revision.value = block.revision ?? 0;
+  form.elements.enabled.checked = block.enabled !== false;
+  form.elements.content.value = block.content || "";
+  $("#coreMemoryFormState").textContent = `编辑 ${block.label || block.id} · revision ${block.revision ?? 0}`;
+  syncCoreMemoryTargetRequirement();
+  form.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
+}
+
+async function saveCoreMemoryBlock(form) {
+  const data = new FormData(form);
+  const payload = {
+    id: String(data.get("id") || ""),
+    expected_revision: Number(data.get("expected_revision") || 0),
+    label: String(data.get("label") || "").trim(),
+    kind: String(data.get("kind") || "fact"),
+    scope: String(data.get("scope") || "global"),
+    target_id: String(data.get("target_id") || "").trim(),
+    bot_id: String(data.get("bot_id") || "").trim(),
+    persona_id: String(data.get("persona_id") || "").trim(),
+    priority: Number(data.get("priority") || 50),
+    enabled: data.get("enabled") === "on",
+    content: String(data.get("content") || "").trim(),
+  };
+  await apiPost("/core-memory/upsert", payload);
+  showToast(payload.id ? "核心块已更新" : "核心块已创建");
+  resetCoreMemoryForm();
+  await loadCoreMemoryBlocks();
+}
+
+async function deleteCoreMemoryBlock(memoryId) {
+  const block = state.coreMemoryBlocks.find((item) => item.id === memoryId);
+  if (!block) return;
+  showInlineConfirmation({
+    host: "#detailDrawer",
+    title: `删除核心块“${block.label || block.id}”`,
+    message: "删除后，这条约定将不再进入后续对话上下文。",
+    confirmLabel: "确认删除",
+    busyText: "正在删除核心块...",
+    dangerous: true,
+    onConfirm: async () => {
+      await apiPost("/core-memory/delete", { id: memoryId });
+      showToast("核心块已删除");
+      resetCoreMemoryForm();
+      clearDetail();
+      await loadCoreMemoryBlocks();
+    },
+    onCancel: clearDetail,
+  });
+}
+
+async function loadCoreMemoryBlocks() {
+  const host = $("#coreMemoryList");
+  if (host) host.innerHTML = loadingState("正在读取核心记忆...");
+  const data = await apiGet("/core-memory");
+  state.coreMemoryBlocks = Array.isArray(data.blocks) ? data.blocks : [];
+  renderCoreMemoryBlocks();
+  const form = $("#coreMemoryForm");
+  if (!form?.dataset.bound) {
+    form.dataset.bound = "true";
+    form.elements.scope.addEventListener("change", syncCoreMemoryTargetRequirement);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      withButton(form.querySelector("button[type='submit']"), "保存中", () => saveCoreMemoryBlock(form));
+    });
+    $("#newCoreMemoryBtn")?.addEventListener("click", resetCoreMemoryForm);
+    $("#cancelCoreMemoryEditBtn")?.addEventListener("click", resetCoreMemoryForm);
+  }
+  syncCoreMemoryTargetRequirement();
 }
 
 function _windowFeatureValue(data, node, feature) {
