@@ -156,6 +156,19 @@ _REMEMBER_TOOL_CONTRACT = "\n".join(
     )
 )
 
+_CORE_MEMORY_TOOL_CONTRACT_HEADER = "<MemoryCompanion-Core-Memory-Tool-Contract>"
+_CORE_MEMORY_TOOL_CONTRACT_FOOTER = "</MemoryCompanion-Core-Memory-Tool-Contract>"
+_CORE_MEMORY_TOOL_CONTRACT = "\n".join(
+    (
+        _CORE_MEMORY_TOOL_CONTRACT_HEADER,
+        "核心记忆用于少量、稳定、每轮都必须可见的长期规则、边界、偏好和关键事实，不用于保存普通聊天片段、临时状态或一次性任务。",
+        "只有用户本轮明确要求将某项约定设为核心、永久遵循、立即纠偏，或明确要求查看、修改、删除核心块时，才调用 memory_companion_core_memory。普通的‘记住’仍使用 memory_companion_remember。",
+        "set/delete 前从本轮文字确定 Label 和内容，不得自行扩大含义；删除必须对应用户明确点名的核心约定。工具只管理当前私聊用户自己的核心块。",
+        "只有工具返回 ok=true 后才能确认操作成功；冲突或失败时如实说明并让用户确认最新内容。",
+        _CORE_MEMORY_TOOL_CONTRACT_FOOTER,
+    )
+)
+
 _RECONSTRUCTION_CONTRACT_HEADER = "<MemoryCompanion-Reconstruction-Contract>"
 _RECONSTRUCTION_CONTRACT_FOOTER = "</MemoryCompanion-Reconstruction-Contract>"
 _RECONSTRUCTION_CONTRACT = "\n".join(
@@ -677,6 +690,7 @@ class MemoryCompanionService:
             return
 
         self._apply_remember_tool_contract(req)
+        self._apply_core_memory_tool_contract(req)
 
         capture_enabled = self._scope_feature_enabled(ctx, "capture")
         if capture_enabled:
@@ -2051,6 +2065,8 @@ class MemoryCompanionService:
         query_text = clean_text(query or ctx.message_text, 1400)
         if not query_text:
             return ""
+        core_memories = await self.core_memories_for_context(ctx)
+        core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
         limit = max(1, min(8, int(top_k or 6)))
         outfit_focus = clean_text(context_kind, 40).lower() == "outfit"
         fast_path = "outfit_fast_local" if outfit_focus else "schedule_fast_local"
@@ -2072,7 +2088,13 @@ class MemoryCompanionService:
                 "candidate_count": len(records),
                 "embedding_reason": skip_reason,
             }
-            return ""
+            return self.injection.compose(
+                ctx,
+                [],
+                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                core_memories=core_memories,
+                core_memory_max_chars=core_memory_max_chars,
+            )
 
         schedule_types = {"schedule_fragment", "persona_life", "companion_note"}
         profile_types = {"user_profile", "user_preference", "relationship_claim"}
@@ -2203,7 +2225,13 @@ class MemoryCompanionService:
                 "candidate_count": len(records),
                 "embedding_reason": skip_reason,
             }
-            return ""
+            return self.injection.compose(
+                ctx,
+                [],
+                max_chars or self.config.int("memory_injection.max_chars", 1800),
+                core_memories=core_memories,
+                core_memory_max_chars=core_memory_max_chars,
+            )
 
         slot_map: dict[str, list[SearchResult]] = {"self_timeline": [], "user_profile": []}
         results: list[SearchResult] = []
@@ -2250,6 +2278,8 @@ class MemoryCompanionService:
             companion_bot_energy=companion_bot_energy,
             time_of_day="" if outfit_focus else self._compute_time_of_day(),
             address_hint="" if outfit_focus else self._address_hint_for_injection(ctx),
+            core_memories=core_memories,
+            core_memory_max_chars=core_memory_max_chars,
         )
         logger.info(
             "[MemoryCompanion] %s快速上下文已生成: session=%s candidates=%s selected=%s chars=%s elapsed_ms=%s",
@@ -4828,6 +4858,280 @@ class MemoryCompanionService:
         self._schedule_memory_embedding(memory_id, record)
         return memory_id
 
+    async def core_memories_for_context(
+        self,
+        ctx: SessionContext,
+        *,
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
+        """Return visible always-in-context blocks without similarity scoring."""
+        if not self.config.bool("core_memory.enabled", True):
+            return []
+        ctx = self._normalized_session_context(ctx)
+        result_limit = max(
+            1,
+            int(limit) if limit is not None else self.config.int("core_memory.max_blocks", 8),
+        )
+        candidates = await self.store.list_core_memories(
+            limit=max(20, result_limit, self.config.int("core_memory.scan_limit", 200))
+        )
+        policy = self.visibility_policy()
+        visible: list[MemoryRecord] = []
+        for record in candidates:
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            if metadata.get("core_enabled", True) is not True:
+                continue
+            persona_id = clean_text(metadata.get("persona_id"), 120)
+            if persona_id and persona_id != clean_text(ctx.persona_id, 120):
+                continue
+            core_scope = clean_text(metadata.get("core_scope"), 24).lower()
+            target_id = clean_text(metadata.get("target_id"), 160)
+            if core_scope == "private" and target_id and target_id != clean_text(ctx.user_id, 160):
+                continue
+            if core_scope == "group" and target_id and target_id != clean_text(ctx.group_id, 160):
+                continue
+            allowed, _reason = policy.is_visible(record, ctx)
+            if not allowed:
+                continue
+            visible.append(record)
+            if len(visible) >= result_limit:
+                break
+        return visible
+
+    async def list_core_memory_blocks(self) -> list[MemoryRecord]:
+        return await self.store.list_core_memories(limit=1000)
+
+    async def save_core_memory_block(self, payload: dict[str, Any]) -> dict[str, Any]:
+        label = clean_text(payload.get("label"), 80)
+        content = clean_text(payload.get("content"), 4000)
+        if not label:
+            return {"ok": False, "code": "missing_label"}
+        if not content:
+            return {"ok": False, "code": "missing_content"}
+
+        core_scope = clean_text(payload.get("scope"), 24).lower() or "global"
+        if core_scope not in {"global", "private", "group"}:
+            return {"ok": False, "code": "invalid_scope"}
+        target_id = clean_text(payload.get("target_id"), 160)
+        if core_scope in {"private", "group"} and not target_id:
+            return {"ok": False, "code": "missing_target_id"}
+        core_kind = clean_text(payload.get("kind"), 32).lower() or "fact"
+        if core_kind not in {"rule", "boundary", "preference", "profile", "fact", "state"}:
+            return {"ok": False, "code": "invalid_kind"}
+        try:
+            priority = max(0, min(100, int(payload.get("priority", 50))))
+        except (TypeError, ValueError):
+            return {"ok": False, "code": "invalid_priority"}
+
+        bot_id = clean_text(payload.get("bot_id"), 120) or "self"
+        persona_id = clean_text(payload.get("persona_id"), 120)
+        platform = clean_text(payload.get("platform"), 80)
+        session_id = clean_text(payload.get("session_id"), 220)
+        memory_id = clean_text(payload.get("id"), 120)
+        if not memory_id:
+            memory_id = self.stable_id(
+                "core_memory",
+                core_scope,
+                target_id,
+                bot_id,
+                persona_id,
+                label.casefold(),
+            )
+        for existing in await self.store.list_core_memories(limit=1000):
+            if existing.id == memory_id:
+                continue
+            existing_metadata = existing.metadata if isinstance(existing.metadata, dict) else {}
+            same_key = (
+                clean_text(existing_metadata.get("core_label"), 80).casefold() == label.casefold()
+                and clean_text(existing_metadata.get("core_scope"), 24).lower() == core_scope
+                and clean_text(existing_metadata.get("target_id"), 160) == target_id
+                and clean_text(existing_metadata.get("owner_bot_id"), 120) == bot_id
+                and clean_text(existing_metadata.get("persona_id"), 120) == persona_id
+            )
+            if same_key:
+                return {"ok": False, "code": "label_conflict", "id": existing.id}
+
+        if core_scope == "private":
+            subject = EntityRef(kind="user", id=target_id, name=clean_text(payload.get("target_name"), 80), role="user")
+            object_ref = EntityRef.bot_self(bot_id)
+            record_scope = "private"
+            visibility = "private_pair"
+            group_id = ""
+        elif core_scope == "group":
+            subject = EntityRef(kind="group", id=target_id, name=clean_text(payload.get("target_name"), 80), role="group")
+            object_ref = EntityRef.bot_self(bot_id)
+            record_scope = "group"
+            visibility = "group_public"
+            group_id = target_id
+        else:
+            subject = EntityRef.bot_self(bot_id)
+            object_ref = EntityRef.bot_self(bot_id)
+            record_scope = "global"
+            visibility = "bot_self"
+            group_id = ""
+
+        metadata = {
+            "core_memory": True,
+            "core_label": label,
+            "core_kind": core_kind,
+            "core_scope": core_scope,
+            "core_priority": priority,
+            "core_enabled": bool(payload.get("enabled", True)),
+            "target_id": target_id,
+            "persona_id": persona_id,
+            "owner_bot_id": bot_id,
+            "managed_by": "memory_panel",
+        }
+        record = MemoryRecord(
+            id=memory_id,
+            memory_type="core_memory",
+            subject=subject,
+            object=object_ref,
+            scope=record_scope,
+            session_id=session_id,
+            platform=platform,
+            group_id=group_id,
+            visibility=visibility,
+            sayability="indirect",
+            reality_level="explicit_user_statement",
+            lifecycle="stable_memory",
+            content=content,
+            evidence="由记忆管理端确认的核心记忆块",
+            confidence=1.0,
+            importance=max(0.5, priority / 100.0),
+            owner_bot_id=bot_id,
+            validity_status="active",
+            salience=max(0.5, priority / 100.0),
+            durability="pinned",
+            sensitivity="private" if core_scope != "global" else "internal",
+            review_status="manual",
+            tags=["core_memory", core_kind, f"core:{label}"],
+            metadata=metadata,
+            source_plugin="memory_companion_core",
+        )
+        expected_revision: int | None = None
+        if payload.get("expected_revision") is not None:
+            try:
+                expected_revision = max(0, int(payload.get("expected_revision")))
+            except (TypeError, ValueError):
+                return {"ok": False, "code": "invalid_expected_revision"}
+        elif not payload.get("id"):
+            expected_revision = 0
+        return await self.store.save_core_memory(
+            record,
+            expected_revision=expected_revision,
+        )
+
+    async def delete_core_memory_block(self, memory_id: str) -> dict[str, Any]:
+        memory_id = clean_text(memory_id, 120)
+        record = await self.store.get_memory(memory_id)
+        if record is None:
+            return {"ok": False, "code": "not_found"}
+        if record.memory_type != "core_memory":
+            return {"ok": False, "code": "memory_type_conflict"}
+        return {"ok": bool(await self.store.delete_memory(memory_id))}
+
+    async def tool_core_memory(
+        self,
+        event: Any,
+        *,
+        action: str,
+        label: str = "",
+        content: str = "",
+        kind: str = "fact",
+        priority: int = 50,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        if not self.config.bool("core_memory.llm_management_enabled", True):
+            return {"ok": False, "code": "llm_management_disabled"}
+        ctx = self._normalized_session_context(await self.identity.resolve_event_context(event))
+        if ctx.scope != "private" or not ctx.user_id:
+            return {"ok": False, "code": "private_scope_required"}
+
+        normalized_action = clean_text(action, 24).lower()
+        action_aliases = {
+            "list": "list",
+            "get": "list",
+            "查看": "list",
+            "set": "set",
+            "upsert": "set",
+            "update": "set",
+            "设置": "set",
+            "修改": "set",
+            "delete": "delete",
+            "remove": "delete",
+            "删除": "delete",
+        }
+        normalized_action = action_aliases.get(normalized_action, "")
+        if not normalized_action:
+            return {"ok": False, "code": "invalid_action"}
+
+        records = await self.core_memories_for_context(ctx, limit=1000)
+        private_records: list[MemoryRecord] = []
+        for record in records:
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            if (
+                clean_text(metadata.get("core_scope"), 24) == "private"
+                and clean_text(metadata.get("target_id"), 160) == ctx.user_id
+            ):
+                private_records.append(record)
+
+        if normalized_action == "list":
+            return {
+                "ok": True,
+                "blocks": [
+                    {
+                        "id": record.id,
+                        "label": clean_text(record.metadata.get("core_label"), 80),
+                        "kind": clean_text(record.metadata.get("core_kind"), 32),
+                        "content": clean_text(record.content, 1000),
+                        "revision": int(record.metadata.get("core_revision") or 0),
+                    }
+                    for record in private_records
+                ],
+            }
+
+        clean_label = clean_text(label, 80)
+        if not clean_label:
+            return {"ok": False, "code": "missing_label"}
+        existing = next(
+            (
+                record
+                for record in private_records
+                if clean_text(record.metadata.get("core_label"), 80).casefold()
+                == clean_label.casefold()
+            ),
+            None,
+        )
+        if normalized_action == "delete":
+            if existing is None:
+                return {"ok": False, "code": "not_found"}
+            return await self.delete_core_memory_block(existing.id)
+
+        if not clean_text(content, 4000):
+            return {"ok": False, "code": "missing_content"}
+        payload = {
+            "id": existing.id if existing is not None else "",
+            "expected_revision": (
+                int(existing.metadata.get("core_revision") or 0)
+                if existing is not None
+                else 0
+            ),
+            "label": clean_label,
+            "content": content,
+            "kind": kind,
+            "priority": priority,
+            "enabled": enabled,
+            "scope": "private",
+            "target_id": ctx.user_id,
+            "target_name": ctx.user_name,
+            "bot_id": clean_text(ctx.bot_id, 120) or self._bot_subject_id(ctx),
+            "persona_id": clean_text(ctx.persona_id, 120),
+            "platform": ctx.platform,
+            "session_id": ctx.session_id,
+        }
+        return await self.save_core_memory_block(payload)
+
     @staticmethod
     def _apply_remember_tool_contract(req: Any) -> None:
         current = getattr(req, "system_prompt", "") or ""
@@ -4839,6 +5143,24 @@ class MemoryCompanionService:
             _REMEMBER_TOOL_CONTRACT_FOOTER,
         )
         req.system_prompt = f"{current}\n\n{_REMEMBER_TOOL_CONTRACT}" if current else _REMEMBER_TOOL_CONTRACT
+
+    def _apply_core_memory_tool_contract(self, req: Any) -> None:
+        current = getattr(req, "system_prompt", "") or ""
+        if not isinstance(current, str):
+            current = str(current)
+        current = remove_marked_text(
+            current,
+            _CORE_MEMORY_TOOL_CONTRACT_HEADER,
+            _CORE_MEMORY_TOOL_CONTRACT_FOOTER,
+        )
+        if not self.config.bool("core_memory.llm_management_enabled", True):
+            req.system_prompt = current
+            return
+        req.system_prompt = (
+            f"{current}\n\n{_CORE_MEMORY_TOOL_CONTRACT}"
+            if current
+            else _CORE_MEMORY_TOOL_CONTRACT
+        )
 
     def _apply_reconstruction_contract(
         self,
@@ -6603,6 +6925,8 @@ class MemoryCompanionService:
         companion_bot_energy: float = 0.0,
     ) -> str:
         ctx = self._normalized_session_context(ctx)
+        core_memories = await self.core_memories_for_context(ctx)
+        core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
         recent_cross_window_context = await self._recent_cross_window_context(ctx)
         turn_signal = analyze_turn_signal(explicit_query or ctx.message_text)
@@ -6621,8 +6945,10 @@ class MemoryCompanionService:
             intent = await self._expand_contextual_retrieval_intent(ctx, intent, turn_signal)
         retrieval_query = self._query_for_time_intent(intent.query, time_intent)
 
+        static_included_memory_ids: list[str] = []
+
         def compose_recent_guard(intent_context: str) -> str:
-            if not recent_fact_context and not recent_cross_window_context:
+            if not core_memories and not recent_fact_context and not recent_cross_window_context:
                 return ""
             return self.injection.compose(
                 ctx,
@@ -6636,6 +6962,9 @@ class MemoryCompanionService:
                 time_of_day=self._compute_time_of_day(),
                 recent_fact_context=recent_fact_context,
                 recent_cross_window_context=recent_cross_window_context,
+                core_memories=core_memories,
+                core_memory_max_chars=core_memory_max_chars,
+                included_memory_ids=static_included_memory_ids,
             )
 
         if decision.suppress_long_memory:
@@ -6670,7 +6999,7 @@ class MemoryCompanionService:
                     session_id=ctx.session_id,
                     scope=ctx.scope,
                     query=intent.query,
-                    selected_memory_ids=[],
+                    selected_memory_ids=static_included_memory_ids,
                     blocked_reasons=blocked,
                     injection_chars=len(injection),
                 )
@@ -6706,7 +7035,7 @@ class MemoryCompanionService:
                     session_id=ctx.session_id,
                     scope=ctx.scope,
                     query="",
-                    selected_memory_ids=[],
+                    selected_memory_ids=static_included_memory_ids,
                     blocked_reasons=blocked,
                     injection_chars=len(injection),
                 )
@@ -6793,6 +7122,8 @@ class MemoryCompanionService:
             recent_fact_context=recent_fact_context,
             recent_cross_window_context=recent_cross_window_context,
             included_memory_ids=included_memory_ids,
+            core_memories=core_memories,
+            core_memory_max_chars=core_memory_max_chars,
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
@@ -6863,6 +7194,8 @@ class MemoryCompanionService:
             )
             return
         self._sanitize_request_history_for_companion(ctx, req)
+        core_memories = await self.core_memories_for_context(ctx)
+        core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
         recent_cross_window_context = await self._recent_cross_window_context(ctx)
 
@@ -6936,7 +7269,8 @@ class MemoryCompanionService:
             blocked = [{"id": "", "reason": "empty_retrieval_query", "content": ""}]
             intent_context = "\n".join(decision.guard_lines)
             injection = ""
-            if recent_fact_context or recent_cross_window_context:
+            actual_injected_memory_ids: list[str] = []
+            if core_memories or recent_fact_context or recent_cross_window_context:
                 injection = self.injection.compose(
                     ctx,
                     [],
@@ -6949,6 +7283,9 @@ class MemoryCompanionService:
                     time_of_day=self._compute_time_of_day(),
                     recent_fact_context=recent_fact_context,
                     recent_cross_window_context=recent_cross_window_context,
+                    core_memories=core_memories,
+                    core_memory_max_chars=core_memory_max_chars,
+                    included_memory_ids=actual_injected_memory_ids,
                 )
             self._log_injection_debug(
                 ctx=ctx,
@@ -6970,7 +7307,7 @@ class MemoryCompanionService:
                     session_id=ctx.session_id,
                     scope=ctx.scope,
                     query="",
-                    selected_memory_ids=[],
+                    selected_memory_ids=actual_injected_memory_ids,
                     blocked_reasons=blocked,
                     injection_chars=len(injection),
                 )
@@ -6983,9 +7320,11 @@ class MemoryCompanionService:
                     slot_map={},
                 )
                 if append_temp_text(req, injection):
+                    await self._mark_injected_memories(actual_injected_memory_ids)
                     return
                 prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
                 req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
+                await self._mark_injected_memories(actual_injected_memory_ids)
             return
         blocked: list[dict[str, Any]] = []
         retrieval_path_info: dict[str, Any] = {
@@ -7106,6 +7445,8 @@ class MemoryCompanionService:
             recent_fact_context=recent_fact_context,
             recent_cross_window_context=recent_cross_window_context,
             included_memory_ids=actual_injected_memory_ids,
+            core_memories=core_memories,
+            core_memory_max_chars=core_memory_max_chars,
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)

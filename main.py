@@ -16,7 +16,7 @@ from .core.models import json_dumps
 from .core.service import MemoryCompanionService
 
 PLUGIN_NAME = "astrbot_plugin_memory_companion"
-PLUGIN_VERSION = "1.9.3"
+PLUGIN_VERSION = "1.10.0"
 
 _ACTIVE_BRIDGE: MemoryCompanionBridge | None = None
 
@@ -197,6 +197,45 @@ class MemoryCompanionPlugin(Star):
         except Exception as exc:
             logger.warning("[MemoryCompanion] 主动记忆工具调用失败: %s", exc, exc_info=True)
             result = {"ok": False, "error": "memory write failed"}
+        return json_dumps(result)
+
+    @filter.llm_tool(name="memory_companion_core_memory")
+    async def memory_companion_core_memory_tool(
+        self,
+        event: AstrMessageEvent,
+        action: str = "",
+        label: str = "",
+        content: str = "",
+        kind: str = "fact",
+        priority: int = 50,
+        enabled: bool = True,
+    ) -> str:
+        """管理当前私聊用户明确要求常驻的核心记忆块。
+
+        仅当用户本轮明确要求把稳定约定设为核心、永久遵循、立即纠偏，或明确要求查看、修改、删除核心记忆时使用。
+        普通长期记忆继续使用 memory_companion_remember。set/delete 成功前不能声称已经修改。
+
+        Args:
+            action(string): list、set 或 delete。
+            label(string): 稳定且简短的块标签；set/delete 时必填。
+            content(string): set 时写入的完整约定内容。
+            kind(string): rule、boundary、preference、profile、fact 或 state。
+            priority(number): 0-100，越高越先进入字数预算。
+            enabled(boolean): set 后是否立即启用。
+        """
+        try:
+            result = await self.service.tool_core_memory(
+                event,
+                action=action,
+                label=label,
+                content=content,
+                kind=kind,
+                priority=priority,
+                enabled=enabled,
+            )
+        except Exception as exc:
+            logger.warning("[MemoryCompanion] 核心记忆工具调用失败: %s", exc, exc_info=True)
+            result = {"ok": False, "code": "core_memory_tool_failed"}
         return json_dumps(result)
 
     @filter.llm_tool(name="memory_companion_note_create")

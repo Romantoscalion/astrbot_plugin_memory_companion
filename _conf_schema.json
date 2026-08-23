@@ -733,6 +733,43 @@
       }
     }
   },
+  "core_memory": {
+    "description": "核心记忆",
+    "hint": "管理不经过相似度检索、在对应作用域内每轮常驻的少量规则、边界、偏好和稳定事实。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用核心记忆",
+        "hint": "关闭后保留已有核心块，但不再注入对话和陪伴功能上下文。",
+        "type": "bool",
+        "default": true
+      },
+      "llm_management_enabled": {
+        "description": "允许对话即时管理",
+        "hint": "开启后，模型可在用户明确要求时通过工具查看、设置或删除当前私聊用户自己的核心块；全局和群聊核心块仍只能在管理面板修改。",
+        "type": "bool",
+        "default": true
+      },
+      "max_blocks": {
+        "description": "每轮核心块上限",
+        "hint": "按优先级选取当前作用域可见的核心块，建议保持在 4-12 条。",
+        "type": "int",
+        "default": 8
+      },
+      "max_chars": {
+        "description": "核心记忆字数预算",
+        "hint": "核心块在整份记忆注入包内的独立预算，超出时按优先级保留。",
+        "type": "int",
+        "default": 800
+      },
+      "scan_limit": {
+        "description": "核心块扫描上限",
+        "hint": "单轮最多检查多少个核心块的作用域和可见性。一般无需调整。",
+        "type": "int",
+        "default": 200
+      }
+    }
+  },
   "context_orchestration": {
     "description": "注入编排",
     "hint": "把自我时间线、用户画像、当前窗口、阶段总结和稳定记忆分槽编排到最终注入包。",

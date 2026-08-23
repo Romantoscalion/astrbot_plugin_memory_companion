@@ -5584,3 +5584,86 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere}
     grid-template-columns:1fr;
   }
 }
+.core-memory-workspace {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.core-memory-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.core-memory-fields label,
+.core-memory-form > label {
+  display: grid;
+  gap: 6px;
+}
+
+.core-memory-enabled {
+  align-content: end;
+}
+
+.core-memory-enabled input {
+  width: 20px;
+  height: 20px;
+}
+
+.core-memory-list {
+  display: grid;
+  gap: 10px;
+}
+
+.core-memory-row {
+  padding: 14px;
+  border: 1px solid var(--line, rgba(126, 139, 150, 0.28));
+  border-radius: 8px;
+  background: var(--panel, rgba(255, 255, 255, 0.72));
+}
+
+.core-memory-row.is-disabled {
+  opacity: 0.68;
+}
+
+.core-memory-row-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.core-memory-row-head span {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.core-memory-row-head small,
+.core-memory-row p {
+  overflow-wrap: anywhere;
+}
+
+.core-memory-row p {
+  margin: 12px 0;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 900px) {
+  .core-memory-workspace {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .core-memory-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .core-memory-row-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

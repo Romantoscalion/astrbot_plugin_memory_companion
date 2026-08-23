@@ -91,6 +91,9 @@ UI_VIEW_ENDPOINTS = {
     ),
     "microscope": ("/search",),
     "archive": (
+        "/core-memory",
+        "/core-memory/upsert",
+        "/core-memory/delete",
         "/context/config",
         "/config/schema",
         "/config/module/update",
@@ -142,6 +145,7 @@ UI_ENDPOINT_EXPOSURE = {
 UI_DANGEROUS_ENDPOINTS = frozenset(
     {
         "/memory/delete",
+        "/core-memory/delete",
         "/portrait/govern",
         "/maintenance/audit/apply",
         "/maintenance/audit/rollback",
@@ -177,6 +181,9 @@ class PluginPageApi:
             ("/memory/delete", self.memory_delete, ["POST"], "MemoryCompanion Page memory delete"),
             ("/memory/visibility", self.memory_visibility, ["POST"], "MemoryCompanion Page memory visibility"),
             ("/memory/lifecycle", self.memory_lifecycle, ["POST"], "MemoryCompanion Page memory lifecycle"),
+            ("/core-memory", self.core_memory_list, ["GET"], "MemoryCompanion core memory blocks"),
+            ("/core-memory/upsert", self.core_memory_upsert, ["POST"], "MemoryCompanion core memory upsert"),
+            ("/core-memory/delete", self.core_memory_delete, ["POST"], "MemoryCompanion core memory delete"),
             ("/acl", self.acl, ["GET"], "MemoryCompanion Page memory ACL rules"),
             ("/acl/upsert", self.acl_upsert, ["POST"], "MemoryCompanion Page memory ACL upsert"),
             ("/acl/policy", self.acl_policy, ["POST"], "MemoryCompanion Page memory ACL policy"),
@@ -996,6 +1003,68 @@ class PluginPageApi:
             clean_text(payload.get("lifecycle"), 40),
         )
         return self._ok({"updated": ok})
+
+    @staticmethod
+    def _core_memory_payload(record: Any) -> dict[str, Any]:
+        metadata = record.metadata if isinstance(record.metadata, dict) else {}
+        owner_bot_id = clean_text(metadata.get("owner_bot_id") or record.owner_bot_id, 120)
+        try:
+            priority = max(0, min(100, int(metadata.get("core_priority", 50))))
+        except (TypeError, ValueError):
+            priority = 50
+        try:
+            revision = max(0, int(metadata.get("core_revision") or 0))
+        except (TypeError, ValueError):
+            revision = 0
+        return {
+            "id": clean_text(record.id, 120),
+            "label": clean_text(metadata.get("core_label"), 80),
+            "content": record.content,
+            "kind": clean_text(metadata.get("core_kind"), 32) or "fact",
+            "scope": clean_text(metadata.get("core_scope"), 24) or "global",
+            "target_id": clean_text(metadata.get("target_id"), 160),
+            "target_name": clean_text(getattr(record.subject, "name", ""), 80),
+            "bot_id": "" if owner_bot_id == "self" else owner_bot_id,
+            "persona_id": clean_text(metadata.get("persona_id"), 120),
+            "platform": clean_text(record.platform, 80),
+            "session_id": clean_text(record.session_id, 220),
+            "priority": priority,
+            "enabled": metadata.get("core_enabled", True) is True,
+            "revision": revision,
+            "updated_at": clean_text(record.updated_at, 80),
+        }
+
+    async def core_memory_list(self):
+        records = await self.plugin.service.list_core_memory_blocks()
+        scope = clean_text(request.args.get("scope", ""), 24).lower()
+        target_id = clean_text(request.args.get("target_id", ""), 160)
+        blocks = [self._core_memory_payload(record) for record in records]
+        if scope:
+            blocks = [block for block in blocks if block["scope"] == scope]
+        if target_id:
+            blocks = [block for block in blocks if block["target_id"] == target_id]
+        return self._ok({"blocks": blocks})
+
+    async def core_memory_upsert(self):
+        payload = await self._json()
+        result = await self.plugin.service.save_core_memory_block(payload)
+        if result.get("ok"):
+            return self._ok(result)
+        code = clean_text(result.get("code"), 80) or "core_memory_save_failed"
+        status = 409 if code in {"revision_conflict", "memory_type_conflict", "label_conflict"} else 400
+        return self._err(code, status)
+
+    async def core_memory_delete(self):
+        payload = await self._json()
+        memory_id = clean_text(payload.get("id"), 120)
+        if not memory_id:
+            return self._err("missing id", 400)
+        result = await self.plugin.service.delete_core_memory_block(memory_id)
+        if result.get("ok"):
+            return self._ok({"deleted": True})
+        code = clean_text(result.get("code"), 80) or "core_memory_delete_failed"
+        status = 404 if code == "not_found" else 409
+        return self._err(code, status)
 
     async def acl(self):
         owner_scope = clean_text(request.args.get("scope", ""), 40)
