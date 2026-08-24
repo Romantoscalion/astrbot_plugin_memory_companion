@@ -540,6 +540,69 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(max(0, snapshot["db_bytes"]), stats["memory_storage"]["database_bytes"])
         self.assertEqual(expected, stats["memory_storage"]["wal_bytes"])
 
+    async def test_recent_timeline_entity_split_matches_baseline(self) -> None:
+        store = self.make_store()
+        scope = "group"
+        session_id = "qq:GroupMessage:g1"
+        entity = "u1"
+        seed = [
+            ("m1", entity, "bot", "2026-08-01T10:00:00+00:00"),
+            ("m2", "u2", entity, "2026-08-01T11:00:00+00:00"),
+            ("m3", entity, entity, "2026-08-01T12:00:00+00:00"),
+            ("m4", entity, "u3", "2026-08-01T13:00:00+00:00"),
+            ("m5", "u4", entity, "2026-08-01T14:00:00+00:00"),
+            ("noise-entity", "u2", "u3", "2026-08-01T15:00:00+00:00"),
+            ("noise-session", entity, "bot", "2026-08-01T16:00:00+00:00"),
+        ]
+        for event_id, subject_id, object_id, occurred_at in seed:
+            other_session = "qq:GroupMessage:g2" if event_id == "noise-session" else session_id
+            await store.add_timeline_event(
+                event_type="user_message",
+                session_id=other_session,
+                scope=scope,
+                subject_id=subject_id,
+                object_id=object_id,
+                content=f"content-{event_id}",
+                occurred_at=occurred_at,
+            )
+
+        def baseline(limit: int, offset: int) -> list[str]:
+            with store._lock:
+                rows = store._conn.execute(
+                    """
+                    SELECT * FROM timeline
+                    WHERE scope=? AND session_id=? AND (subject_id=? OR object_id=?)
+                    ORDER BY occurred_at DESC, created_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (scope, session_id, entity, entity, limit, offset),
+                ).fetchall()
+            return [str(row["content"]) for row in rows]
+
+        for limit, offset in ((10, 0), (2, 0), (2, 1), (1, 4)):
+            actual = await store.recent_timeline(
+                limit=limit,
+                scope=scope,
+                session_id=session_id,
+                entity_id=entity,
+                offset=offset,
+            )
+            self.assertEqual(
+                baseline(limit, offset),
+                [str(row["content"]) for row in actual],
+                f"limit={limit} offset={offset}",
+            )
+
+        # Rows visible to both branches must appear exactly once.
+        all_rows = await store.recent_timeline(
+            limit=10, scope=scope, session_id=session_id, entity_id=entity
+        )
+        self.assertEqual(5, len(all_rows))
+        self.assertEqual(
+            ["content-m5", "content-m4", "content-m3", "content-m2", "content-m1"],
+            [row["content"] for row in all_rows],
+        )
+
     async def test_recovery_never_replaces_a_missing_database_with_empty_file(self) -> None:
         store = self.make_store()
         store.close()

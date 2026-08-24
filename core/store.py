@@ -81,6 +81,7 @@ class MemoryStore:
         self._closing = False
         self._closed = False
         self._fts_enabled = False
+        self._knowledge_trgm_enabled = False
         self._savepoint_counter = 0
         self._embedding_candidate_cache_revision = ""
         self._embedding_candidate_cache: dict[
@@ -805,6 +806,7 @@ class MemoryStore:
             self._ensure_acl_columns_sync()
             self._ensure_portrait_columns_sync()
             self._ensure_memory_fts_sync()
+            self._ensure_knowledge_trgm_sync()
             self._ensure_retrieval_revision_sync()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
@@ -830,6 +832,14 @@ class MemoryStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_scope_recent ON timeline(scope, occurred_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_subject_recent "
+                "ON timeline(scope, session_id, subject_id, occurred_at DESC, created_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_object_recent "
+                "ON timeline(scope, session_id, object_id, occurred_at DESC, created_at DESC)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_retention ON timeline(occurred_at, created_at) WHERE summarized_at!=''"
@@ -1247,6 +1257,57 @@ class MemoryStore:
                 self._rebuild_memory_fts_sync()
         except sqlite3.Error:
             self._fts_enabled = False
+
+    def _ensure_knowledge_trgm_sync(self) -> None:
+        """Maintain a trigram index over knowledge node labels via triggers.
+
+        LIKE '%term%' cannot use a b-tree index, so substring recall over
+        ~100k labels needs FTS5 trigram. Triggers keep the index in sync for
+        every write path (upsert, cascade delete, clear); a count mismatch at
+        startup triggers a full rebuild.
+        """
+        try:
+            self._conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_label_trgm
+                USING fts5(label, node_id UNINDEXED, tokenize='trigram')
+                """
+            )
+            self._conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_knowledge_label_trgm_ai
+                AFTER INSERT ON knowledge_nodes
+                BEGIN
+                    INSERT INTO knowledge_label_trgm(rowid, node_id, label)
+                    VALUES(new.rowid, new.id, new.label);
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_knowledge_label_trgm_ad
+                AFTER DELETE ON knowledge_nodes
+                BEGIN
+                    DELETE FROM knowledge_label_trgm WHERE rowid=old.rowid;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_knowledge_label_trgm_au
+                AFTER UPDATE OF label ON knowledge_nodes
+                BEGIN
+                    DELETE FROM knowledge_label_trgm WHERE rowid=old.rowid;
+                    INSERT INTO knowledge_label_trgm(rowid, node_id, label)
+                    VALUES(new.rowid, new.id, new.label);
+                END;
+                """
+            )
+            node_count = int(self._conn.execute("SELECT COUNT(*) FROM knowledge_nodes").fetchone()[0] or 0)
+            trgm_count = int(self._conn.execute("SELECT COUNT(*) FROM knowledge_label_trgm").fetchone()[0] or 0)
+            if node_count != trgm_count:
+                self._conn.execute("DELETE FROM knowledge_label_trgm")
+                self._conn.execute(
+                    """
+                    INSERT INTO knowledge_label_trgm(rowid, node_id, label)
+                    SELECT rowid, id, label FROM knowledge_nodes
+                    """
+                )
+            self._knowledge_trgm_enabled = True
+        except sqlite3.Error:
+            self._knowledge_trgm_enabled = False
 
     def _rebuild_memory_fts_sync(self) -> int:
         if not self._fts_enabled:
@@ -5876,18 +5937,37 @@ class MemoryStore:
         if group_id:
             scope_filter += " AND (n.group_id='' OR n.group_id=?)"
             params.append(group_id)
-        like_sql = " OR ".join(["lower(n.label) LIKE ? ESCAPE '\\'" for _ in cleaned_terms])
-        like_params = [self._like_pattern(term) for term in cleaned_terms]
+        match_clauses: list[str] = []
+        match_params: list[Any] = []
+        like_terms = cleaned_terms
+        if self._knowledge_trgm_enabled:
+            # Trigram substring match equals LIKE '%term%' for terms with
+            # >=3 alphanumeric characters. Terms containing punctuation keep
+            # the exact LIKE path because the trigram tokenizer splits tokens
+            # on non-alphanumeric characters.
+            long_terms = [term for term in cleaned_terms if len(term) >= 3 and term.isalnum()]
+            like_terms = [term for term in cleaned_terms if term not in long_terms]
+            if long_terms:
+                trgm_query = " OR ".join(self._quote_fts_term(term) for term in long_terms)
+                match_clauses.append(
+                    "n.rowid IN (SELECT rowid FROM knowledge_label_trgm WHERE knowledge_label_trgm MATCH ?)"
+                )
+                match_params.append(trgm_query)
+        if like_terms:
+            like_sql = " OR ".join(["lower(n.label) LIKE ? ESCAPE '\\'" for _ in like_terms])
+            match_clauses.append(f"({like_sql})")
+            match_params.extend(self._like_pattern(term) for term in like_terms)
+        match_where = " OR ".join(match_clauses) or "1=0"
         with self._lock:
             matched = self._conn.execute(
                 f"""
                 SELECT n.id, n.label
                 FROM knowledge_nodes n
-                WHERE ({like_sql}) {scope_filter}
+                WHERE ({match_where}) {scope_filter}
                 ORDER BY n.updated_at DESC
                 LIMIT ?
                 """,
-                like_params + params + [max(1, int(limit))],
+                match_params + params + [max(1, int(limit))],
             ).fetchall()
             matched_ids = [str(row["id"]) for row in matched]
             labels = [clean_text(row["label"], 80) for row in matched]
@@ -7302,6 +7382,12 @@ class MemoryStore:
         entity_id: str,
         offset: int,
     ) -> list[dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
+        if scope and session_id and entity_id:
+            return self._recent_timeline_entity_split_sync(
+                safe_limit, scope, session_id, entity_id, safe_offset
+            )
         params: list[Any] = []
         where = "1=1"
         if scope:
@@ -7321,9 +7407,46 @@ class MemoryStore:
                 ORDER BY occurred_at DESC, created_at DESC
                 LIMIT ? OFFSET ?
                 """,
-                params + [max(1, int(limit)), max(0, int(offset))],
+                params + [safe_limit, safe_offset],
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def _recent_timeline_entity_split_sync(
+        self,
+        limit: int,
+        scope: str,
+        session_id: str,
+        entity_id: str,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        """Read the subject/object branches through dedicated indexes and merge.
+
+        ``(subject_id=? OR object_id=?)`` forces a scan plus temp B-tree on
+        large sessions. Two index-driven branch reads keep the same rows and
+        ordering: any row in the merged top-(offset+limit) must be in its own
+        branch's top-(offset+limit), so bounded branch reads are exact.
+        """
+        branch_size = limit + offset
+        merged: dict[str, dict[str, Any]] = {}
+        with self._lock:
+            for column in ("subject_id", "object_id"):
+                rows = self._conn.execute(
+                    f"""
+                    SELECT * FROM timeline
+                    WHERE scope=? AND session_id=? AND {column}=?
+                    ORDER BY occurred_at DESC, created_at DESC
+                    LIMIT ?
+                    """,
+                    (scope, session_id, entity_id, branch_size),
+                ).fetchall()
+                for row in rows:
+                    merged.setdefault(str(row["id"]), dict(row))
+        ordered = sorted(
+            merged.values(),
+            key=lambda row: (str(row.get("occurred_at") or ""), str(row.get("created_at") or "")),
+            reverse=True,
+        )
+        return ordered[offset : offset + limit]
 
     async def recent_cross_window_timeline(
         self,
