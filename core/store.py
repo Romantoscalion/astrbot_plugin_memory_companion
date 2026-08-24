@@ -822,6 +822,10 @@ class MemoryStore:
                 "ON memories(canonical_key)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_candidate "
+                "ON memories(importance DESC, occurred_at DESC, id)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_summary ON timeline(session_id, summarized_at, occurred_at)"
             )
             self._conn.execute(
@@ -1140,8 +1144,7 @@ class MemoryStore:
                 tags, metadata, created_at, updated_at, occurred_at, source_plugin,
                 import_batch_id, content_fingerprint, merged_count, supersedes_id,
                 owner_bot_id, validity_status, valid_from, valid_to, salience,
-                durability, sensitivity, reinforcement_score, injection_count,
-                last_injected_at, canonical_key
+                durability, sensitivity, canonical_key
             ON memories
             BEGIN
                 UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;

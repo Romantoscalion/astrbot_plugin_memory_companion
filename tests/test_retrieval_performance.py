@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import math
+import re
 import sys
 import tempfile
 import unittest
@@ -18,6 +21,7 @@ from astrbot_plugin_memory_companion.core.models import (
     MemoryRecord,
     SearchResult,
     SessionContext,
+    clean_text,
     memory_embedding_text,
     memory_embedding_text_hash,
 )
@@ -82,6 +86,55 @@ class _EmptyRerankProvider:
     async def rerank(self, **kwargs):
         self.calls.append(kwargs)
         return []
+
+
+def _legacy_mmr(engine: RetrievalEngine, ranked: list[SearchResult], selection_limit: int) -> list[SearchResult]:
+    """Reference copy of the pre-optimization MMR algorithm (HEAD baseline)."""
+    if len(ranked) < 2 or selection_limit <= 1:
+        return ranked
+    head_size = min(len(ranked), max(int(selection_limit or 1) * 4, 16))
+    pool = list(ranked[:head_size])
+    scores = [float(item.score) for item in pool]
+    minimum = min(scores)
+    maximum = max(scores)
+
+    def relevance(item: SearchResult) -> float:
+        if maximum <= minimum:
+            return 1.0
+        return (float(item.score) - minimum) / (maximum - minimum)
+
+    def features(item: SearchResult) -> set[str]:
+        memory = item.memory
+        text = re.sub(r"\s+", "", engine._haystack(memory))
+        cjk = {text[index : index + 2] for index in range(max(0, len(text) - 1)) if text[index : index + 2]}
+        latin = set(re.findall(r"[a-z0-9_]{2,}", text))
+        tags = {f"tag:{clean_text(tag, 40).lower()}" for tag in (memory.tags or []) if clean_text(tag, 40)}
+        source = clean_text(memory.source_plugin, 60).lower()
+        return set(sorted(cjk)[:180]) | latin | tags | ({f"source:{source}"} if source else set())
+
+    feature_map = {id(item): features(item) for item in pool}
+
+    def similarity(left: SearchResult, right: SearchResult) -> float:
+        left_features = feature_map[id(left)]
+        right_features = feature_map[id(right)]
+        union = left_features | right_features
+        return (len(left_features & right_features) / len(union)) if union else 0.0
+
+    selected: list[SearchResult] = [pool.pop(0)]
+    target = min(len(ranked), max(1, int(selection_limit or 1)))
+    while pool and len(selected) < target:
+        best_index = 0
+        best_value = -math.inf
+        for index, item in enumerate(pool):
+            redundancy = max(similarity(item, chosen) for chosen in selected)
+            value = (0.84 * relevance(item)) - (0.16 * redundancy)
+            if value > best_value:
+                best_value = value
+                best_index = index
+        selected.append(pool.pop(best_index))
+    selected_ids = {id(item) for item in selected}
+    tail = [item for item in ranked if id(item) not in selected_ids]
+    return [*selected, *tail]
 
 
 class RetrievalPerformanceTests(unittest.IsolatedAsyncioTestCase):
@@ -238,6 +291,123 @@ class RetrievalPerformanceTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 store.close()
+
+    def test_mmr_optimization_matches_legacy_selection_and_order(self) -> None:
+        engine = RetrievalEngine(
+            _CandidateStore(),
+            VisibilityPolicy(enable_acl_rules=False),
+            retrieval_mode="basic",
+            embedding_enabled=False,
+            knowledge_graph_enabled=False,
+        )
+        ranked = [
+            SearchResult(memory=_memory(f"m-{index}", content), score=score)
+            for index, (content, score) in enumerate(
+                [
+                    ("蓝风铃在午夜盛开", 0.95),
+                    ("蓝风铃的香气很淡", 0.90),
+                    ("蓝风铃的香气很淡", 0.85),
+                    ("用户喜欢喝拿铁不加糖", 0.60),
+                    ("latte no sugar please", 0.55),
+                    ("完全不同的长句用于测试特征", 0.30),
+                ]
+            )
+        ]
+        for item in ranked:
+            item.memory.tags = ["flower"] if "蓝风铃" in item.memory.content else []
+            item.memory.source_plugin = "memory_companion"
+
+        for limit in (2, 3, 4, 6):
+            expected = _legacy_mmr(engine, list(ranked), limit)
+            actual = engine._mmr_diversify(list(ranked), limit)
+            self.assertEqual(
+                [item.memory.id for item in expected],
+                [item.memory.id for item in actual],
+                f"MMR order diverged at limit={limit}",
+            )
+            self.assertEqual(
+                {item.memory.id for item in expected},
+                {item.memory.id for item in actual},
+                f"MMR membership diverged at limit={limit}",
+            )
+
+    def test_mmr_optimization_preserves_long_memory_bigram_cap(self) -> None:
+        engine = RetrievalEngine(
+            _CandidateStore(),
+            VisibilityPolicy(enable_acl_rules=False),
+            retrieval_mode="basic",
+            embedding_enabled=False,
+            knowledge_graph_enabled=False,
+        )
+        long_text = "甲" * 300 + "乙" * 300 + "丙"
+        ranked = [
+            SearchResult(memory=_memory("long-1", long_text), score=1.0),
+            SearchResult(memory=_memory("long-2", "丙丙丙丙丙"), score=0.9),
+        ]
+        self.assertEqual(
+            [item.memory.id for item in _legacy_mmr(engine, list(ranked), 2)],
+            [item.memory.id for item in engine._mmr_diversify(list(ranked), 2)],
+        )
+
+    async def test_mmr_offload_does_not_mutate_input_and_stays_responsive(self) -> None:
+        import time as _time
+
+        engine = RetrievalEngine(
+            _CandidateStore(),
+            VisibilityPolicy(enable_acl_rules=False),
+            retrieval_mode="basic",
+            embedding_enabled=False,
+            knowledge_graph_enabled=False,
+        )
+        ranked = [
+            SearchResult(memory=_memory("a", "第一段记忆"), score=1.0),
+            SearchResult(memory=_memory("b", "第二段记忆"), score=0.5),
+        ]
+        original = [id(item) for item in ranked]
+
+        def slow_mmr(candidates, limit):
+            _time.sleep(0.05)
+            return list(candidates)
+
+        engine._mmr_diversify = slow_mmr
+
+        ticks: list[int] = []
+
+        async def heartbeat() -> None:
+            for _ in range(40):
+                ticks.append(1)
+                await asyncio.sleep(0.005)
+
+        task = asyncio.create_task(heartbeat())
+        result = await engine._mmr_diversify_async(ranked, 2)
+        await task
+
+        self.assertEqual(original, [id(item) for item in ranked])
+        self.assertEqual([item.memory.id for item in ranked], [item.memory.id for item in result])
+        self.assertGreaterEqual(len(ticks), 5)
+
+    async def test_rank_candidates_is_deterministic_across_offloaded_runs(self) -> None:
+        current = _memory("stable-1", "蓝风铃的香气")
+        store = _CandidateStore(current=[current])
+        engine = RetrievalEngine(
+            store,
+            VisibilityPolicy(enable_acl_rules=False),
+            retrieval_mode="basic",
+            embedding_enabled=False,
+            knowledge_graph_enabled=False,
+        )
+        ctx = SessionContext(session_id="s1", scope="private", user_id="u1")
+
+        first, first_blocked = await engine._rank_candidates("蓝风铃", ctx)
+        second, second_blocked = await engine._rank_candidates("蓝风铃", ctx)
+
+        self.assertEqual(
+            [(item.memory.id, item.score) for item in first],
+            [(item.memory.id, item.score) for item in second],
+        )
+        self.assertEqual(first_blocked, second_blocked)
+        self.assertGreaterEqual(engine._rank_path_info["candidate_count"], 1)
+        self.assertTrue(engine._rank_path_info["ranking_offloaded"])
 
 
 if __name__ == "__main__":

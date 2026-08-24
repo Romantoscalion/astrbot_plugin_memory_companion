@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import math
 import re
-import inspect
-import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -241,7 +242,7 @@ class RetrievalEngine:
     ) -> tuple[list[SearchResult], list[dict[str, str]]]:
         results, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         results = await self._maybe_rerank_results(query, results, max(1, int(top_k or 1)))
-        results = self._mmr_diversify(results, max(1, int(top_k or 1)))
+        results = await self._mmr_diversify_async(results, max(1, int(top_k or 1)))
         selected = results[: max(1, int(top_k or 1))]
         selected, mutable_blocked = self._collapse_mutable_fact_results(query, ctx, selected)
         blocked.extend(mutable_blocked)
@@ -262,7 +263,7 @@ class RetrievalEngine:
         ranked, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         total = max(1, int(total_limit or 1))
         ranked = await self._maybe_rerank_results(query, ranked, total)
-        ranked = self._mmr_diversify(ranked, min(len(ranked), max(total * 6, 24)))
+        ranked = await self._mmr_diversify_async(ranked, min(len(ranked), max(total * 6, 24)))
         allow_profile_fallback = self._query_allows_profile_fallback(query)
         block_profile_retrieval = self._query_blocks_profile_retrieval(query)
 
@@ -585,6 +586,30 @@ class RetrievalEngine:
         anchors.sort(key=lambda item: item.score, reverse=True)
         return anchors[: max(1, min(len(anchors), int(final_limit or 1)))]
 
+    async def _mmr_diversify_async(
+        self,
+        ranked: list[SearchResult],
+        selection_limit: int,
+    ) -> list[SearchResult]:
+        """Run deterministic MMR off the event loop without changing its output."""
+        if len(ranked) < 2 or selection_limit <= 1:
+            self._rank_path_info["mmr_wall_ms"] = 0
+            self._rank_path_info["mmr_offloaded"] = False
+            self.last_path_info.update(self._rank_path_info)
+            return ranked
+        started = time.perf_counter()
+        # The worker receives a private list; MMR only reorders that list and
+        # mutates no store, request, or shared service state.
+        result = await asyncio.to_thread(
+            self._mmr_diversify,
+            list(ranked),
+            selection_limit,
+        )
+        self._rank_path_info["mmr_wall_ms"] = int((time.perf_counter() - started) * 1000)
+        self._rank_path_info["mmr_offloaded"] = True
+        self.last_path_info.update(self._rank_path_info)
+        return result
+
     def _mmr_diversify(self, ranked: list[SearchResult], selection_limit: int) -> list[SearchResult]:
         """Reorder the head with MMR while preserving every candidate."""
         if len(ranked) < 2 or selection_limit <= 1:
@@ -603,17 +628,35 @@ class RetrievalEngine:
         def features(item: SearchResult) -> set[str]:
             memory = item.memory
             text = re.sub(r"\s+", "", self._haystack(memory))
-            cjk = {text[index : index + 2] for index in range(max(0, len(text) - 1)) if text[index : index + 2]}
+            cjk = frozenset(
+                text[index : index + 2]
+                for index in range(max(0, len(text) - 1))
+                if text[index : index + 2]
+            )
+            # Avoid sorting the common case while preserving the historical
+            # deterministic 180-feature cap for unusually long memories.
+            if len(cjk) > 180:
+                cjk_features = set(sorted(cjk)[:180])
+            else:
+                cjk_features = set(cjk)
             latin = set(re.findall(r"[a-z0-9_]{2,}", text))
             tags = {f"tag:{clean_text(tag, 40).lower()}" for tag in (memory.tags or []) if clean_text(tag, 40)}
             source = clean_text(memory.source_plugin, 60).lower()
-            return set(sorted(cjk)[:180]) | latin | tags | ({f"source:{source}"} if source else set())
+            return cjk_features | latin | tags | ({f"source:{source}"} if source else set())
 
-        feature_map = {id(item): features(item) for item in pool}
+        feature_map: dict[int, set[str]] = {}
+
+        def feature_for(item: SearchResult) -> set[str]:
+            item_id = id(item)
+            cached = feature_map.get(item_id)
+            if cached is None:
+                cached = features(item)
+                feature_map[item_id] = cached
+            return cached
 
         def similarity(left: SearchResult, right: SearchResult) -> float:
-            left_features = feature_map[id(left)]
-            right_features = feature_map[id(right)]
+            left_features = feature_for(left)
+            right_features = feature_for(right)
             union = left_features | right_features
             return (len(left_features & right_features) / len(union)) if union else 0.0
 
@@ -623,8 +666,14 @@ class RetrievalEngine:
             best_index = 0
             best_value = -math.inf
             for index, item in enumerate(pool):
+                # Redundancy is non-negative, so this is an exact upper bound
+                # for the candidate's MMR value. Candidates that cannot beat
+                # the current winner need no expensive feature/intersection work.
+                upper_bound = 0.84 * relevance(item)
+                if upper_bound <= best_value:
+                    continue
                 redundancy = max(similarity(item, chosen) for chosen in selected)
-                value = (0.84 * relevance(item)) - (0.16 * redundancy)
+                value = upper_bound - (0.16 * redundancy)
                 if value > best_value:
                     best_value = value
                     best_index = index
@@ -1241,6 +1290,49 @@ class RetrievalEngine:
                 "keyword_candidates": len(keyword_candidates),
             }
         )
+        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
+        block_profile_retrieval = self._query_blocks_profile_retrieval(query)
+        ranking_started = time.perf_counter()
+        results, blocked, ranking_info = await asyncio.to_thread(
+            self._rank_candidates_sync,
+            query,
+            ctx,
+            expanded_terms,
+            graph_terms,
+            ranked_candidates,
+            current_window_candidates,
+            fts_candidates,
+            keyword_candidates,
+            vector_candidates,
+            time_window_candidates,
+            vector_scores,
+            acl_state,
+            time_intent,
+            block_profile_retrieval,
+        )
+        self._rank_path_info.update(ranking_info)
+        self._rank_path_info["ranking_cpu_ms"] = int((time.perf_counter() - ranking_started) * 1000)
+        self._rank_path_info["ranking_offloaded"] = True
+        return results, blocked
+
+    def _rank_candidates_sync(
+        self,
+        query: str,
+        ctx: SessionContext,
+        expanded_terms: list[str],
+        graph_terms: list[str],
+        ranked_candidates: list[MemoryRecord],
+        current_window_candidates: list[MemoryRecord],
+        fts_candidates: list[MemoryRecord],
+        keyword_candidates: list[MemoryRecord],
+        vector_candidates: list[MemoryRecord],
+        time_window_candidates: list[MemoryRecord],
+        vector_scores: dict[str, float],
+        acl_state: dict[str, object],
+        time_intent: TimeIntent | None,
+        block_profile_retrieval: bool,
+    ) -> tuple[list[SearchResult], list[dict[str, str]], dict[str, int]]:
+        """Score a private candidate snapshot without touching the event loop."""
         route_lists = (
             ("fts", fts_candidates),
             ("current_window", current_window_candidates),
@@ -1258,11 +1350,9 @@ class RetrievalEngine:
             vector_candidates,
             time_window_candidates,
         )
-        acl_state = await self._acl_state() if self.policy.enable_acl_rules else self._empty_acl_state()
         searchable: list[tuple[MemoryRecord, str]] = []
         prefiltered: dict[str, int] = {}
         time_filtered = 0
-        block_profile_retrieval = self._query_blocks_profile_retrieval(query)
         for memory in candidates:
             memory_type = clean_text(getattr(memory, "memory_type", ""), 80).lower()
             visibility_reason, prefilter_reason = self._search_visibility_reason(
@@ -1290,9 +1380,7 @@ class RetrievalEngine:
                 key = clean_text(prefilter_reason or "not_visible", 180)
                 prefiltered[key] = prefiltered.get(key, 0) + 1
         profile = self._query_profile(query, expanded_terms)
-        # IDF must describe the query-aware candidate pool (FTS/keyword/vector/
-        # time-window hits). Counting the importance-priority scan in the
-        # denominator lets unrelated high-importance rows dilute term weights.
+        # IDF must describe query-aware routes, not the unrelated priority scan.
         query_aware_ids = {
             memory_id
             for memory_id, sources in candidate_sources.items()
@@ -1329,16 +1417,16 @@ class RetrievalEngine:
                 }
             )
         for memory, visibility_reason in searchable:
-            vector_score = vector_scores.get(clean_text(memory.id, 120), 0.0)
+            memory_id = clean_text(memory.id, 120)
             score, reason = self._score(
                 memory,
                 expanded_terms,
                 ctx,
                 profile,
                 term_stats,
-                vector_score=vector_score,
-                reciprocal_rank_score=reciprocal_rank_scores.get(clean_text(memory.id, 120), 0.0),
-                route_families=route_families_by_id.get(clean_text(memory.id, 120), frozenset()),
+                vector_score=vector_scores.get(memory_id, 0.0),
+                reciprocal_rank_score=reciprocal_rank_scores.get(memory_id, 0.0),
+                route_families=route_families_by_id.get(memory_id, frozenset()),
             )
             if score <= 0:
                 if len(blocked) < 40:
@@ -1360,7 +1448,12 @@ class RetrievalEngine:
                 )
             )
         results.sort(key=lambda item: item.score, reverse=True)
-        return results, blocked
+        return results, blocked, {
+            "candidate_count": len(candidates),
+            "searchable_count": len(searchable),
+            "prefiltered_count": sum(prefiltered.values()),
+            "time_filtered_count": time_filtered,
+        }
 
     async def _embedding_candidate_memories(
         self,
