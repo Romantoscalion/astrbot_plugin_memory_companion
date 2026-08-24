@@ -294,6 +294,9 @@ class MemoryCompanionService:
         self._retrieval_result_cache_stats: dict[str, int] = {"hits": 0, "misses": 0, "evictions": 0}
         self._RETRIEVAL_RESULT_CACHE_TTL: float = 45.0
         self._RETRIEVAL_RESULT_CACHE_MAX: int = 128
+        # 注入结果 TTL 缓存（§3.5）：同一会话短时间连续提问的注入包变化很小，
+        # 命中缓存可毫秒级注入，避免重复检索与编排。
+        self._injection_cache: dict[str, tuple[float, str, str]] = {}
         self._reconstruction_states: dict[str, dict[str, Any]] = {}
         self._reconstruction_lock = asyncio.Lock()
         self._reconstruction_last_cleanup: float = 0.0
@@ -713,136 +716,160 @@ class MemoryCompanionService:
 
         self._apply_reconstruction_contract(req, ctx, event=event)
 
-        if not capture_enabled:
-            return
-        if not self.config.bool("memory_capture.enabled", True):
-            return
-        if not self.config.bool("memory_capture.capture_user_messages", True):
-            return
-        record = self.classifier.from_user_message(ctx)
-        if not record:
-            return
-        recent_timeline_rows: list[dict[str, Any]] | None = None
-        if ctx.scope == "group":
-            recent_timeline_rows = await self.store.recent_timeline(
-                limit=20,
-                scope=ctx.scope,
-                session_id=ctx.session_id,
-                entity_id=ctx.current_target_id,
-            )
-        memory_id = await self._existing_timeline_message_id(
-            ctx,
-            "user_message",
-            recent_rows=recent_timeline_rows,
-        )
-        if not memory_id:
-            event_metadata = {
-                "memory_id": memory_id,
-                "sender_name": ctx.user_name,
-                "message_id": ctx.message_id,
-                "source": "llm_request",
-                "conversation_memory": ctx.scope == "group",
-            }
-            event_metadata.update(self._cross_window_event_metadata(ctx))
-            event_metadata.update(self._reply_chain_metadata(reply_chain))
+        if capture_enabled:
+            # 关于本轮回复的采集写入（写时间线、写关系、抽取事实、调度向量化等）
+            # 对"本轮要不要出回复"毫无贡献，移入后台执行，不阻塞请求关键路径。
+            # 对应 optimization_plan.md §3.2「把写操作移出请求关键路径」。
+            asyncio.create_task(self._capture_async(ctx, event, req, reply_chain))
+
+    async def _capture_async(
+        self,
+        ctx: SessionContext,
+        event: Any,
+        req: Any,
+        reply_chain: list[dict[str, Any]] | None,
+    ) -> None:
+        """后台执行：采集写入链，不阻塞本轮 LLM 请求。
+
+        包含：稳定事实抽取、时间线写入、关系边记录、画像捕获等。
+        所有异常在此被捕获并记录日志，不会传播到请求路径。
+        """
+        try:
+            if not self.config.bool("memory_capture.enabled", True):
+                return
+            if not self.config.bool("memory_capture.capture_user_messages", True):
+                return
+            record = self.classifier.from_user_message(ctx)
+            if not record:
+                return
+            recent_timeline_rows: list[dict[str, Any]] | None = None
             if ctx.scope == "group":
-                event_metadata.update(await self._conversation_memory_metadata(
-                    ctx,
-                    source="llm_request",
-                    recent_rows=recent_timeline_rows,
-                ))
-            memory_id = await self.store.add_timeline_event(
-                event_type="user_message",
-                session_id=ctx.session_id,
-                scope=ctx.scope,
-                subject_id=ctx.user_id,
-                object_id=ctx.current_target_id,
-                content=self._timeline_content_with_reply_chain(
-                    ctx.message_text, reply_chain
-                ),
-                metadata=event_metadata,
-            )
-        if self.config.bool("memory_capture.record_relationship_edges", True):
-            await self.note_relationships(ctx, source_memory_id=memory_id)
-        if self.config.bool("memory_capture.extract_stable_facts", True):
-            derived_memories = self.classifier.derived_user_memories(
+                recent_timeline_rows = await self.store.recent_timeline(
+                    limit=20,
+                    scope=ctx.scope,
+                    session_id=ctx.session_id,
+                    entity_id=ctx.current_target_id,
+                )
+            memory_id = await self._existing_timeline_message_id(
                 ctx,
-                source_memory_id=memory_id,
+                "user_message",
+                recent_rows=recent_timeline_rows,
             )
-            if not any(
-                clean_text((item.metadata or {}).get("profile_dimension"), 80)
-                for item in derived_memories
-            ):
-                rejection_reason = self.classifier.profile_rejection_reason(
-                    ctx.message_text
+            if not memory_id:
+                event_metadata = {
+                    "memory_id": memory_id,
+                    "sender_name": ctx.user_name,
+                    "message_id": ctx.message_id,
+                    "source": "llm_request",
+                    "conversation_memory": ctx.scope == "group",
+                }
+                event_metadata.update(self._cross_window_event_metadata(ctx))
+                event_metadata.update(self._reply_chain_metadata(reply_chain))
+                if ctx.scope == "group":
+                    event_metadata.update(await self._conversation_memory_metadata(
+                        ctx,
+                        source="llm_request",
+                        recent_rows=recent_timeline_rows,
+                    ))
+                memory_id = await self.store.add_timeline_event(
+                    event_type="user_message",
+                    session_id=ctx.session_id,
+                    scope=ctx.scope,
+                    subject_id=ctx.user_id,
+                    object_id=ctx.current_target_id,
+                    content=self._timeline_content_with_reply_chain(
+                        ctx.message_text, reply_chain
+                    ),
+                    metadata=event_metadata,
                 )
-                if rejection_reason:
-                    logger.info(
-                        "[MemoryCompanion] 画像写入门禁: decision=rejected "
-                        "reason=%s type=profile_candidate dimension= subject=%s source=%s",
-                        rejection_reason,
-                        clean_text(ctx.user_id, 120),
-                        clean_text(memory_id, 160),
-                    )
-            for derived in derived_memories:
-                derived.id = self.stable_id(
-                    "derived", derived.memory_type, ctx.session_id, derived.content
+            if self.config.bool("memory_capture.record_relationship_edges", True):
+                await self.note_relationships(ctx, source_memory_id=memory_id)
+            if self.config.bool("memory_capture.extract_stable_facts", True):
+                derived_memories = self.classifier.derived_user_memories(
+                    ctx,
+                    source_memory_id=memory_id,
                 )
-                self.importance.calibrate(derived, source="stable_fact_extraction")
-                write_mode, gate_reason = self._prepare_rule_profile_write(derived)
-                if write_mode == "reject":
-                    self._log_profile_write_gate(
-                        derived,
-                        decision="rejected",
-                        reason=gate_reason,
+                if not any(
+                    clean_text((item.metadata or {}).get("profile_dimension"), 80)
+                    for item in derived_memories
+                ):
+                    rejection_reason = self.classifier.profile_rejection_reason(
+                        ctx.message_text
                     )
-                    continue
-                if write_mode == "profile":
-                    profile_result = await self.store.upsert_profile_candidate(derived)
-                    if not profile_result.get("ok"):
+                    if rejection_reason:
+                        logger.info(
+                            "[MemoryCompanion] 画像写入门禁: decision=rejected "
+                            "reason=%s type=profile_candidate dimension= subject=%s source=%s",
+                            rejection_reason,
+                            clean_text(ctx.user_id, 120),
+                            clean_text(memory_id, 160),
+                        )
+                for derived in derived_memories:
+                    derived.id = self.stable_id(
+                        "derived", derived.memory_type, ctx.session_id, derived.content
+                    )
+                    self.importance.calibrate(derived, source="stable_fact_extraction")
+                    write_mode, gate_reason = self._prepare_rule_profile_write(derived)
+                    if write_mode == "reject":
                         self._log_profile_write_gate(
                             derived,
                             decision="rejected",
-                            reason=clean_text(profile_result.get("code"), 120),
+                            reason=gate_reason,
                         )
                         continue
-                    derived_id = clean_text(profile_result.get("memory_id"), 120)
-                    gate_reason = clean_text(profile_result.get("profile_status"), 40)
-                    self._log_profile_write_gate(
-                        derived,
-                        decision="written",
-                        reason=gate_reason,
-                    )
-                    if gate_reason == "active":
-                        stored_profile = await self.store.get_memory(derived_id)
-                        self._schedule_memory_embedding(
-                            derived_id, stored_profile or derived
+                    if write_mode == "profile":
+                        profile_result = await self.store.upsert_profile_candidate(derived)
+                        if not profile_result.get("ok"):
+                            self._log_profile_write_gate(
+                                derived,
+                                decision="rejected",
+                                reason=clean_text(profile_result.get("code"), 120),
+                            )
+                            continue
+                        derived_id = clean_text(profile_result.get("memory_id"), 120)
+                        gate_reason = clean_text(profile_result.get("profile_status"), 40)
+                        self._log_profile_write_gate(
+                            derived,
+                            decision="written",
+                            reason=gate_reason,
                         )
-                else:
-                    derived_id = await self.store.insert_memory(derived)
-                    self._schedule_memory_embedding(derived_id, derived)
-                relation_type = str(derived.metadata.get("relation_type") or "")
-                if relation_type and self.config.bool(
-                    "memory_capture.record_relationship_edges", True
-                ):
-                    await self.store.upsert_relationship(
-                        subject=derived.subject,
-                        object=self._bot_entity(ctx),
-                        relation_type=relation_type,
-                        scope=ctx.scope,
-                        session_id=ctx.session_id,
-                        group_id=ctx.group_id,
-                        visibility=derived.visibility,
-                        evidence=derived.evidence,
-                        confidence=derived.confidence,
-                        review_status=derived.review_status,
-                        source_memory_id=derived_id,
-                        metadata={"source": "relationship_claim"},
-                    )
-        await self.portraits.capture_user_message(ctx, event=event, req=req)
-        self._ensure_portrait_daily_dispatcher()
-        if not self.config.bool("memory_capture.capture_bot_responses", True):
-            self._schedule_session_summary(ctx, reason="after_user_message")
+                        if gate_reason == "active":
+                            stored_profile = await self.store.get_memory(derived_id)
+                            self._schedule_memory_embedding(
+                                derived_id, stored_profile or derived
+                            )
+                    else:
+                        derived_id = await self.store.insert_memory(derived)
+                        self._schedule_memory_embedding(derived_id, derived)
+                    relation_type = str(derived.metadata.get("relation_type") or "")
+                    if relation_type and self.config.bool(
+                        "memory_capture.record_relationship_edges", True
+                    ):
+                        await self.store.upsert_relationship(
+                            subject=derived.subject,
+                            object=self._bot_entity(ctx),
+                            relation_type=relation_type,
+                            scope=ctx.scope,
+                            session_id=ctx.session_id,
+                            group_id=ctx.group_id,
+                            visibility=derived.visibility,
+                            evidence=derived.evidence,
+                            confidence=derived.confidence,
+                            review_status=derived.review_status,
+                            source_memory_id=derived_id,
+                            metadata={"source": "relationship_claim"},
+                        )
+            await self.portraits.capture_user_message(ctx, event=event, req=req)
+            self._ensure_portrait_daily_dispatcher()
+            if not self.config.bool("memory_capture.capture_bot_responses", True):
+                self._schedule_session_summary(ctx, reason="after_user_message")
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] 后台采集写入失败: session=%s error=%s",
+                ctx.session_id if hasattr(ctx, "session_id") else "?",
+                exc,
+                exc_info=True,
+            )
 
     async def handle_group_message(self, event: Any) -> None:
         self._ensure_lifecycle_maintenance_dispatcher()
@@ -7177,6 +7204,26 @@ class MemoryCompanionService:
                 event, req, injected=False, conversation_memory=False, slot_map={}
             )
             return
+        # 注入结果 TTL 缓存：同一会话短时间连续提问的注入包变化很小，
+        # 命中缓存可毫秒级注入，避免重复检索与编排（optimization_plan.md §3.5）。
+        _cache_ttl = self.config.float("injection_cache_ttl_seconds", 0.0)
+        if _cache_ttl > 0 and ctx.session_id:
+            _cached = self._injection_cache.get(ctx.session_id)
+            if _cached:
+                _ts, _cached_inj, _cached_scope = _cached
+                if time.monotonic() - _ts < _cache_ttl and _cached_scope == ctx.scope:
+                    if _cached_inj:
+                        self._mark_memory_companion_injection_state(
+                            event, req, injected=True, conversation_memory=False, slot_map={}
+                        )
+                        if append_temp_text(req, _cached_inj):
+                            await self._mark_injected_memories([])
+                            return
+                        _prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
+                        req.prompt = f"{_prompt}\n\n{_cached_inj}" if _prompt else _cached_inj
+                        await self._mark_injected_memories([])
+                        return
+                    return
         p5_gate = await self._p5_gate(event=event, sink="memory_recall")
         if not p5_gate.get("ok"):
             self._mark_memory_companion_injection_state(
@@ -7321,10 +7368,14 @@ class MemoryCompanionService:
                 )
                 if append_temp_text(req, injection):
                     await self._mark_injected_memories(actual_injected_memory_ids)
+                    if _cache_ttl > 0 and ctx.session_id:
+                        self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
                     return
                 prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
                 req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
                 await self._mark_injected_memories(actual_injected_memory_ids)
+                if _cache_ttl > 0 and ctx.session_id:
+                    self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
             return
         blocked: list[dict[str, Any]] = []
         retrieval_path_info: dict[str, Any] = {
@@ -7495,6 +7546,8 @@ class MemoryCompanionService:
         )
         if append_temp_text(req, injection):
             await self._mark_injected_memories(actual_injected_memory_ids)
+            if _cache_ttl > 0 and ctx.session_id:
+                self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
             logger.info(
                 "[MemoryCompanion] 已临时注入结构化记忆: session=%s source=%s count=%s chars=%s",
                 ctx.session_id,
@@ -7507,6 +7560,8 @@ class MemoryCompanionService:
         prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
         req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
         await self._mark_injected_memories(actual_injected_memory_ids)
+        if _cache_ttl > 0 and ctx.session_id:
+            self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
         logger.warning("[MemoryCompanion] TextPart 不可用，已回退到 prompt 注入: session=%s", ctx.session_id)
 
     def _log_injection_debug(

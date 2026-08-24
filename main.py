@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
@@ -91,7 +92,30 @@ class MemoryCompanionPlugin(Star):
 
     @filter.on_llm_request(priority=-20)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        await self.service.handle_llm_request(event, req)
+        """LLM 请求前钩子：注入记忆上下文，支持可配置的熔断预算。
+
+        对应 ``optimization_plan.md §3.1``：当 ``hook_request_budget_seconds``
+        配置为正数时，整个钩子被 ``asyncio.wait_for`` 包裹，超时即降级放行
+        （本轮无记忆注入），绝不拖死全轮对话。默认值 0 = 关闭，完全向后兼容。
+        """
+        budget = self.service.config.float("hook_request_budget_seconds", 0.0)
+        if budget <= 0:
+            await self.service.handle_llm_request(event, req)
+            return
+        try:
+            await asyncio.wait_for(
+                self.service.handle_llm_request(event, req),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[MemoryCompanion] on_llm_request 钩子超时 %.1fs，本轮降级放行（无记忆注入）",
+                budget,
+            )
+        except Exception:
+            logger.exception(
+                "[MemoryCompanion] on_llm_request 钩子异常，本轮放行"
+            )
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000)
     async def on_group_message(self, event: AstrMessageEvent):
