@@ -290,6 +290,19 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("番茄鸡蛋面", injection)
 
+    async def test_qq_memory_is_recalled_through_aiocqhttp_platform_alias(self) -> None:
+        service = self.make_service()
+        await service.store.insert_memory(self.private_memory("QQ 历史记录：中午吃过番茄鸡蛋面。"))
+        await self.allow_private_to_group(service)
+
+        injection = await service._compose_memory_injection(
+            self.group_context(platform="aiocqhttp"),
+            max_chars=3200,
+            write_log=False,
+        )
+
+        self.assertIn("番茄鸡蛋面", injection)
+
     def test_explicit_contextual_memory_query_keeps_recall_markers(self) -> None:
         service = self.make_service()
         self.assertFalse(

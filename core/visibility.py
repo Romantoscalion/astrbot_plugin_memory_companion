@@ -8,6 +8,16 @@ def _clean_id(value: str | None) -> str:
     return (value or "").strip()
 
 
+def _platform_family(value: str | None) -> str:
+    """Normalize adapter/product names without merging unrelated platforms."""
+    platform = _clean_id(value).casefold()
+    if platform in {"", "unknown", "default"}:
+        return ""
+    if platform in {"qq", "qqbot", "aiocqhttp", "onebot", "napcat", "go-cqhttp"}:
+        return "qq"
+    return platform
+
+
 class VisibilityPolicy:
     def __init__(
         self,
@@ -58,13 +68,8 @@ class VisibilityPolicy:
             # do not let that placeholder hide an otherwise identical window.
             if memory.session_id and memory.session_id == ctx.session_id:
                 return True, "same_private_session"
-            memory_platform = _clean_id(memory.platform).lower()
-            current_platform = _clean_id(ctx.platform).lower()
-            placeholder_platforms = {"", "unknown", "default"}
-            if memory_platform in placeholder_platforms:
-                memory_platform = ""
-            if current_platform in placeholder_platforms:
-                current_platform = ""
+            memory_platform = _platform_family(memory.platform)
+            current_platform = _platform_family(ctx.platform)
             if memory_platform and current_platform and memory_platform != current_platform:
                 return False, "other_platform"
             if ctx.scope != "private":
