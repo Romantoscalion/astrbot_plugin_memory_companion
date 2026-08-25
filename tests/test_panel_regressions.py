@@ -155,7 +155,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=1.10.0-ui-v1", page)
+        self.assertIn("app.css?v=1.10.4-ui-v1", page)
 
     def test_microscope_has_explicit_context_and_non_overlapping_results(self) -> None:
         page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
@@ -288,7 +288,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-workspace .object-rail', styles)
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film', styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=1.10.0-ui-v1", page)
+        self.assertIn("app.js?v=1.10.4-ui-v1", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")
