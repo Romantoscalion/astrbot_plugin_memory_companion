@@ -1256,6 +1256,17 @@ class MemoryStore:
             count += 1
         return count
 
+    async def rebuild_memory_indexes(self) -> dict[str, Any]:
+        """Ensure local lexical indexes exist after an external database import."""
+        return await asyncio.to_thread(self._rebuild_memory_indexes_sync)
+
+    def _rebuild_memory_indexes_sync(self) -> dict[str, Any]:
+        with self._lock:
+            self._ensure_memory_fts_sync()
+            rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled else 0
+            self._conn.commit()
+            return {"fts_enabled": self._fts_enabled, "fts_rebuilt": rebuilt}
+
     def _upsert_memory_fts_row(self, row: sqlite3.Row | None) -> None:
         if not self._fts_enabled or row is None:
             return

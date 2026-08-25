@@ -141,6 +141,7 @@ class LivingMemoryMigrator:
                     "imported": imported - before_table,
                 }
             )
+        index_result = await self.store.rebuild_memory_indexes()
         return {
             "imported": imported,
             "skipped": skipped,
@@ -151,6 +152,8 @@ class LivingMemoryMigrator:
             "import_limit": limit,
             "importable_tables": importable_tables,
             "skipped_tables": skipped_tables,
+            "fts_enabled": bool(index_result.get("fts_enabled")),
+            "fts_rebuilt": int(index_result.get("fts_rebuilt") or 0),
         }
 
     async def repair_imported_content(self, configured_path: str = "") -> dict[str, Any]:
@@ -259,6 +262,29 @@ class LivingMemoryMigrator:
         session_id = clean_text(row[session_col], 200) if session_col else ""
         session_id = clean_text(session_id or source_metadata.get("session_id"), 200)
         scope, target = self._scope_from_session(session_id)
+        if scope == "unknown":
+            metadata_scope = clean_text(
+                source_metadata.get("scope") or source_metadata.get("conversation_scope"),
+                40,
+            ).lower()
+            metadata_group = clean_text(
+                source_metadata.get("group_id") or self._row_get(row, "group_id"),
+                120,
+            )
+            metadata_user = clean_text(
+                source_metadata.get("user_id")
+                or source_metadata.get("sender_id")
+                or self._row_get(row, "user_id"),
+                120,
+            )
+            if metadata_scope == "group" and metadata_group:
+                scope, target = "group", metadata_group
+            elif metadata_scope == "private" and metadata_user:
+                scope, target = "private", metadata_user
+            elif metadata_group:
+                scope, target = "group", metadata_group
+            elif metadata_user:
+                scope, target = "private", metadata_user
         group_id = target if scope == "group" else ""
         object_ref = EntityRef(kind="group" if scope == "group" else "user", id=target, role="imported_target")
         visibility = "group_public" if scope == "group" else ("private_pair" if scope == "private" else "internal")
@@ -508,12 +534,16 @@ class LivingMemoryMigrator:
         return text
 
     def _scope_from_session(self, session_id: str) -> tuple[str, str]:
-        if ":GroupMessage:" in session_id:
-            return "group", session_id.rsplit(":GroupMessage:", 1)[-1]
-        if ":FriendMessage:" in session_id:
-            return "private", session_id.rsplit(":FriendMessage:", 1)[-1]
-        if ":PrivateMessage:" in session_id:
-            return "private", session_id.rsplit(":PrivateMessage:", 1)[-1]
+        normalized = clean_text(session_id, 200)
+        lowered = normalized.lower()
+        for marker in (":groupmessage:", ":group:"):
+            index = lowered.rfind(marker)
+            if index >= 0:
+                return "group", normalized[index + len(marker) :]
+        for marker in (":friendmessage:", ":privatemessage:", ":friend:", ":private:"):
+            index = lowered.rfind(marker)
+            if index >= 0:
+                return "private", normalized[index + len(marker) :]
         return "unknown", ""
 
     def _quote(self, name: str) -> str:

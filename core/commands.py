@@ -548,6 +548,10 @@ class MemoryCompanionCommandHandler:
             lines.append(f"跳过异常行：{skipped} 条")
         if imported == 0:
             lines.append("没有新增内容，可能是旧库没有 documents 完整摘要。")
+        elif result.get("fts_enabled"):
+            lines.append(f"本地检索索引已重建：{int(result.get('fts_rebuilt') or 0)} 条。")
+        else:
+            lines.append("本地检索索引未启用，建议检查 SQLite FTS5 支持。")
         lines.append("可在记忆面板或 /mcomp search 中查看。")
         return "\n".join(lines)
 
