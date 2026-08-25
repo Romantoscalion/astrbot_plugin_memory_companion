@@ -116,8 +116,35 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_ids(bundle["current_window_candidates"]), _ids(legacy_window))
         self.assertEqual(_ids(bundle["fts_candidates"]), _ids(legacy_fts))
         self.assertEqual(_ids(bundle["time_window_candidates"]), _ids(legacy_time))
+        # from_row_light (bundle) must be field-for-field identical to from_row
+        # (legacy) for every row written through the store — the semantic
+        # equivalence contract of the light read path.
+        self.assertEqual(bundle["ranked_candidates"], legacy_materialized)
+        self.assertEqual(bundle["current_window_candidates"], legacy_window)
+        self.assertEqual(bundle["fts_candidates"], legacy_fts)
+        self.assertEqual(bundle["time_window_candidates"], legacy_time)
         self.assertNotIn("m4", _ids(bundle["ranked_candidates"]))
         self.assertNotIn("m5", _ids(bundle["ranked_candidates"]))
+
+    def test_from_row_light_matches_from_row_for_stored_rows(self) -> None:
+        store = self.make_store()
+        # Seed a record carrying sensitive-looking metadata to prove the light
+        # path (no re-redaction) still equals the normalized stored value.
+        store._insert_memory_sync(
+            _memory(
+                "sensitive-1",
+                "我的 api_key 是 sk_live_abc123 请勿泄露",
+                importance=0.95,
+            )
+        )
+        store._insert_memory_sync(_memory("plain-1", "今天天气很好", importance=0.4))
+        with store._lock:
+            rows = store._conn.execute("SELECT * FROM memories ORDER BY id").fetchall()
+        for row in rows:
+            self.assertEqual(
+                MemoryRecord.from_row_light(row),
+                MemoryRecord.from_row(row),
+            )
 
     async def test_keyword_fallback_semantics(self) -> None:
         store = self.make_store()

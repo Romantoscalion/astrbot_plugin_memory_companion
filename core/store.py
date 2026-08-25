@@ -8537,12 +8537,12 @@ class MemoryStore:
                 time_rows = self._time_window_candidate_rows(conn, start_at, end_at, tw_limit, include_pending)
             queries_done_at = time.perf_counter()
         parsed = {
-            "ranked_candidates": [MemoryRecord.from_row(row) for row in ranked_rows],
-            "current_window_candidates": [MemoryRecord.from_row(row) for row in current_window_rows],
-            "fts_candidates": [MemoryRecord.from_row(row) for row in fts_rows],
-            "keyword_candidates": [MemoryRecord.from_row(row) for row in keyword_rows],
+            "ranked_candidates": [MemoryRecord.from_row_light(row) for row in ranked_rows],
+            "current_window_candidates": [MemoryRecord.from_row_light(row) for row in current_window_rows],
+            "fts_candidates": [MemoryRecord.from_row_light(row) for row in fts_rows],
+            "keyword_candidates": [MemoryRecord.from_row_light(row) for row in keyword_rows],
             "keyword_fallback_used": keyword_fallback_used,
-            "time_window_candidates": [MemoryRecord.from_row(row) for row in time_rows],
+            "time_window_candidates": [MemoryRecord.from_row_light(row) for row in time_rows],
         }
         parsed["_timing"] = {
             "lock_wait_ms": int((lock_acquired_at - bundle_started) * 1000),
