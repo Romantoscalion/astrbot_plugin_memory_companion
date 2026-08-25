@@ -89,6 +89,36 @@ class StoreConsistencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3000, store._conn.execute("PRAGMA busy_timeout").fetchone()[0])
         self.assertEqual(500, store._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
 
+    async def test_wal_checkpoint_truncate_skips_below_threshold(self) -> None:
+        store = self.make_store()
+        # A fresh empty DB has a tiny (or absent) WAL, so a high threshold skips.
+        result = await store.wal_checkpoint_truncate(min_wal_bytes=10 * 1024 * 1024)
+        self.assertEqual("below_threshold", result.get("skipped"))
+        self.assertFalse(result.get("checkpoint_attempted"))
+
+    async def test_wal_checkpoint_truncate_attempts_above_threshold(self) -> None:
+        store = self.make_store()
+        for index in range(200):
+            await store.insert_memory(
+                MemoryRecord(
+                    id=f"wal-{index}",
+                    memory_type="observation",
+                    subject=EntityRef(kind="user", id="u1"),
+                    object=EntityRef(kind="group", id="g1"),
+                    scope="group",
+                    session_id="qq:GroupMessage:g1",
+                    group_id="g1",
+                    visibility="group_public",
+                    lifecycle="stable_memory",
+                    content=f"WAL checkpoint 写入 {index}",
+                )
+            )
+        result = await store.wal_checkpoint_truncate(min_wal_bytes=1)
+        # TRUNCATE is best-effort: it must report an attempt, not a skip, and
+        # must not raise. busy==0 means it succeeded; busy==1 is a legal no-op.
+        self.assertTrue(result.get("checkpoint_attempted"))
+        self.assertIn(result.get("checkpoint_busy"), (0, 1))
+
     async def test_bucket_limit_applies_after_multi_bot_contexts_are_merged(self) -> None:
         store = self.make_store()
         for index in range(9):

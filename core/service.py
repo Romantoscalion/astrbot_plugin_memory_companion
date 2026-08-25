@@ -303,6 +303,13 @@ class MemoryCompanionService:
             "last_error": "",
             "last_completed_at": "",
         }
+        self._wal_checkpoint_task: asyncio.Task[Any] | None = None
+        self._wal_checkpoint_status: dict[str, Any] = {
+            "state": "idle",
+            "last_error": "",
+            "last_completed_at": "",
+            "last_result": {},
+        }
         self._portrait_dispatch_status: dict[str, Any] = {
             "state": "idle",
             "last_run_day": "",
@@ -712,6 +719,7 @@ class MemoryCompanionService:
             self.config.bool("memory_injection.debug_stage_timing_enabled", False)
         )
         self._ensure_lifecycle_maintenance_dispatcher()
+        self._ensure_wal_checkpoint_loop()
         ctx = await self.identity.resolve_event_context(event)
         stage_timer.mark("identity")
         self._sanitize_session_context_message_text(ctx)
@@ -954,6 +962,7 @@ class MemoryCompanionService:
 
     async def handle_group_message(self, event: Any) -> None:
         self._ensure_lifecycle_maintenance_dispatcher()
+        self._ensure_wal_checkpoint_loop()
         if not self.config.bool("memory_capture.enabled", True):
             return
         if not self.config.bool("conversation_memory.enabled", True):
@@ -1042,6 +1051,68 @@ class MemoryCompanionService:
         self._portrait_dispatch_task = task
         if task is not None:
             self._portrait_dispatch_status["state"] = "scheduled"
+
+    def _ensure_wal_checkpoint_loop(self) -> None:
+        """Start one retained, low-frequency WAL truncation task.
+
+        The dedicated candidate-load read connection can keep the passive
+        auto-checkpoint from ever truncating the ``-wal`` file, so it grows to
+        its high-water mark (a 146MB WAL was observed). This task periodically
+        runs a best-effort ``wal_checkpoint(TRUNCATE)`` when the WAL exceeds a
+        threshold, bounding its size without touching the request path.
+        """
+        if self._closing or self._closed:
+            return
+        if not self.config.bool("maintenance.wal_checkpoint_enabled", True):
+            return
+        if self._wal_checkpoint_task is not None and not self._wal_checkpoint_task.done():
+            return
+        task = self._spawn_background(
+            self._wal_checkpoint_loop(),
+            label="wal-checkpoint",
+        )
+        self._wal_checkpoint_task = task
+        if task is not None:
+            self._wal_checkpoint_status["state"] = "scheduled"
+
+    async def _wal_checkpoint_loop(self) -> None:
+        interval_seconds = max(
+            60,
+            self.config.int("maintenance.wal_checkpoint_interval_seconds", 1800),
+        )
+        min_wal_bytes = max(
+            1024 * 1024,
+            self.config.int("maintenance.wal_checkpoint_min_bytes", 8 * 1024 * 1024),
+        )
+        await asyncio.sleep(max(30, interval_seconds // 6))
+        while (
+            not self._closing
+            and not self._closed
+            and self.config.bool("maintenance.wal_checkpoint_enabled", True)
+        ):
+            try:
+                self._wal_checkpoint_status["state"] = "running"
+                result = await self.store.wal_checkpoint_truncate(min_wal_bytes=min_wal_bytes)
+                self._wal_checkpoint_status.update(
+                    {
+                        "state": "scheduled",
+                        "last_error": "",
+                        "last_completed_at": utc_now(),
+                        "last_result": result,
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._wal_checkpoint_status.update(
+                    {
+                        "state": "degraded",
+                        "last_error": self._describe_exception(exc),
+                        "last_completed_at": utc_now(),
+                    }
+                )
+                logger.warning("[MemoryCompanion] WAL checkpoint 任务失败: %s", exc, exc_info=True)
+            await asyncio.sleep(interval_seconds)
 
     def _ensure_lifecycle_maintenance_dispatcher(self) -> None:
         """Start one retained, low-frequency natural-forgetting scheduler."""

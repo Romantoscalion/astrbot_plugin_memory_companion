@@ -1166,6 +1166,24 @@
         "type": "int",
         "default": 24
       },
+      "wal_checkpoint_enabled": {
+        "description": "自动 WAL 截断",
+        "hint": "开启后插件会周期对 SQLite WAL 做 best-effort TRUNCATE 检查点，防止 -wal 文件持续膨胀拖慢读取。",
+        "type": "bool",
+        "default": true
+      },
+      "wal_checkpoint_interval_seconds": {
+        "description": "WAL 截断间隔（秒）",
+        "hint": "两次 WAL 截断检查之间的最短间隔，最小 60 秒。",
+        "type": "int",
+        "default": 1800
+      },
+      "wal_checkpoint_min_bytes": {
+        "description": "WAL 截断阈值（字节）",
+        "hint": "仅当 -wal 文件超过该大小时才尝试 TRUNCATE，最小 1MB。",
+        "type": "int",
+        "default": 8388608
+      },
       "memory_decay_archive_without_summary": {
         "description": "无模型时冷归档",
         "hint": "没有可用总结模型或候选过少时，将达到严格衰减阈值的碎片放入可恢复冷区；不会物理删除。",

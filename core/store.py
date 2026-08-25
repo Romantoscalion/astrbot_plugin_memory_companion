@@ -303,6 +303,52 @@ class MemoryStore:
         self._last_wal_health = dict(result)
         return result
 
+    async def wal_checkpoint_truncate(self, *, min_wal_bytes: int = 8 * 1024 * 1024) -> dict[str, Any]:
+        """Best-effort TRUNCATE checkpoint to bound the WAL file size.
+
+        A long-running WAL reader (the dedicated candidate-load connection) can
+        keep the passive auto-checkpoint from ever truncating the ``-wal`` file,
+        so it grows to its high-water mark and stays there — a 146MB WAL was
+        observed in production, which slows every subsequent read. This runs a
+        ``wal_checkpoint(TRUNCATE)`` on the main connection only when the WAL is
+        above ``min_wal_bytes`` and no write transaction is active; a busy
+        result is not an error.
+        """
+        return await asyncio.to_thread(self._wal_checkpoint_truncate_sync, min_wal_bytes)
+
+    def _wal_checkpoint_truncate_sync(self, min_wal_bytes: int) -> dict[str, Any]:
+        result = self._database_file_snapshot()
+        result.update(
+            {
+                "checkpoint_attempted": False,
+                "checkpoint_mode": "truncate",
+                "checkpoint_busy": None,
+                "checkpoint_log_frames": None,
+                "checkpointed_frames": None,
+            }
+        )
+        if self._read_only:
+            result["skipped"] = "read_only"
+            return result
+        if result.get("wal_bytes", -1) < max(0, int(min_wal_bytes)):
+            result["skipped"] = "below_threshold"
+            return result
+        with self._lock:
+            if self._conn.in_transaction:
+                result["skipped"] = "in_transaction"
+                return result
+            try:
+                row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                result["checkpoint_attempted"] = True
+                if row is not None and len(row) >= 3:
+                    result["checkpoint_busy"] = int(row[0] or 0)
+                    result["checkpoint_log_frames"] = int(row[1] or 0)
+                    result["checkpointed_frames"] = int(row[2] or 0)
+            except sqlite3.Error as exc:
+                result["checkpoint_error"] = clean_text(exc, 200)
+        result.update({f"after_{key}": value for key, value in self._database_file_snapshot().items()})
+        return result
+
     @contextmanager
     def _transaction_sync(self):
         """Run a write unit atomically; callers must hold ``self._lock``."""
