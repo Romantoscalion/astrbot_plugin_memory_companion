@@ -205,6 +205,36 @@ class MemoryRouteDecision:
     guard_lines: list[str] = field(default_factory=list)
 
 
+class _HookStageTimer:
+    """轻量阶段计时器：仅在 ``memory_injection.debug_stage_timing_enabled`` 打开时记录。
+
+    用于排障 on_llm_request 钩子内部各阶段（身份解析、注入、检索、编排等）的耗时分布，
+    关闭时几乎零开销。
+    """
+
+    __slots__ = ("enabled", "_marks", "_last")
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._marks: list[tuple[str, int]] = []
+        self._last = time.monotonic()
+
+    def mark(self, name: str) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        self._marks.append((name, int((now - self._last) * 1000)))
+        self._last = now
+
+    def summary(self) -> str:
+        if not self._marks:
+            return "no_stages"
+        return " ".join(f"{name}={ms}ms" for name, ms in self._marks)
+
+    def total_ms(self) -> int:
+        return sum(ms for _, ms in self._marks)
+
+
 class MemoryCompanionService:
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
 
@@ -273,6 +303,13 @@ class MemoryCompanionService:
             "last_error": "",
             "last_completed_at": "",
         }
+        self._wal_checkpoint_task: asyncio.Task[Any] | None = None
+        self._wal_checkpoint_status: dict[str, Any] = {
+            "state": "idle",
+            "last_error": "",
+            "last_completed_at": "",
+            "last_result": {},
+        }
         self._portrait_dispatch_status: dict[str, Any] = {
             "state": "idle",
             "last_run_day": "",
@@ -288,12 +325,21 @@ class MemoryCompanionService:
         self._embedding_background_semaphore = asyncio.Semaphore(
             max(1, self.config.int("retrieval.embedding_background_concurrency", 2))
         )
+        # 全局摘要调用并发上限（#10）：每会话 worker 并行调 provider 会压垮
+        # 模型网关，默认串行化所有后台阶段性总结的 provider 调用。
+        self._summary_call_semaphore = asyncio.Semaphore(
+            max(1, self.config.int("memory_summary.max_concurrent_calls", 1))
+        )
         self._embedding_provider_warned: set[str] = set()
         self._last_retrieval_path_info: dict[str, Any] = {}
+        self._hook_stage_timer: _HookStageTimer | None = None
         self._retrieval_result_cache: dict[str, dict[str, Any]] = {}
         self._retrieval_result_cache_stats: dict[str, int] = {"hits": 0, "misses": 0, "evictions": 0}
         self._RETRIEVAL_RESULT_CACHE_TTL: float = 45.0
         self._RETRIEVAL_RESULT_CACHE_MAX: int = 128
+        # 注入结果 TTL 缓存（§3.5）：同一会话短时间连续提问的注入包变化很小，
+        # 命中缓存可毫秒级注入，避免重复检索与编排。
+        self._injection_cache: dict[str, tuple[float, str, str]] = {}
         self._reconstruction_states: dict[str, dict[str, Any]] = {}
         self._reconstruction_lock = asyncio.Lock()
         self._reconstruction_last_cleanup: float = 0.0
@@ -669,14 +715,20 @@ class MemoryCompanionService:
             # Companion owns the fixed-reply branch. Do not resolve identity,
             # read memory, write evidence, or enter any LLM path here.
             return
+        stage_timer = _HookStageTimer(
+            self.config.bool("memory_injection.debug_stage_timing_enabled", False)
+        )
         self._ensure_lifecycle_maintenance_dispatcher()
+        self._ensure_wal_checkpoint_loop()
         ctx = await self.identity.resolve_event_context(event)
+        stage_timer.mark("identity")
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
         self._apply_companion_expression_decision(ctx, event=event, req=req)
         self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
+            self._emit_hook_stage_timing(stage_timer, ctx, note="internal_generation_skip")
             return
         if looks_like_command(ctx.message_text):
             remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
@@ -687,20 +739,26 @@ class MemoryCompanionService:
                     ctx.session_id,
                     clean_text(ctx.message_text, 160),
                 )
+            self._emit_hook_stage_timing(stage_timer, ctx, note="command_skip")
             return
 
         self._apply_remember_tool_contract(req)
         self._apply_core_memory_tool_contract(req)
+        stage_timer.mark("decorate")
 
         capture_enabled = self._scope_feature_enabled(ctx, "capture")
         if capture_enabled:
             await self.note_identity(ctx)
+        stage_timer.mark("note_identity")
         reply_chain = await self._reply_chain_for_event(event)
+        stage_timer.mark("reply_chain")
 
         if capture_enabled:
             await self._apply_user_reaction_feedback(ctx)
             self._update_address_evolution(ctx, ctx.message_text or "")
+        stage_timer.mark("feedback")
 
+        self._hook_stage_timer = stage_timer
         try:
             await self.inject_memories(ctx, req, event=event)
         except Exception as exc:
@@ -710,142 +768,201 @@ class MemoryCompanionService:
                 exc,
                 exc_info=True,
             )
+        finally:
+            self._hook_stage_timer = None
+        stage_timer.mark("inject")
 
         self._apply_reconstruction_contract(req, ctx, event=event)
 
-        if not capture_enabled:
+        if capture_enabled:
+            # 关于本轮回复的采集写入（写时间线、写关系、抽取事实、调度向量化等）
+            # 对"本轮要不要出回复"毫无贡献，移入后台执行，不阻塞请求关键路径。
+            # 对应 optimization_plan.md §3.2「把写操作移出请求关键路径」。
+            asyncio.create_task(self._capture_async(ctx, event, req, reply_chain))
+        stage_timer.mark("finalize")
+        self._emit_hook_stage_timing(stage_timer, ctx, note="ok")
+
+    def _emit_hook_stage_timing(
+        self,
+        stage_timer: _HookStageTimer,
+        ctx: Any,
+        *,
+        note: str = "",
+    ) -> None:
+        if not stage_timer.enabled:
             return
-        if not self.config.bool("memory_capture.enabled", True):
-            return
-        if not self.config.bool("memory_capture.capture_user_messages", True):
-            return
-        record = self.classifier.from_user_message(ctx)
-        if not record:
-            return
-        recent_timeline_rows: list[dict[str, Any]] | None = None
-        if ctx.scope == "group":
-            recent_timeline_rows = await self.store.recent_timeline(
-                limit=20,
-                scope=ctx.scope,
-                session_id=ctx.session_id,
-                entity_id=ctx.current_target_id,
+        retrieval_info = dict(getattr(self, "_last_retrieval_path_info", None) or {})
+        retrieval_brief = {
+            key: retrieval_info.get(key)
+            for key in (
+                "path", "mode", "candidate_count", "mmr_wall_ms", "cache", "reason",
+                "ranking_cpu_ms", "candidate_load_ms", "candidate_bundle", "fts_candidates",
+                "current_window_candidates", "keyword_candidates", "keyword_fallback_used",
+                "bundle_lock_wait_ms", "bundle_queries_ms", "bundle_parse_ms", "bundle_inner_ms",
             )
-        memory_id = await self._existing_timeline_message_id(
-            ctx,
-            "user_message",
-            recent_rows=recent_timeline_rows,
+            if key in retrieval_info
+        }
+        logger.info(
+            "[MemoryCompanion] hook stage timing: session=%s note=%s total=%sms | %s | retrieval=%s",
+            getattr(ctx, "session_id", ""),
+            note,
+            stage_timer.total_ms(),
+            stage_timer.summary(),
+            json_dumps(retrieval_brief) if retrieval_brief else "{}",
         )
-        if not memory_id:
-            event_metadata = {
-                "memory_id": memory_id,
-                "sender_name": ctx.user_name,
-                "message_id": ctx.message_id,
-                "source": "llm_request",
-                "conversation_memory": ctx.scope == "group",
-            }
-            event_metadata.update(self._cross_window_event_metadata(ctx))
-            event_metadata.update(self._reply_chain_metadata(reply_chain))
+
+    async def _capture_async(
+        self,
+        ctx: SessionContext,
+        event: Any,
+        req: Any,
+        reply_chain: list[dict[str, Any]] | None,
+    ) -> None:
+        """后台执行：采集写入链，不阻塞本轮 LLM 请求。
+
+        包含：稳定事实抽取、时间线写入、关系边记录、画像捕获等。
+        所有异常在此被捕获并记录日志，不会传播到请求路径。
+        """
+        try:
+            if not self.config.bool("memory_capture.enabled", True):
+                return
+            if not self.config.bool("memory_capture.capture_user_messages", True):
+                return
+            record = self.classifier.from_user_message(ctx)
+            if not record:
+                return
+            recent_timeline_rows: list[dict[str, Any]] | None = None
             if ctx.scope == "group":
-                event_metadata.update(await self._conversation_memory_metadata(
-                    ctx,
-                    source="llm_request",
-                    recent_rows=recent_timeline_rows,
-                ))
-            memory_id = await self.store.add_timeline_event(
-                event_type="user_message",
-                session_id=ctx.session_id,
-                scope=ctx.scope,
-                subject_id=ctx.user_id,
-                object_id=ctx.current_target_id,
-                content=self._timeline_content_with_reply_chain(
-                    ctx.message_text, reply_chain
-                ),
-                metadata=event_metadata,
-            )
-        if self.config.bool("memory_capture.record_relationship_edges", True):
-            await self.note_relationships(ctx, source_memory_id=memory_id)
-        if self.config.bool("memory_capture.extract_stable_facts", True):
-            derived_memories = self.classifier.derived_user_memories(
+                recent_timeline_rows = await self.store.recent_timeline(
+                    limit=20,
+                    scope=ctx.scope,
+                    session_id=ctx.session_id,
+                    entity_id=ctx.current_target_id,
+                )
+            memory_id = await self._existing_timeline_message_id(
                 ctx,
-                source_memory_id=memory_id,
+                "user_message",
+                recent_rows=recent_timeline_rows,
             )
-            if not any(
-                clean_text((item.metadata or {}).get("profile_dimension"), 80)
-                for item in derived_memories
-            ):
-                rejection_reason = self.classifier.profile_rejection_reason(
-                    ctx.message_text
+            if not memory_id:
+                event_metadata = {
+                    "memory_id": memory_id,
+                    "sender_name": ctx.user_name,
+                    "message_id": ctx.message_id,
+                    "source": "llm_request",
+                    "conversation_memory": ctx.scope == "group",
+                }
+                event_metadata.update(self._cross_window_event_metadata(ctx))
+                event_metadata.update(self._reply_chain_metadata(reply_chain))
+                if ctx.scope == "group":
+                    event_metadata.update(await self._conversation_memory_metadata(
+                        ctx,
+                        source="llm_request",
+                        recent_rows=recent_timeline_rows,
+                    ))
+                memory_id = await self.store.add_timeline_event(
+                    event_type="user_message",
+                    session_id=ctx.session_id,
+                    scope=ctx.scope,
+                    subject_id=ctx.user_id,
+                    object_id=ctx.current_target_id,
+                    content=self._timeline_content_with_reply_chain(
+                        ctx.message_text, reply_chain
+                    ),
+                    metadata=event_metadata,
                 )
-                if rejection_reason:
-                    logger.info(
-                        "[MemoryCompanion] 画像写入门禁: decision=rejected "
-                        "reason=%s type=profile_candidate dimension= subject=%s source=%s",
-                        rejection_reason,
-                        clean_text(ctx.user_id, 120),
-                        clean_text(memory_id, 160),
-                    )
-            for derived in derived_memories:
-                derived.id = self.stable_id(
-                    "derived", derived.memory_type, ctx.session_id, derived.content
+            if self.config.bool("memory_capture.record_relationship_edges", True):
+                await self.note_relationships(ctx, source_memory_id=memory_id)
+            if self.config.bool("memory_capture.extract_stable_facts", True):
+                derived_memories = self.classifier.derived_user_memories(
+                    ctx,
+                    source_memory_id=memory_id,
                 )
-                self.importance.calibrate(derived, source="stable_fact_extraction")
-                write_mode, gate_reason = self._prepare_rule_profile_write(derived)
-                if write_mode == "reject":
-                    self._log_profile_write_gate(
-                        derived,
-                        decision="rejected",
-                        reason=gate_reason,
+                if not any(
+                    clean_text((item.metadata or {}).get("profile_dimension"), 80)
+                    for item in derived_memories
+                ):
+                    rejection_reason = self.classifier.profile_rejection_reason(
+                        ctx.message_text
                     )
-                    continue
-                if write_mode == "profile":
-                    profile_result = await self.store.upsert_profile_candidate(derived)
-                    if not profile_result.get("ok"):
+                    if rejection_reason:
+                        logger.info(
+                            "[MemoryCompanion] 画像写入门禁: decision=rejected "
+                            "reason=%s type=profile_candidate dimension= subject=%s source=%s",
+                            rejection_reason,
+                            clean_text(ctx.user_id, 120),
+                            clean_text(memory_id, 160),
+                        )
+                for derived in derived_memories:
+                    derived.id = self.stable_id(
+                        "derived", derived.memory_type, ctx.session_id, derived.content
+                    )
+                    self.importance.calibrate(derived, source="stable_fact_extraction")
+                    write_mode, gate_reason = self._prepare_rule_profile_write(derived)
+                    if write_mode == "reject":
                         self._log_profile_write_gate(
                             derived,
                             decision="rejected",
-                            reason=clean_text(profile_result.get("code"), 120),
+                            reason=gate_reason,
                         )
                         continue
-                    derived_id = clean_text(profile_result.get("memory_id"), 120)
-                    gate_reason = clean_text(profile_result.get("profile_status"), 40)
-                    self._log_profile_write_gate(
-                        derived,
-                        decision="written",
-                        reason=gate_reason,
-                    )
-                    if gate_reason == "active":
-                        stored_profile = await self.store.get_memory(derived_id)
-                        self._schedule_memory_embedding(
-                            derived_id, stored_profile or derived
+                    if write_mode == "profile":
+                        profile_result = await self.store.upsert_profile_candidate(derived)
+                        if not profile_result.get("ok"):
+                            self._log_profile_write_gate(
+                                derived,
+                                decision="rejected",
+                                reason=clean_text(profile_result.get("code"), 120),
+                            )
+                            continue
+                        derived_id = clean_text(profile_result.get("memory_id"), 120)
+                        gate_reason = clean_text(profile_result.get("profile_status"), 40)
+                        self._log_profile_write_gate(
+                            derived,
+                            decision="written",
+                            reason=gate_reason,
                         )
-                else:
-                    derived_id = await self.store.insert_memory(derived)
-                    self._schedule_memory_embedding(derived_id, derived)
-                relation_type = str(derived.metadata.get("relation_type") or "")
-                if relation_type and self.config.bool(
-                    "memory_capture.record_relationship_edges", True
-                ):
-                    await self.store.upsert_relationship(
-                        subject=derived.subject,
-                        object=self._bot_entity(ctx),
-                        relation_type=relation_type,
-                        scope=ctx.scope,
-                        session_id=ctx.session_id,
-                        group_id=ctx.group_id,
-                        visibility=derived.visibility,
-                        evidence=derived.evidence,
-                        confidence=derived.confidence,
-                        review_status=derived.review_status,
-                        source_memory_id=derived_id,
-                        metadata={"source": "relationship_claim"},
-                    )
-        await self.portraits.capture_user_message(ctx, event=event, req=req)
-        self._ensure_portrait_daily_dispatcher()
-        if not self.config.bool("memory_capture.capture_bot_responses", True):
-            self._schedule_session_summary(ctx, reason="after_user_message")
+                        if gate_reason == "active":
+                            stored_profile = await self.store.get_memory(derived_id)
+                            self._schedule_memory_embedding(
+                                derived_id, stored_profile or derived
+                            )
+                    else:
+                        derived_id = await self.store.insert_memory(derived)
+                        self._schedule_memory_embedding(derived_id, derived)
+                    relation_type = str(derived.metadata.get("relation_type") or "")
+                    if relation_type and self.config.bool(
+                        "memory_capture.record_relationship_edges", True
+                    ):
+                        await self.store.upsert_relationship(
+                            subject=derived.subject,
+                            object=self._bot_entity(ctx),
+                            relation_type=relation_type,
+                            scope=ctx.scope,
+                            session_id=ctx.session_id,
+                            group_id=ctx.group_id,
+                            visibility=derived.visibility,
+                            evidence=derived.evidence,
+                            confidence=derived.confidence,
+                            review_status=derived.review_status,
+                            source_memory_id=derived_id,
+                            metadata={"source": "relationship_claim"},
+                        )
+            await self.portraits.capture_user_message(ctx, event=event, req=req)
+            self._ensure_portrait_daily_dispatcher()
+            if not self.config.bool("memory_capture.capture_bot_responses", True):
+                self._schedule_session_summary(ctx, reason="after_user_message")
+        except Exception as exc:
+            logger.warning(
+                "[MemoryCompanion] 后台采集写入失败: session=%s error=%s",
+                ctx.session_id if hasattr(ctx, "session_id") else "?",
+                exc,
+                exc_info=True,
+            )
 
     async def handle_group_message(self, event: Any) -> None:
         self._ensure_lifecycle_maintenance_dispatcher()
+        self._ensure_wal_checkpoint_loop()
         if not self.config.bool("memory_capture.enabled", True):
             return
         if not self.config.bool("conversation_memory.enabled", True):
@@ -934,6 +1051,68 @@ class MemoryCompanionService:
         self._portrait_dispatch_task = task
         if task is not None:
             self._portrait_dispatch_status["state"] = "scheduled"
+
+    def _ensure_wal_checkpoint_loop(self) -> None:
+        """Start one retained, low-frequency WAL truncation task.
+
+        The dedicated candidate-load read connection can keep the passive
+        auto-checkpoint from ever truncating the ``-wal`` file, so it grows to
+        its high-water mark (a 146MB WAL was observed). This task periodically
+        runs a best-effort ``wal_checkpoint(TRUNCATE)`` when the WAL exceeds a
+        threshold, bounding its size without touching the request path.
+        """
+        if self._closing or self._closed:
+            return
+        if not self.config.bool("maintenance.wal_checkpoint_enabled", True):
+            return
+        if self._wal_checkpoint_task is not None and not self._wal_checkpoint_task.done():
+            return
+        task = self._spawn_background(
+            self._wal_checkpoint_loop(),
+            label="wal-checkpoint",
+        )
+        self._wal_checkpoint_task = task
+        if task is not None:
+            self._wal_checkpoint_status["state"] = "scheduled"
+
+    async def _wal_checkpoint_loop(self) -> None:
+        interval_seconds = max(
+            60,
+            self.config.int("maintenance.wal_checkpoint_interval_seconds", 1800),
+        )
+        min_wal_bytes = max(
+            1024 * 1024,
+            self.config.int("maintenance.wal_checkpoint_min_bytes", 8 * 1024 * 1024),
+        )
+        await asyncio.sleep(max(30, interval_seconds // 6))
+        while (
+            not self._closing
+            and not self._closed
+            and self.config.bool("maintenance.wal_checkpoint_enabled", True)
+        ):
+            try:
+                self._wal_checkpoint_status["state"] = "running"
+                result = await self.store.wal_checkpoint_truncate(min_wal_bytes=min_wal_bytes)
+                self._wal_checkpoint_status.update(
+                    {
+                        "state": "scheduled",
+                        "last_error": "",
+                        "last_completed_at": utc_now(),
+                        "last_result": result,
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._wal_checkpoint_status.update(
+                    {
+                        "state": "degraded",
+                        "last_error": self._describe_exception(exc),
+                        "last_completed_at": utc_now(),
+                    }
+                )
+                logger.warning("[MemoryCompanion] WAL checkpoint 任务失败: %s", exc, exc_info=True)
+            await asyncio.sleep(interval_seconds)
 
     def _ensure_lifecycle_maintenance_dispatcher(self) -> None:
         """Start one retained, low-frequency natural-forgetting scheduler."""
@@ -3948,6 +4127,25 @@ class MemoryCompanionService:
             after_timeline_id=clean_text(failure.get("end_timeline_id"), 160),
         )
 
+    async def _acquire_summary_call_slot(self, *, force: bool) -> bool:
+        """Cap concurrent summary provider calls across sessions (#10).
+
+        Background rounds wait up to ``call_queue_timeout_seconds`` for a
+        global slot and skip the round on timeout (the worker is re-triggered
+        by new messages); ``force=True`` manual runs bypass the queue.
+        """
+        if force:
+            return True
+        timeout = max(0, self.config.int("memory_summary.call_queue_timeout_seconds", 20))
+        if timeout <= 0:
+            await self._summary_call_semaphore.acquire()
+            return True
+        try:
+            await asyncio.wait_for(self._summary_call_semaphore.acquire(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
             return ""
@@ -4038,60 +4236,71 @@ class MemoryCompanionService:
                 logger.warning("[MemoryCompanion] 无可用 Provider，跳过阶段性记忆总结: session=%s", ctx.session_id)
                 return ""
 
+            slot_held = await self._acquire_summary_call_slot(force=force)
+            if not slot_held:
+                logger.info(
+                    "[MemoryCompanion] 摘要调用队列繁忙，本轮跳过，等待下次触发: session=%s",
+                    ctx.session_id,
+                )
+                return ""
             payload = None
             content = ""
             used_summary = {}
             last_error: Exception | None = None
             try:
-                for attempt in summary_attempts:
-                    try:
-                        payload = await self.summarizer.summarize_with_provider(
-                            attempt["provider"],
-                            rows=rows,
-                            session_label=ctx.label,
-                            provider_id=attempt["provider_id"] or attempt["source"],
-                            usage_recorder=self._record_token_usage,
-                            usage_task="memory_summary",
-                        )
-                        content = self.summarizer.compose_memory_content(payload or {})
-                        if content:
-                            used_summary = attempt
-                            break
-                        last_error = RuntimeError("empty summary content")
-                        logger.warning(
-                            "[MemoryCompanion] 阶段性总结候选返回空内容，尝试下一个: session=%s provider=%s",
-                            ctx.session_id,
-                            attempt["provider_id"] or attempt["source"],
-                        )
-                    except Exception as exc:
-                        last_error = exc
-                        error_text = self._describe_exception(exc)
-                        expected_failure = isinstance(exc, (TimeoutError, ValueError)) or type(exc).__name__ in {
-                            "APIConnectionError",
-                            "APITimeoutError",
-                            "ConnectError",
-                            "ConnectTimeout",
-                            "ReadError",
-                            "ReadTimeout",
-                        }
-                        expected_failure = expected_failure or self._summary_failure_is_transient(error_text)
-                        if expected_failure:
-                            logger.info(
-                                "[MemoryCompanion] 阶段性总结候选暂不可用，尝试下一个: session=%s provider=%s error=%s",
-                                ctx.session_id,
-                                attempt["provider_id"] or attempt["source"],
-                                error_text,
+                try:
+                    for attempt in summary_attempts:
+                        try:
+                            payload = await self.summarizer.summarize_with_provider(
+                                attempt["provider"],
+                                rows=rows,
+                                session_label=ctx.label,
+                                provider_id=attempt["provider_id"] or attempt["source"],
+                                usage_recorder=self._record_token_usage,
+                                usage_task="memory_summary",
                             )
-                        else:
+                            content = self.summarizer.compose_memory_content(payload or {})
+                            if content:
+                                used_summary = attempt
+                                break
+                            last_error = RuntimeError("empty summary content")
                             logger.warning(
-                                "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
+                                "[MemoryCompanion] 阶段性总结候选返回空内容，尝试下一个: session=%s provider=%s",
                                 ctx.session_id,
                                 attempt["provider_id"] or attempt["source"],
-                                error_text,
-                                exc_info=True,
                             )
-            except Exception as exc:
-                last_error = exc
+                        except Exception as exc:
+                            last_error = exc
+                            error_text = self._describe_exception(exc)
+                            expected_failure = isinstance(exc, (TimeoutError, ValueError)) or type(exc).__name__ in {
+                                "APIConnectionError",
+                                "APITimeoutError",
+                                "ConnectError",
+                                "ConnectTimeout",
+                                "ReadError",
+                                "ReadTimeout",
+                            }
+                            expected_failure = expected_failure or self._summary_failure_is_transient(error_text)
+                            if expected_failure:
+                                logger.info(
+                                    "[MemoryCompanion] 阶段性总结候选暂不可用，尝试下一个: session=%s provider=%s error=%s",
+                                    ctx.session_id,
+                                    attempt["provider_id"] or attempt["source"],
+                                    error_text,
+                                )
+                            else:
+                                logger.warning(
+                                    "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
+                                    ctx.session_id,
+                                    attempt["provider_id"] or attempt["source"],
+                                    error_text,
+                                    exc_info=True,
+                                )
+                except Exception as exc:
+                    last_error = exc
+            finally:
+                if not force:
+                    self._summary_call_semaphore.release()
             if not content:
                 failure_error = self._describe_exception(last_error) if last_error is not None else "summary failed"
                 transient_failure = self._summary_failure_is_transient(failure_error)
@@ -7164,6 +7373,7 @@ class MemoryCompanionService:
         return injection
 
     async def inject_memories(self, ctx: SessionContext, req: Any, *, event: Any = None) -> None:
+        stage_timer = getattr(self, "_hook_stage_timer", None)
         removed = remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
         if removed:
             logger.info("[MemoryCompanion] 已清理历史记忆包注入片段: session=%s count=%s", ctx.session_id, removed)
@@ -7177,7 +7387,29 @@ class MemoryCompanionService:
                 event, req, injected=False, conversation_memory=False, slot_map={}
             )
             return
+        # 注入结果 TTL 缓存：同一会话短时间连续提问的注入包变化很小，
+        # 命中缓存可毫秒级注入，避免重复检索与编排（optimization_plan.md §3.5）。
+        _cache_ttl = self.config.float("injection_cache_ttl_seconds", 0.0)
+        if _cache_ttl > 0 and ctx.session_id:
+            _cached = self._injection_cache.get(ctx.session_id)
+            if _cached:
+                _ts, _cached_inj, _cached_scope = _cached
+                if time.monotonic() - _ts < _cache_ttl and _cached_scope == ctx.scope:
+                    if _cached_inj:
+                        self._mark_memory_companion_injection_state(
+                            event, req, injected=True, conversation_memory=False, slot_map={}
+                        )
+                        if append_temp_text(req, _cached_inj):
+                            await self._mark_injected_memories([])
+                            return
+                        _prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
+                        req.prompt = f"{_prompt}\n\n{_cached_inj}" if _prompt else _cached_inj
+                        await self._mark_injected_memories([])
+                        return
+                    return
         p5_gate = await self._p5_gate(event=event, sink="memory_recall")
+        if stage_timer:
+            stage_timer.mark("p5_gate")
         if not p5_gate.get("ok"):
             self._mark_memory_companion_injection_state(
                 event,
@@ -7195,9 +7427,15 @@ class MemoryCompanionService:
             return
         self._sanitize_request_history_for_companion(ctx, req)
         core_memories = await self.core_memories_for_context(ctx)
+        if stage_timer:
+            stage_timer.mark("core_memories")
         core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
+        if stage_timer:
+            stage_timer.mark("recent_fact")
         recent_cross_window_context = await self._recent_cross_window_context(ctx)
+        if stage_timer:
+            stage_timer.mark("cross_window")
 
         turn_signal = analyze_turn_signal(ctx.message_text)
         low_guard_enabled = self._context_bool(ctx, "low_information_guard_enabled", True)
@@ -7239,6 +7477,8 @@ class MemoryCompanionService:
             )
 
         companion_state = detect_private_companion_request(req)
+        if stage_timer:
+            stage_timer.mark("guards")
         companion_deferred = self._companion_deferred_sections(event, req)
         companion_memory_present = self._companion_memory_context_present(companion_state, companion_deferred)
         time_intent = parse_time_intent(ctx.message_text)
@@ -7259,6 +7499,8 @@ class MemoryCompanionService:
         if decision.allow_contextual_expansion:
             intent = await self._expand_contextual_retrieval_intent(ctx, intent, turn_signal)
         retrieval_query = self._query_for_time_intent(intent.query, time_intent)
+        if stage_timer:
+            stage_timer.mark("intent")
         if not retrieval_query and not (time_intent.active and time_intent.summary_like):
             retrieval_path_info = {
                 "mode": clean_text(self.config.get("retrieval.mode", "auto"), 40),
@@ -7321,10 +7563,14 @@ class MemoryCompanionService:
                 )
                 if append_temp_text(req, injection):
                     await self._mark_injected_memories(actual_injected_memory_ids)
+                    if _cache_ttl > 0 and ctx.session_id:
+                        self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
                     return
                 prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
                 req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
                 await self._mark_injected_memories(actual_injected_memory_ids)
+                if _cache_ttl > 0 and ctx.session_id:
+                    self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
             return
         blocked: list[dict[str, Any]] = []
         retrieval_path_info: dict[str, Any] = {
@@ -7380,6 +7626,8 @@ class MemoryCompanionService:
             )
             retrieval_path_info = dict(self._last_retrieval_path_info or {})
             retrieval_path_info["route_layer"] = decision.layer
+        if stage_timer:
+            stage_timer.mark("retrieve")
         slot_map, current_state_reasons = self._filter_current_state_memory_slots(ctx, slot_map)
         if current_state_reasons:
             blocked.extend({"id": "", "reason": reason, "content": clean_text(ctx.message_text, 180)} for reason in current_state_reasons)
@@ -7413,6 +7661,8 @@ class MemoryCompanionService:
             retrieval_path_info,
         )
         results = self._flatten_slot_map(slot_map)
+        if stage_timer:
+            stage_timer.mark("filter_policy")
         intent_context = self._intent_context_for_injection(intent, time_intent=time_intent)
         if decision.guard_lines:
             guard_text = "\n".join(decision.guard_lines)
@@ -7450,6 +7700,8 @@ class MemoryCompanionService:
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
+        if stage_timer:
+            stage_timer.mark("compose")
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
@@ -7461,6 +7713,8 @@ class MemoryCompanionService:
             emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
         )
         self._maybe_record_persona_touch(ctx, results, emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"))
+        if stage_timer:
+            stage_timer.mark("emotion")
         self._log_injection_debug(
             ctx=ctx,
             intent=intent,
@@ -7482,6 +7736,8 @@ class MemoryCompanionService:
                 blocked_reasons=blocked[:30],
                 injection_chars=len(injection),
             )
+        if stage_timer:
+            stage_timer.mark("compose_log")
         if not injection:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map=slot_map)
             return
@@ -7495,6 +7751,8 @@ class MemoryCompanionService:
         )
         if append_temp_text(req, injection):
             await self._mark_injected_memories(actual_injected_memory_ids)
+            if _cache_ttl > 0 and ctx.session_id:
+                self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
             logger.info(
                 "[MemoryCompanion] 已临时注入结构化记忆: session=%s source=%s count=%s chars=%s",
                 ctx.session_id,
@@ -7507,6 +7765,8 @@ class MemoryCompanionService:
         prompt = clean_text(getattr(req, "prompt", "") or "", 8000)
         req.prompt = f"{prompt}\n\n{injection}" if prompt else injection
         await self._mark_injected_memories(actual_injected_memory_ids)
+        if _cache_ttl > 0 and ctx.session_id:
+            self._injection_cache[ctx.session_id] = (time.monotonic(), injection, ctx.scope)
         logger.warning("[MemoryCompanion] TextPart 不可用，已回退到 prompt 注入: session=%s", ctx.session_id)
 
     def _log_injection_debug(

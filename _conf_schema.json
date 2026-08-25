@@ -317,6 +317,18 @@
         "hint": "非法 JSON、安全审核拒绝等非连接类错误达到失败上限后，自动恢复探测前等待多久。失败只隔离当前批次，后续新消息仍可继续总结。0 表示下一次检查即可探测。",
         "type": "int",
         "default": 30
+      },
+      "max_concurrent_calls": {
+        "description": "全局总结并发上限",
+        "hint": "同一时刻最多允许多少个后台阶段性总结同时调用模型。多个群同时触发总结时会排队，避免一次性打爆模型网关导致全线超时。手动 /summary 命令不受此限制。",
+        "type": "int",
+        "default": 1
+      },
+      "call_queue_timeout_seconds": {
+        "description": "总结排队等待秒数",
+        "hint": "后台总结等待全局并发槽位的最长时间；超时则本轮跳过，等新消息再次触发。0 表示无限等待。",
+        "type": "int",
+        "default": 20
       }
     }
   },
@@ -582,6 +594,12 @@
       "debug_log_injection_enabled": {
         "description": "日志打印注入内容",
         "hint": "默认关闭。仅在排障时临时开启；开启后会把检索 query、命中记忆、过滤原因、连续对话记忆状态和实际注入包打印到 AstrBot 日志。",
+        "type": "bool",
+        "default": false
+      },
+      "debug_stage_timing_enabled": {
+        "description": "打印钩子阶段耗时",
+        "hint": "默认关闭。开启后在 on_llm_request 钩子结束时输出一行各阶段耗时（身份解析、注入、检索、编排等），用于延迟排障。",
         "type": "bool",
         "default": false
       },
@@ -1147,6 +1165,24 @@
         "hint": "两次自然遗忘维护之间的最短间隔，最小 1 小时。",
         "type": "int",
         "default": 24
+      },
+      "wal_checkpoint_enabled": {
+        "description": "自动 WAL 截断",
+        "hint": "开启后插件会周期对 SQLite WAL 做 best-effort TRUNCATE 检查点，防止 -wal 文件持续膨胀拖慢读取。",
+        "type": "bool",
+        "default": true
+      },
+      "wal_checkpoint_interval_seconds": {
+        "description": "WAL 截断间隔（秒）",
+        "hint": "两次 WAL 截断检查之间的最短间隔，最小 60 秒。",
+        "type": "int",
+        "default": 1800
+      },
+      "wal_checkpoint_min_bytes": {
+        "description": "WAL 截断阈值（字节）",
+        "hint": "仅当 -wal 文件超过该大小时才尝试 TRUNCATE，最小 1MB。",
+        "type": "int",
+        "default": 8388608
       },
       "memory_decay_archive_without_summary": {
         "description": "无模型时冷归档",

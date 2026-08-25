@@ -210,6 +210,24 @@ class SecurityAndCacheTests(unittest.IsolatedAsyncioTestCase):
         await service.store.mark_accessed([memory_id])
         self.assertEqual(before, await service.store.memory_revision())
 
+    async def test_injection_reinforcement_does_not_invalidate_retrieval_revision(self) -> None:
+        service = self.make_service()
+        memory_id = await service.store.insert_memory(self.group_memory("强化锚点"))
+        before = await service.store.memory_revision()
+        await service.store.mark_injected([memory_id])
+        self.assertEqual(before, await service.store.memory_revision())
+
+    async def test_new_memory_and_content_change_bump_retrieval_revision(self) -> None:
+        service = self.make_service()
+        before = await service.store.memory_revision()
+        memory_id = await service.store.insert_memory(self.group_memory("新增锚点"))
+        after_insert = await service.store.memory_revision()
+        self.assertNotEqual(before, after_insert)
+
+        await service.store.update_memory_payload(memory_id, content="内容变更锚点")
+        after_update = await service.store.memory_revision()
+        self.assertNotEqual(after_insert, after_update)
+
     async def test_page_search_without_context_uses_authenticated_admin_scope(self) -> None:
         response, search = await self.page_search({"query": "显微镜锚点", "scope": "unknown"})
 

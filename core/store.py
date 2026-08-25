@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -76,11 +77,16 @@ class MemoryStore:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = self._open_connection()
         self._lock = threading.RLock()
+        # 专用只读连接（WAL 下与主连接写入真正并行）：候选加载等纯读操作
+        # 不再排队等主连接写锁，对应 optimization_plan.md §6.1。
+        self._read_conn: sqlite3.Connection | None = None
+        self._read_lock = threading.RLock()
         self._operation_condition = threading.Condition()
         self._active_tracked_operations = 0
         self._closing = False
         self._closed = False
         self._fts_enabled = False
+        self._knowledge_trgm_enabled = False
         self._savepoint_counter = 0
         self._embedding_candidate_cache_revision = ""
         self._embedding_candidate_cache: dict[
@@ -114,6 +120,37 @@ class MemoryStore:
         if not self._read_only:
             connection.execute("PRAGMA wal_autocheckpoint=500")
         return connection
+
+    def _ensure_read_connection(self) -> sqlite3.Connection:
+        """Lazily open a dedicated read-only connection.
+
+        Under WAL this reader runs concurrently with the main connection's
+        writes, so pure-read paths (candidate loading) stop queueing behind
+        the main write lock. Read-only stores simply reuse the main
+        connection, which is already opened with mode=ro.
+        """
+        if self._read_only:
+            return self._conn
+        conn = self._read_conn
+        if conn is None:
+            with self._read_lock:
+                conn = self._read_conn
+                if conn is None:
+                    conn = sqlite3.connect(
+                        f"{self.db_path.resolve().as_uri()}?mode=ro",
+                        timeout=3.0,
+                        check_same_thread=False,
+                        uri=True,
+                    )
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA busy_timeout=3000")
+                    self._read_conn = conn
+        return conn
+
+    def _read_connection_for_bundle(self) -> tuple[sqlite3.Connection, threading.RLock]:
+        if self._read_only:
+            return self._conn, self._lock
+        return self._ensure_read_connection(), self._read_lock
 
     @staticmethod
     def _is_database_path_error(error: BaseException) -> bool:
@@ -264,6 +301,52 @@ class MemoryStore:
         if self._last_database_error:
             result["last_database_error"] = dict(self._last_database_error)
         self._last_wal_health = dict(result)
+        return result
+
+    async def wal_checkpoint_truncate(self, *, min_wal_bytes: int = 8 * 1024 * 1024) -> dict[str, Any]:
+        """Best-effort TRUNCATE checkpoint to bound the WAL file size.
+
+        A long-running WAL reader (the dedicated candidate-load connection) can
+        keep the passive auto-checkpoint from ever truncating the ``-wal`` file,
+        so it grows to its high-water mark and stays there — a 146MB WAL was
+        observed in production, which slows every subsequent read. This runs a
+        ``wal_checkpoint(TRUNCATE)`` on the main connection only when the WAL is
+        above ``min_wal_bytes`` and no write transaction is active; a busy
+        result is not an error.
+        """
+        return await asyncio.to_thread(self._wal_checkpoint_truncate_sync, min_wal_bytes)
+
+    def _wal_checkpoint_truncate_sync(self, min_wal_bytes: int) -> dict[str, Any]:
+        result = self._database_file_snapshot()
+        result.update(
+            {
+                "checkpoint_attempted": False,
+                "checkpoint_mode": "truncate",
+                "checkpoint_busy": None,
+                "checkpoint_log_frames": None,
+                "checkpointed_frames": None,
+            }
+        )
+        if self._read_only:
+            result["skipped"] = "read_only"
+            return result
+        if result.get("wal_bytes", -1) < max(0, int(min_wal_bytes)):
+            result["skipped"] = "below_threshold"
+            return result
+        with self._lock:
+            if self._conn.in_transaction:
+                result["skipped"] = "in_transaction"
+                return result
+            try:
+                row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                result["checkpoint_attempted"] = True
+                if row is not None and len(row) >= 3:
+                    result["checkpoint_busy"] = int(row[0] or 0)
+                    result["checkpoint_log_frames"] = int(row[1] or 0)
+                    result["checkpointed_frames"] = int(row[2] or 0)
+            except sqlite3.Error as exc:
+                result["checkpoint_error"] = clean_text(exc, 200)
+        result.update({f"after_{key}": value for key, value in self._database_file_snapshot().items()})
         return result
 
     @contextmanager
@@ -805,6 +888,7 @@ class MemoryStore:
             self._ensure_acl_columns_sync()
             self._ensure_portrait_columns_sync()
             self._ensure_memory_fts_sync()
+            self._ensure_knowledge_trgm_sync()
             self._ensure_retrieval_revision_sync()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
@@ -822,10 +906,22 @@ class MemoryStore:
                 "ON memories(canonical_key)"
             )
             self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_candidate "
+                "ON memories(importance DESC, occurred_at DESC, id)"
+            )
+            self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_summary ON timeline(session_id, summarized_at, occurred_at)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_scope_recent ON timeline(scope, occurred_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_subject_recent "
+                "ON timeline(scope, session_id, subject_id, occurred_at DESC, created_at DESC)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_timeline_object_recent "
+                "ON timeline(scope, session_id, object_id, occurred_at DESC, created_at DESC)"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_timeline_retention ON timeline(occurred_at, created_at) WHERE summarized_at!=''"
@@ -1140,8 +1236,7 @@ class MemoryStore:
                 tags, metadata, created_at, updated_at, occurred_at, source_plugin,
                 import_batch_id, content_fingerprint, merged_count, supersedes_id,
                 owner_bot_id, validity_status, valid_from, valid_to, salience,
-                durability, sensitivity, reinforcement_score, injection_count,
-                last_injected_at, canonical_key
+                durability, sensitivity, canonical_key
             ON memories
             BEGIN
                 UPDATE retrieval_revision SET revision = revision + 1 WHERE singleton = 1;
@@ -1244,6 +1339,57 @@ class MemoryStore:
                 self._rebuild_memory_fts_sync()
         except sqlite3.Error:
             self._fts_enabled = False
+
+    def _ensure_knowledge_trgm_sync(self) -> None:
+        """Maintain a trigram index over knowledge node labels via triggers.
+
+        LIKE '%term%' cannot use a b-tree index, so substring recall over
+        ~100k labels needs FTS5 trigram. Triggers keep the index in sync for
+        every write path (upsert, cascade delete, clear); a count mismatch at
+        startup triggers a full rebuild.
+        """
+        try:
+            self._conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_label_trgm
+                USING fts5(label, node_id UNINDEXED, tokenize='trigram')
+                """
+            )
+            self._conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_knowledge_label_trgm_ai
+                AFTER INSERT ON knowledge_nodes
+                BEGIN
+                    INSERT INTO knowledge_label_trgm(rowid, node_id, label)
+                    VALUES(new.rowid, new.id, new.label);
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_knowledge_label_trgm_ad
+                AFTER DELETE ON knowledge_nodes
+                BEGIN
+                    DELETE FROM knowledge_label_trgm WHERE rowid=old.rowid;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_knowledge_label_trgm_au
+                AFTER UPDATE OF label ON knowledge_nodes
+                BEGIN
+                    DELETE FROM knowledge_label_trgm WHERE rowid=old.rowid;
+                    INSERT INTO knowledge_label_trgm(rowid, node_id, label)
+                    VALUES(new.rowid, new.id, new.label);
+                END;
+                """
+            )
+            node_count = int(self._conn.execute("SELECT COUNT(*) FROM knowledge_nodes").fetchone()[0] or 0)
+            trgm_count = int(self._conn.execute("SELECT COUNT(*) FROM knowledge_label_trgm").fetchone()[0] or 0)
+            if node_count != trgm_count:
+                self._conn.execute("DELETE FROM knowledge_label_trgm")
+                self._conn.execute(
+                    """
+                    INSERT INTO knowledge_label_trgm(rowid, node_id, label)
+                    SELECT rowid, id, label FROM knowledge_nodes
+                    """
+                )
+            self._knowledge_trgm_enabled = True
+        except sqlite3.Error:
+            self._knowledge_trgm_enabled = False
 
     def _rebuild_memory_fts_sync(self) -> int:
         if not self._fts_enabled:
@@ -2509,6 +2655,13 @@ class MemoryStore:
             self._conn.commit()
             self._conn.close()
             self._closed = True
+        with self._read_lock:
+            if self._read_conn is not None:
+                try:
+                    self._read_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._read_conn = None
 
     def backup(self, suffix: str = "") -> Path:
         stamp = utc_now().replace(":", "").replace("-", "").replace("+", "_")
@@ -5884,18 +6037,37 @@ class MemoryStore:
         if group_id:
             scope_filter += " AND (n.group_id='' OR n.group_id=?)"
             params.append(group_id)
-        like_sql = " OR ".join(["lower(n.label) LIKE ? ESCAPE '\\'" for _ in cleaned_terms])
-        like_params = [self._like_pattern(term) for term in cleaned_terms]
+        match_clauses: list[str] = []
+        match_params: list[Any] = []
+        like_terms = cleaned_terms
+        if self._knowledge_trgm_enabled:
+            # Trigram substring match equals LIKE '%term%' for terms with
+            # >=3 alphanumeric characters. Terms containing punctuation keep
+            # the exact LIKE path because the trigram tokenizer splits tokens
+            # on non-alphanumeric characters.
+            long_terms = [term for term in cleaned_terms if len(term) >= 3 and term.isalnum()]
+            like_terms = [term for term in cleaned_terms if term not in long_terms]
+            if long_terms:
+                trgm_query = " OR ".join(self._quote_fts_term(term) for term in long_terms)
+                match_clauses.append(
+                    "n.rowid IN (SELECT rowid FROM knowledge_label_trgm WHERE knowledge_label_trgm MATCH ?)"
+                )
+                match_params.append(trgm_query)
+        if like_terms:
+            like_sql = " OR ".join(["lower(n.label) LIKE ? ESCAPE '\\'" for _ in like_terms])
+            match_clauses.append(f"({like_sql})")
+            match_params.extend(self._like_pattern(term) for term in like_terms)
+        match_where = " OR ".join(match_clauses) or "1=0"
         with self._lock:
             matched = self._conn.execute(
                 f"""
                 SELECT n.id, n.label
                 FROM knowledge_nodes n
-                WHERE ({like_sql}) {scope_filter}
+                WHERE ({match_where}) {scope_filter}
                 ORDER BY n.updated_at DESC
                 LIMIT ?
                 """,
-                like_params + params + [max(1, int(limit))],
+                match_params + params + [max(1, int(limit))],
             ).fetchall()
             matched_ids = [str(row["id"]) for row in matched]
             labels = [clean_text(row["label"], 80) for row in matched]
@@ -7310,6 +7482,12 @@ class MemoryStore:
         entity_id: str,
         offset: int,
     ) -> list[dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
+        if scope and session_id and entity_id:
+            return self._recent_timeline_entity_split_sync(
+                safe_limit, scope, session_id, entity_id, safe_offset
+            )
         params: list[Any] = []
         where = "1=1"
         if scope:
@@ -7329,9 +7507,46 @@ class MemoryStore:
                 ORDER BY occurred_at DESC, created_at DESC
                 LIMIT ? OFFSET ?
                 """,
-                params + [max(1, int(limit)), max(0, int(offset))],
+                params + [safe_limit, safe_offset],
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def _recent_timeline_entity_split_sync(
+        self,
+        limit: int,
+        scope: str,
+        session_id: str,
+        entity_id: str,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        """Read the subject/object branches through dedicated indexes and merge.
+
+        ``(subject_id=? OR object_id=?)`` forces a scan plus temp B-tree on
+        large sessions. Two index-driven branch reads keep the same rows and
+        ordering: any row in the merged top-(offset+limit) must be in its own
+        branch's top-(offset+limit), so bounded branch reads are exact.
+        """
+        branch_size = limit + offset
+        merged: dict[str, dict[str, Any]] = {}
+        with self._lock:
+            for column in ("subject_id", "object_id"):
+                rows = self._conn.execute(
+                    f"""
+                    SELECT * FROM timeline
+                    WHERE scope=? AND session_id=? AND {column}=?
+                    ORDER BY occurred_at DESC, created_at DESC
+                    LIMIT ?
+                    """,
+                    (scope, session_id, entity_id, branch_size),
+                ).fetchall()
+                for row in rows:
+                    merged.setdefault(str(row["id"]), dict(row))
+        ordered = sorted(
+            merged.values(),
+            key=lambda row: (str(row.get("occurred_at") or ""), str(row.get("created_at") or "")),
+            reverse=True,
+        )
+        return ordered[offset : offset + limit]
 
     async def recent_cross_window_timeline(
         self,
@@ -7895,21 +8110,29 @@ class MemoryStore:
         return await self._run_recoverable_database_operation(self._list_candidate_memories_sync, limit, include_pending)
 
     def _list_candidate_memories_sync(self, limit: int, include_pending: bool) -> list[MemoryRecord]:
+        with self._lock:
+            rows = self._materialized_candidate_rows(self._conn, limit, include_pending)
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def _materialized_candidate_rows(
+        self,
+        conn: sqlite3.Connection,
+        limit: int,
+        include_pending: bool,
+    ) -> list[Any]:
         where = "lifecycle != 'archived'"
         params: list[Any] = []
         if not include_pending:
             where += " AND review_status != 'pending'"
-        with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT * FROM memories
-                WHERE {where}
-                ORDER BY importance DESC, occurred_at DESC
-                LIMIT ?
-                """,
-                params + [max(1, int(limit))],
-            ).fetchall()
-        return [MemoryRecord.from_row(row) for row in rows]
+        return conn.execute(
+            f"""
+            SELECT * FROM memories
+            WHERE {where}
+            ORDER BY importance DESC, occurred_at DESC
+            LIMIT ?
+            """,
+            params + [max(1, int(limit))],
+        ).fetchall()
 
     async def list_core_memories(self, limit: int = 200) -> list[MemoryRecord]:
         """Read active core blocks without routing them through similarity search."""
@@ -8187,6 +8410,22 @@ class MemoryStore:
         limit: int,
         include_pending: bool,
     ) -> list[MemoryRecord]:
+        with self._lock:
+            rows = self._current_window_candidate_rows(
+                self._conn, scope, session_id, user_id, group_id, limit, include_pending
+            )
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def _current_window_candidate_rows(
+        self,
+        conn: sqlite3.Connection,
+        scope: str,
+        session_id: str,
+        user_id: str,
+        group_id: str,
+        limit: int,
+        include_pending: bool,
+    ) -> list[Any]:
         scope = clean_text(scope, 40).lower()
         session_id = clean_text(session_id, 200)
         user_id = clean_text(user_id, 120)
@@ -8207,19 +8446,17 @@ class MemoryStore:
         where = "lifecycle != 'archived' AND (" + " OR ".join(clauses) + ")"
         if not include_pending:
             where += " AND review_status != 'pending'"
-        with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT *
-                FROM memories
-                WHERE {where}
-                ORDER BY importance DESC,
-                         COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC
-                LIMIT ?
-                """,
-                params + [max(1, int(limit or 1))],
-            ).fetchall()
-        return [MemoryRecord.from_row(row) for row in rows]
+        return conn.execute(
+            f"""
+            SELECT *
+            FROM memories
+            WHERE {where}
+            ORDER BY importance DESC,
+                     COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC
+            LIMIT ?
+            """,
+            params + [max(1, int(limit or 1))],
+        ).fetchall()
 
     async def list_time_window_candidate_memories(
         self,
@@ -8243,6 +8480,18 @@ class MemoryStore:
         limit: int,
         include_pending: bool,
     ) -> list[MemoryRecord]:
+        with self._lock:
+            rows = self._time_window_candidate_rows(self._conn, start_at, end_at, limit, include_pending)
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def _time_window_candidate_rows(
+        self,
+        conn: sqlite3.Connection,
+        start_at: str,
+        end_at: str,
+        limit: int,
+        include_pending: bool,
+    ) -> list[Any]:
         start = clean_text(start_at, 80)
         end = clean_text(end_at, 80)
         if not start or not end:
@@ -8251,25 +8500,114 @@ class MemoryStore:
         params: list[Any] = [start, end, start, end, start, end]
         if not include_pending:
             where += " AND review_status != 'pending'"
-        with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT *
-                FROM memories
-                WHERE {where}
-                  AND (
-                    (occurred_at >= ? AND occurred_at < ?)
-                    OR (created_at >= ? AND created_at < ?)
-                    OR (updated_at >= ? AND updated_at < ?)
-                  )
-                ORDER BY
-                    COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC,
-                    importance DESC
-                LIMIT ?
-                """,
-                params + [max(1, int(limit or 1))],
-            ).fetchall()
-        return [MemoryRecord.from_row(row) for row in rows]
+        return conn.execute(
+            f"""
+            SELECT *
+            FROM memories
+            WHERE {where}
+              AND (
+                (occurred_at >= ? AND occurred_at < ?)
+                OR (created_at >= ? AND created_at < ?)
+                OR (updated_at >= ? AND updated_at < ?)
+              )
+            ORDER BY
+                COALESCE(NULLIF(occurred_at, ''), NULLIF(updated_at, ''), created_at) DESC,
+                importance DESC
+            LIMIT ?
+            """,
+            params + [max(1, int(limit or 1))],
+        ).fetchall()
+
+    async def list_retrieval_candidate_bundle(
+        self,
+        *,
+        materialize_limit: int,
+        current_window: dict[str, Any] | None,
+        fts_terms: list[str],
+        fts_limit: int,
+        keyword_terms: list[str],
+        keyword_limit: int,
+        keyword_fallback_min_fts: int,
+        time_window: tuple[str, str, int] | None,
+        include_pending: bool = False,
+    ) -> dict[str, Any]:
+        """Load all retrieval candidate sources in one read-only pass.
+
+        Replaces four separate ``asyncio.gather`` store calls (each of which
+        re-acquired the single write connection lock) with a single threaded
+        pass over a dedicated read-only connection. Under WAL this reader runs
+        concurrently with writes, so candidate loading no longer serializes
+        behind the main lock. Keyword-fallback semantics are preserved: the
+        keyword scan only runs when FTS produced too few candidates.
+
+        Corresponds to optimization_plan.md §6.1/§6.2.
+        """
+        return await asyncio.to_thread(
+            self._list_retrieval_candidate_bundle_sync,
+            materialize_limit,
+            current_window or {},
+            fts_terms,
+            fts_limit,
+            keyword_terms,
+            keyword_limit,
+            keyword_fallback_min_fts,
+            time_window,
+            include_pending,
+        )
+
+    def _list_retrieval_candidate_bundle_sync(
+        self,
+        materialize_limit: int,
+        current_window: dict[str, Any],
+        fts_terms: list[str],
+        fts_limit: int,
+        keyword_terms: list[str],
+        keyword_limit: int,
+        keyword_fallback_min_fts: int,
+        time_window: tuple[str, str, int] | None,
+        include_pending: bool,
+    ) -> dict[str, Any]:
+        bundle_started = time.perf_counter()
+        conn, lock = self._read_connection_for_bundle()
+        with lock:
+            lock_acquired_at = time.perf_counter()
+            ranked_rows = self._materialized_candidate_rows(conn, materialize_limit, include_pending)
+            current_window_rows = self._current_window_candidate_rows(
+                conn,
+                clean_text(current_window.get("scope", ""), 40),
+                clean_text(current_window.get("session_id", ""), 200),
+                clean_text(current_window.get("user_id", ""), 120),
+                clean_text(current_window.get("group_id", ""), 120),
+                int(current_window.get("limit", 0) or 0),
+                include_pending,
+            )
+            fts_rows = self._fts_candidate_rows(conn, fts_terms, fts_limit, include_pending)
+            keyword_fallback_used = len(fts_rows) < max(0, int(keyword_fallback_min_fts or 0))
+            keyword_rows = (
+                self._keyword_candidate_rows(conn, keyword_terms, keyword_limit, include_pending)
+                if keyword_fallback_used
+                else []
+            )
+            time_rows: list[Any] = []
+            if time_window is not None:
+                start_at, end_at, tw_limit = time_window
+                time_rows = self._time_window_candidate_rows(conn, start_at, end_at, tw_limit, include_pending)
+            queries_done_at = time.perf_counter()
+        parsed = {
+            "ranked_candidates": [MemoryRecord.from_row_light(row) for row in ranked_rows],
+            "current_window_candidates": [MemoryRecord.from_row_light(row) for row in current_window_rows],
+            "fts_candidates": [MemoryRecord.from_row_light(row) for row in fts_rows],
+            "keyword_candidates": [MemoryRecord.from_row_light(row) for row in keyword_rows],
+            "keyword_fallback_used": keyword_fallback_used,
+            "time_window_candidates": [MemoryRecord.from_row_light(row) for row in time_rows],
+        }
+        parsed["_timing"] = {
+            "lock_wait_ms": int((lock_acquired_at - bundle_started) * 1000),
+            "queries_ms": int((queries_done_at - lock_acquired_at) * 1000),
+            "parse_ms": int((time.perf_counter() - queries_done_at) * 1000),
+            "inner_total_ms": int((time.perf_counter() - bundle_started) * 1000),
+        }
+        return parsed
 
     async def list_fts_candidate_memories(
         self,
@@ -8290,6 +8628,17 @@ class MemoryStore:
         limit: int,
         include_pending: bool,
     ) -> list[MemoryRecord]:
+        with self._lock:
+            rows = self._fts_candidate_rows(self._conn, terms, limit, include_pending)
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def _fts_candidate_rows(
+        self,
+        conn: sqlite3.Connection,
+        terms: list[str],
+        limit: int,
+        include_pending: bool,
+    ) -> list[Any]:
         if not self._fts_enabled:
             return []
         query = self._fts_match_query(terms)
@@ -8300,23 +8649,21 @@ class MemoryStore:
         if not include_pending:
             where += " AND m.review_status != 'pending'"
         try:
-            with self._lock:
-                rows = self._conn.execute(
-                    f"""
-                    SELECT m.*
-                    FROM memory_fts
-                    JOIN memories m ON m.id = memory_fts.memory_id
-                    WHERE memory_fts MATCH ?
-                      AND {where}
-                    ORDER BY bm25(memory_fts), m.importance DESC,
-                             COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
-                    LIMIT ?
-                    """,
-                    params + [max(1, int(limit or 1))],
-                ).fetchall()
+            return conn.execute(
+                f"""
+                SELECT m.*
+                FROM memory_fts
+                JOIN memories m ON m.id = memory_fts.memory_id
+                WHERE memory_fts MATCH ?
+                  AND {where}
+                ORDER BY bm25(memory_fts), m.importance DESC,
+                         COALESCE(NULLIF(m.occurred_at, ''), m.created_at) DESC
+                LIMIT ?
+                """,
+                params + [max(1, int(limit or 1))],
+            ).fetchall()
         except sqlite3.Error:
             return []
-        return [MemoryRecord.from_row(row) for row in rows]
 
     def _fts_match_query(self, terms: list[str]) -> str:
         variants: list[str] = []
@@ -8362,6 +8709,17 @@ class MemoryStore:
         limit: int,
         include_pending: bool,
     ) -> list[MemoryRecord]:
+        with self._lock:
+            rows = self._keyword_candidate_rows(self._conn, terms, limit, include_pending)
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def _keyword_candidate_rows(
+        self,
+        conn: sqlite3.Connection,
+        terms: list[str],
+        limit: int,
+        include_pending: bool,
+    ) -> list[Any]:
         cleaned_terms = []
         for term in terms or []:
             text = clean_text(term, 80).lower()
@@ -8398,22 +8756,20 @@ class MemoryStore:
             params.extend([like] * len(columns))
         where += " AND (" + " OR ".join(term_clauses) + ")"
 
-        with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT *
-                FROM memories
-                WHERE {where}
-                ORDER BY
-                    CASE WHEN session_id != '' THEN 0 ELSE 1 END,
-                    importance DESC,
-                    occurred_at DESC,
-                    created_at DESC
-                LIMIT ?
-                """,
-                params + [max(1, int(limit or 1))],
-            ).fetchall()
-        return [MemoryRecord.from_row(row) for row in rows]
+        return conn.execute(
+            f"""
+            SELECT *
+            FROM memories
+            WHERE {where}
+            ORDER BY
+                CASE WHEN session_id != '' THEN 0 ELSE 1 END,
+                importance DESC,
+                occurred_at DESC,
+                created_at DESC
+            LIMIT ?
+            """,
+            params + [max(1, int(limit or 1))],
+        ).fetchall()
 
     @staticmethod
     def _like_pattern(term: str) -> str:

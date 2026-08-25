@@ -320,11 +320,11 @@ class MemoryRecord:
         }
 
     @classmethod
-    def from_row(cls, row: Any) -> "MemoryRecord":
+    def _from_row_raw(cls, row: Any) -> "MemoryRecord":
         metadata = json_loads(row_value(row, "metadata", "{}"), {})
         if not isinstance(metadata, dict):
             metadata = {}
-        record = cls(
+        return cls(
             id=row_value(row, "id", ""),
             memory_type=row_value(row, "memory_type", "observation"),
             subject=EntityRef(
@@ -377,7 +377,29 @@ class MemoryRecord:
             merged_count=int(row_value(row, "merged_count", 1) or 1),
             supersedes_id=row_value(row, "supersedes_id", ""),
         )
-        return record.ensure_defaults()
+
+    @classmethod
+    def from_row(cls, row: Any) -> "MemoryRecord":
+        return cls._from_row_raw(row).ensure_defaults()
+
+    @classmethod
+    def from_row_light(cls, row: Any) -> "MemoryRecord":
+        """Build a record from a stored row without re-running ``ensure_defaults``.
+
+        Candidate-loading read paths materialize thousands of rows per hook.
+        The stored columns are already normalized, redacted and hashed at
+        write time (``to_db`` runs ``ensure_defaults``), so re-deriving them on
+        read is redundant work — dominated by ``redact_sensitive_value`` over
+        the metadata dict. This constructor trusts the stored scalar columns,
+        parses the JSON columns, and applies only the cheap tag cleaning that
+        ``ensure_defaults`` also performs, so its output is identical to
+        ``from_row`` for any row written through the store. Verified
+        idempotent across the eligible population (see
+        test_candidate_bundle equivalence tests).
+        """
+        record = cls._from_row_raw(row)
+        record.tags = [clean_text(tag, 80) for tag in record.tags if clean_text(tag, 80)]
+        return record
 
 
 @dataclass(slots=True)
