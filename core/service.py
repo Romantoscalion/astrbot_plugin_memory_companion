@@ -8134,6 +8134,12 @@ class MemoryCompanionService:
 
     def _should_replace_current_query_with_anchors(self, query: str, turn_signal: Any, anchors: list[str]) -> bool:
         compact = re.sub(r"\s+", "", clean_text(query, 500)).lower()
+        # Keep the user's explicit memory intent in the retrieval query.  A
+        # follow-up such as "还记得水蜜桃是什么情况吗" may be context-dependent,
+        # but replacing it with recent dialogue anchors removes the recall
+        # markers and reintroduces the multi-term keyword gate.
+        if self._message_is_contextual_memory_request(compact):
+            return False
         if bool(getattr(turn_signal, "low_information", False)):
             return True
         if bool(getattr(turn_signal, "context_dependent", False)) and (len(anchors) <= 2 or len(compact) <= 8):

@@ -290,6 +290,16 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("番茄鸡蛋面", injection)
 
+    def test_explicit_contextual_memory_query_keeps_recall_markers(self) -> None:
+        service = self.make_service()
+        self.assertFalse(
+            service._should_replace_current_query_with_anchors(
+                "还记得水蜜桃是什么情况吗",
+                type("Signal", (), {"context_dependent": True, "low_information": False})(),
+                ["水蜜桃", "情况"],
+            )
+        )
+
     async def test_seamless_acl_use_is_limited_to_private_memory_owner(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory())
