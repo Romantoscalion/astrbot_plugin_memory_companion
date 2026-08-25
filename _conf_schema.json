@@ -597,6 +597,12 @@
         "type": "bool",
         "default": false
       },
+      "debug_stage_timing_enabled": {
+        "description": "打印钩子阶段耗时",
+        "hint": "默认关闭。开启后在 on_llm_request 钩子结束时输出一行各阶段耗时（身份解析、注入、检索、编排等），用于延迟排障。",
+        "type": "bool",
+        "default": false
+      },
       "debug_log_max_chars": {
         "description": "注入调试日志字数",
         "hint": "单轮注入调试日志最多打印多少字符。调大可查看完整注入块，调小可避免日志过长。",

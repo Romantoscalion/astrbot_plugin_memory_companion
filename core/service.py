@@ -205,6 +205,36 @@ class MemoryRouteDecision:
     guard_lines: list[str] = field(default_factory=list)
 
 
+class _HookStageTimer:
+    """轻量阶段计时器：仅在 ``memory_injection.debug_stage_timing_enabled`` 打开时记录。
+
+    用于排障 on_llm_request 钩子内部各阶段（身份解析、注入、检索、编排等）的耗时分布，
+    关闭时几乎零开销。
+    """
+
+    __slots__ = ("enabled", "_marks", "_last")
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+        self._marks: list[tuple[str, int]] = []
+        self._last = time.monotonic()
+
+    def mark(self, name: str) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        self._marks.append((name, int((now - self._last) * 1000)))
+        self._last = now
+
+    def summary(self) -> str:
+        if not self._marks:
+            return "no_stages"
+        return " ".join(f"{name}={ms}ms" for name, ms in self._marks)
+
+    def total_ms(self) -> int:
+        return sum(ms for _, ms in self._marks)
+
+
 class MemoryCompanionService:
     _SCOPE_CONTROL_FEATURES = frozenset({"capture", "recall", "topology"})
 
@@ -295,6 +325,7 @@ class MemoryCompanionService:
         )
         self._embedding_provider_warned: set[str] = set()
         self._last_retrieval_path_info: dict[str, Any] = {}
+        self._hook_stage_timer: _HookStageTimer | None = None
         self._retrieval_result_cache: dict[str, dict[str, Any]] = {}
         self._retrieval_result_cache_stats: dict[str, int] = {"hits": 0, "misses": 0, "evictions": 0}
         self._RETRIEVAL_RESULT_CACHE_TTL: float = 45.0
@@ -677,14 +708,19 @@ class MemoryCompanionService:
             # Companion owns the fixed-reply branch. Do not resolve identity,
             # read memory, write evidence, or enter any LLM path here.
             return
+        stage_timer = _HookStageTimer(
+            self.config.bool("memory_injection.debug_stage_timing_enabled", False)
+        )
         self._ensure_lifecycle_maintenance_dispatcher()
         ctx = await self.identity.resolve_event_context(event)
+        stage_timer.mark("identity")
         self._sanitize_session_context_message_text(ctx)
         self._apply_companion_relationship_projection(ctx, event=event, req=req)
         self._apply_companion_expression_decision(ctx, event=event, req=req)
         self._ensure_reconstruction_turn_token(event, ctx)
         self._apply_private_companion_preferred_address(ctx, req=req, event=event)
         if self._private_companion_internal_generation_event(event):
+            self._emit_hook_stage_timing(stage_timer, ctx, note="internal_generation_skip")
             return
         if looks_like_command(ctx.message_text):
             remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
@@ -695,20 +731,26 @@ class MemoryCompanionService:
                     ctx.session_id,
                     clean_text(ctx.message_text, 160),
                 )
+            self._emit_hook_stage_timing(stage_timer, ctx, note="command_skip")
             return
 
         self._apply_remember_tool_contract(req)
         self._apply_core_memory_tool_contract(req)
+        stage_timer.mark("decorate")
 
         capture_enabled = self._scope_feature_enabled(ctx, "capture")
         if capture_enabled:
             await self.note_identity(ctx)
+        stage_timer.mark("note_identity")
         reply_chain = await self._reply_chain_for_event(event)
+        stage_timer.mark("reply_chain")
 
         if capture_enabled:
             await self._apply_user_reaction_feedback(ctx)
             self._update_address_evolution(ctx, ctx.message_text or "")
+        stage_timer.mark("feedback")
 
+        self._hook_stage_timer = stage_timer
         try:
             await self.inject_memories(ctx, req, event=event)
         except Exception as exc:
@@ -718,6 +760,9 @@ class MemoryCompanionService:
                 exc,
                 exc_info=True,
             )
+        finally:
+            self._hook_stage_timer = None
+        stage_timer.mark("inject")
 
         self._apply_reconstruction_contract(req, ctx, event=event)
 
@@ -726,6 +771,32 @@ class MemoryCompanionService:
             # 对"本轮要不要出回复"毫无贡献，移入后台执行，不阻塞请求关键路径。
             # 对应 optimization_plan.md §3.2「把写操作移出请求关键路径」。
             asyncio.create_task(self._capture_async(ctx, event, req, reply_chain))
+        stage_timer.mark("finalize")
+        self._emit_hook_stage_timing(stage_timer, ctx, note="ok")
+
+    def _emit_hook_stage_timing(
+        self,
+        stage_timer: _HookStageTimer,
+        ctx: Any,
+        *,
+        note: str = "",
+    ) -> None:
+        if not stage_timer.enabled:
+            return
+        retrieval_info = dict(getattr(self, "_last_retrieval_path_info", None) or {})
+        retrieval_brief = {
+            key: retrieval_info.get(key)
+            for key in ("path", "mode", "candidate_count", "mmr_wall_ms", "cache", "reason")
+            if key in retrieval_info
+        }
+        logger.info(
+            "[MemoryCompanion] hook stage timing: session=%s note=%s total=%sms | %s | retrieval=%s",
+            getattr(ctx, "session_id", ""),
+            note,
+            stage_timer.total_ms(),
+            stage_timer.summary(),
+            json_dumps(retrieval_brief) if retrieval_brief else "{}",
+        )
 
     async def _capture_async(
         self,
@@ -7226,6 +7297,7 @@ class MemoryCompanionService:
         return injection
 
     async def inject_memories(self, ctx: SessionContext, req: Any, *, event: Any = None) -> None:
+        stage_timer = getattr(self, "_hook_stage_timer", None)
         removed = remove_temp_text(req, MEMORY_COMPANION_INJECTION_HEADER, MEMORY_COMPANION_INJECTION_FOOTER)
         if removed:
             logger.info("[MemoryCompanion] 已清理历史记忆包注入片段: session=%s count=%s", ctx.session_id, removed)
@@ -7260,6 +7332,8 @@ class MemoryCompanionService:
                         return
                     return
         p5_gate = await self._p5_gate(event=event, sink="memory_recall")
+        if stage_timer:
+            stage_timer.mark("p5_gate")
         if not p5_gate.get("ok"):
             self._mark_memory_companion_injection_state(
                 event,
@@ -7277,9 +7351,15 @@ class MemoryCompanionService:
             return
         self._sanitize_request_history_for_companion(ctx, req)
         core_memories = await self.core_memories_for_context(ctx)
+        if stage_timer:
+            stage_timer.mark("core_memories")
         core_memory_max_chars = self.config.int("core_memory.max_chars", 800)
         recent_fact_context = await self._recent_fact_guard_context(ctx)
+        if stage_timer:
+            stage_timer.mark("recent_fact")
         recent_cross_window_context = await self._recent_cross_window_context(ctx)
+        if stage_timer:
+            stage_timer.mark("cross_window")
 
         turn_signal = analyze_turn_signal(ctx.message_text)
         low_guard_enabled = self._context_bool(ctx, "low_information_guard_enabled", True)
@@ -7321,6 +7401,8 @@ class MemoryCompanionService:
             )
 
         companion_state = detect_private_companion_request(req)
+        if stage_timer:
+            stage_timer.mark("guards")
         companion_deferred = self._companion_deferred_sections(event, req)
         companion_memory_present = self._companion_memory_context_present(companion_state, companion_deferred)
         time_intent = parse_time_intent(ctx.message_text)
@@ -7341,6 +7423,8 @@ class MemoryCompanionService:
         if decision.allow_contextual_expansion:
             intent = await self._expand_contextual_retrieval_intent(ctx, intent, turn_signal)
         retrieval_query = self._query_for_time_intent(intent.query, time_intent)
+        if stage_timer:
+            stage_timer.mark("intent")
         if not retrieval_query and not (time_intent.active and time_intent.summary_like):
             retrieval_path_info = {
                 "mode": clean_text(self.config.get("retrieval.mode", "auto"), 40),
@@ -7466,6 +7550,8 @@ class MemoryCompanionService:
             )
             retrieval_path_info = dict(self._last_retrieval_path_info or {})
             retrieval_path_info["route_layer"] = decision.layer
+        if stage_timer:
+            stage_timer.mark("retrieve")
         slot_map, current_state_reasons = self._filter_current_state_memory_slots(ctx, slot_map)
         if current_state_reasons:
             blocked.extend({"id": "", "reason": reason, "content": clean_text(ctx.message_text, 180)} for reason in current_state_reasons)
@@ -7499,6 +7585,8 @@ class MemoryCompanionService:
             retrieval_path_info,
         )
         results = self._flatten_slot_map(slot_map)
+        if stage_timer:
+            stage_timer.mark("filter_policy")
         intent_context = self._intent_context_for_injection(intent, time_intent=time_intent)
         if decision.guard_lines:
             guard_text = "\n".join(decision.guard_lines)
@@ -7536,6 +7624,8 @@ class MemoryCompanionService:
         )
         injection_omissions, _diagnostic_included_memory_ids = self.injection.diagnostic_snapshot()
         blocked.extend(injection_omissions)
+        if stage_timer:
+            stage_timer.mark("compose")
         conversation_memory_note = self._conversation_memory_injection_note(
             slot_map,
             recent_fact_context=(recent_fact_context if "<recent_fact_context>" in injection else ""),
@@ -7547,6 +7637,8 @@ class MemoryCompanionService:
             emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"),
         )
         self._maybe_record_persona_touch(ctx, results, emotional_tone=getattr(turn_signal, "emotional_tone", "neutral"))
+        if stage_timer:
+            stage_timer.mark("emotion")
         self._log_injection_debug(
             ctx=ctx,
             intent=intent,
@@ -7568,6 +7660,8 @@ class MemoryCompanionService:
                 blocked_reasons=blocked[:30],
                 injection_chars=len(injection),
             )
+        if stage_timer:
+            stage_timer.mark("compose_log")
         if not injection:
             self._mark_memory_companion_injection_state(event, req, injected=False, conversation_memory=False, slot_map=slot_map)
             return
