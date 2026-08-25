@@ -1276,6 +1276,7 @@ class RetrievalEngine:
                 include_pending=include_pending,
             )
         if bundle is not None:
+            bundle_timing = bundle.pop("_timing", None) or {}
             ranked_candidates = bundle["ranked_candidates"]
             current_window_candidates = bundle["current_window_candidates"]
             fts_candidates = bundle["fts_candidates"]
@@ -1283,6 +1284,7 @@ class RetrievalEngine:
             time_window_candidates = bundle["time_window_candidates"]
             use_keyword_fallback = bool(bundle["keyword_fallback_used"])
         else:
+            bundle_timing = None
             time_window_task = None
             if time_window_spec is not None:
                 time_window_task = self.store.list_time_window_candidate_memories(
@@ -1330,6 +1332,11 @@ class RetrievalEngine:
         self._rank_path_info = embedding_info
         self._rank_path_info["candidate_load_ms"] = int((time.perf_counter() - load_started) * 1000)
         self._rank_path_info["candidate_bundle"] = bundle is not None
+        if bundle_timing:
+            self._rank_path_info["bundle_lock_wait_ms"] = bundle_timing.get("lock_wait_ms", 0)
+            self._rank_path_info["bundle_queries_ms"] = bundle_timing.get("queries_ms", 0)
+            self._rank_path_info["bundle_parse_ms"] = bundle_timing.get("parse_ms", 0)
+            self._rank_path_info["bundle_inner_ms"] = bundle_timing.get("inner_total_ms", 0)
         self._rank_path_info.update(
             {
                 "current_window_candidates": len(current_window_candidates),

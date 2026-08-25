@@ -790,6 +790,7 @@ class MemoryCompanionService:
                 "path", "mode", "candidate_count", "mmr_wall_ms", "cache", "reason",
                 "ranking_cpu_ms", "candidate_load_ms", "candidate_bundle", "fts_candidates",
                 "current_window_candidates", "keyword_candidates", "keyword_fallback_used",
+                "bundle_lock_wait_ms", "bundle_queries_ms", "bundle_parse_ms", "bundle_inner_ms",
             )
             if key in retrieval_info
         }

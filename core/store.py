@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -8509,8 +8510,10 @@ class MemoryStore:
         time_window: tuple[str, str, int] | None,
         include_pending: bool,
     ) -> dict[str, Any]:
+        bundle_started = time.perf_counter()
         conn, lock = self._read_connection_for_bundle()
         with lock:
+            lock_acquired_at = time.perf_counter()
             ranked_rows = self._materialized_candidate_rows(conn, materialize_limit, include_pending)
             current_window_rows = self._current_window_candidate_rows(
                 conn,
@@ -8532,7 +8535,8 @@ class MemoryStore:
             if time_window is not None:
                 start_at, end_at, tw_limit = time_window
                 time_rows = self._time_window_candidate_rows(conn, start_at, end_at, tw_limit, include_pending)
-        return {
+            queries_done_at = time.perf_counter()
+        parsed = {
             "ranked_candidates": [MemoryRecord.from_row(row) for row in ranked_rows],
             "current_window_candidates": [MemoryRecord.from_row(row) for row in current_window_rows],
             "fts_candidates": [MemoryRecord.from_row(row) for row in fts_rows],
@@ -8540,6 +8544,13 @@ class MemoryStore:
             "keyword_fallback_used": keyword_fallback_used,
             "time_window_candidates": [MemoryRecord.from_row(row) for row in time_rows],
         }
+        parsed["_timing"] = {
+            "lock_wait_ms": int((lock_acquired_at - bundle_started) * 1000),
+            "queries_ms": int((queries_done_at - lock_acquired_at) * 1000),
+            "parse_ms": int((time.perf_counter() - queries_done_at) * 1000),
+            "inner_total_ms": int((time.perf_counter() - bundle_started) * 1000),
+        }
+        return parsed
 
     async def list_fts_candidate_memories(
         self,
