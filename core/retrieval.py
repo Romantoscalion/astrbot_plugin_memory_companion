@@ -1237,6 +1237,7 @@ class RetrievalEngine:
         # These reads do not depend on one another. Running them together lets
         # the embedding provider's network wait overlap the store reads while
         # preserving the same candidate sources and merge order below.
+        load_started = time.perf_counter()
         time_window_task = None
         if time_intent is not None and time_intent.active:
             time_window_task = self.store.list_time_window_candidate_memories(
@@ -1282,6 +1283,7 @@ class RetrievalEngine:
             else []
         )
         self._rank_path_info = embedding_info
+        self._rank_path_info["candidate_load_ms"] = int((time.perf_counter() - load_started) * 1000)
         self._rank_path_info.update(
             {
                 "current_window_candidates": len(current_window_candidates),
