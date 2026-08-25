@@ -1234,56 +1234,102 @@ class RetrievalEngine:
         include_pending = not self.policy.hide_pending_review
         keyword_terms = self._keyword_candidate_terms(query, expanded_terms)
 
-        # These reads do not depend on one another. Running them together lets
-        # the embedding provider's network wait overlap the store reads while
-        # preserving the same candidate sources and merge order below.
+        # Candidate sources are read in one bundled pass over the store's
+        # dedicated read-only connection instead of four separate gathered
+        # store calls that each re-acquired the single write connection lock
+        # (optimization_plan.md §6.1/§6.2). The embedding provider wait still
+        # overlaps the store reads via gather. Any bundle failure falls back
+        # to the legacy per-source reads with identical semantics.
         load_started = time.perf_counter()
-        time_window_task = None
+        time_window_spec: tuple[str, str, int] | None = None
         if time_intent is not None and time_intent.active:
-            time_window_task = self.store.list_time_window_candidate_memories(
-                time_intent.start_at,
-                time_intent.end_at,
-                limit=1600,
-                include_pending=include_pending,
+            time_window_spec = (time_intent.start_at, time_intent.end_at, 1600)
+        bundle: dict[str, Any] | None = None
+        try:
+            bundle, vector_result = await asyncio.gather(
+                self.store.list_retrieval_candidate_bundle(
+                    materialize_limit=self.DEFAULT_MATERIALIZE_LIMIT,
+                    current_window={
+                        "scope": ctx.scope,
+                        "session_id": ctx.session_id,
+                        "user_id": ctx.user_id,
+                        "group_id": ctx.group_id,
+                        "limit": self.current_window_candidate_limit,
+                    },
+                    fts_terms=keyword_terms,
+                    fts_limit=1200,
+                    keyword_terms=keyword_terms,
+                    keyword_limit=1200,
+                    keyword_fallback_min_fts=self.keyword_fallback_min_fts_candidates,
+                    time_window=time_window_spec,
+                    include_pending=include_pending,
+                ),
+                self._embedding_candidate_memories(
+                    query,
+                    include_pending=include_pending,
+                ),
             )
-        ranked_candidates, current_window_candidates, fts_candidates, vector_result, time_result = await asyncio.gather(
-            self.store.list_candidate_memories(
-                limit=self.DEFAULT_MATERIALIZE_LIMIT,
-                include_pending=include_pending,
-            ),
-            self.store.list_current_window_candidate_memories(
-                scope=ctx.scope,
-                session_id=ctx.session_id,
-                user_id=ctx.user_id,
-                group_id=ctx.group_id,
-                limit=self.current_window_candidate_limit,
-                include_pending=include_pending,
-            ),
-            self.store.list_fts_candidate_memories(
-                keyword_terms,
-                limit=1200,
-                include_pending=include_pending,
-            ),
-            self._embedding_candidate_memories(
+        except Exception:
+            bundle = None
+            vector_result = await self._embedding_candidate_memories(
                 query,
                 include_pending=include_pending,
-            ),
-            time_window_task if time_window_task is not None else asyncio.sleep(0, result=[]),
-        )
-        vector_candidates, vector_scores, embedding_info = vector_result
-        time_window_candidates = time_result
-        use_keyword_fallback = len(fts_candidates) < self.keyword_fallback_min_fts_candidates
-        keyword_candidates = (
-            await self.store.list_keyword_candidate_memories(
-                keyword_terms,
-                limit=1200,
-                include_pending=include_pending,
             )
-            if use_keyword_fallback
-            else []
-        )
+        if bundle is not None:
+            ranked_candidates = bundle["ranked_candidates"]
+            current_window_candidates = bundle["current_window_candidates"]
+            fts_candidates = bundle["fts_candidates"]
+            keyword_candidates = bundle["keyword_candidates"]
+            time_window_candidates = bundle["time_window_candidates"]
+            use_keyword_fallback = bool(bundle["keyword_fallback_used"])
+        else:
+            time_window_task = None
+            if time_window_spec is not None:
+                time_window_task = self.store.list_time_window_candidate_memories(
+                    time_window_spec[0],
+                    time_window_spec[1],
+                    limit=time_window_spec[2],
+                    include_pending=include_pending,
+                )
+            (
+                ranked_candidates,
+                current_window_candidates,
+                fts_candidates,
+                time_window_candidates,
+            ) = await asyncio.gather(
+                self.store.list_candidate_memories(
+                    limit=self.DEFAULT_MATERIALIZE_LIMIT,
+                    include_pending=include_pending,
+                ),
+                self.store.list_current_window_candidate_memories(
+                    scope=ctx.scope,
+                    session_id=ctx.session_id,
+                    user_id=ctx.user_id,
+                    group_id=ctx.group_id,
+                    limit=self.current_window_candidate_limit,
+                    include_pending=include_pending,
+                ),
+                self.store.list_fts_candidate_memories(
+                    keyword_terms,
+                    limit=1200,
+                    include_pending=include_pending,
+                ),
+                time_window_task if time_window_task is not None else asyncio.sleep(0, result=[]),
+            )
+            use_keyword_fallback = len(fts_candidates) < self.keyword_fallback_min_fts_candidates
+            keyword_candidates = (
+                await self.store.list_keyword_candidate_memories(
+                    keyword_terms,
+                    limit=1200,
+                    include_pending=include_pending,
+                )
+                if use_keyword_fallback
+                else []
+            )
+        vector_candidates, vector_scores, embedding_info = vector_result
         self._rank_path_info = embedding_info
         self._rank_path_info["candidate_load_ms"] = int((time.perf_counter() - load_started) * 1000)
+        self._rank_path_info["candidate_bundle"] = bundle is not None
         self._rank_path_info.update(
             {
                 "current_window_candidates": len(current_window_candidates),
