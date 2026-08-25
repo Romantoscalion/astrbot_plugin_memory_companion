@@ -491,4 +491,17 @@ class MemoryCompanionPlugin(Star):
         if _ACTIVE_BRIDGE is self.memory_companion:
             _ACTIVE_BRIDGE = None
         await self.service.aclose()
+        evidence = self.service.shutdown_evidence()
+        store_state = evidence.get("store") or {}
+        logger.info(
+            "[MemoryCompanion] shutdown_complete reason=terminate "
+            "background=%s summary=%s pending=%s tracked_ops=%s "
+            "read_conn_closed=%s main_conn_closed=%s",
+            evidence.get("background_tasks", 0),
+            evidence.get("summary_workers", 0),
+            evidence.get("summary_pending", 0),
+            store_state.get("tracked_ops", 0),
+            store_state.get("read_conn_closed"),
+            store_state.get("main_conn_closed"),
+        )
         logger.info("[MemoryCompanion] 我会牢牢记住你 已停止")
