@@ -288,6 +288,11 @@ class MemoryCompanionService:
         self._embedding_background_semaphore = asyncio.Semaphore(
             max(1, self.config.int("retrieval.embedding_background_concurrency", 2))
         )
+        # 全局摘要调用并发上限（#10）：每会话 worker 并行调 provider 会压垮
+        # 模型网关，默认串行化所有后台阶段性总结的 provider 调用。
+        self._summary_call_semaphore = asyncio.Semaphore(
+            max(1, self.config.int("memory_summary.max_concurrent_calls", 1))
+        )
         self._embedding_provider_warned: set[str] = set()
         self._last_retrieval_path_info: dict[str, Any] = {}
         self._retrieval_result_cache: dict[str, dict[str, Any]] = {}
@@ -3975,6 +3980,25 @@ class MemoryCompanionService:
             after_timeline_id=clean_text(failure.get("end_timeline_id"), 160),
         )
 
+    async def _acquire_summary_call_slot(self, *, force: bool) -> bool:
+        """Cap concurrent summary provider calls across sessions (#10).
+
+        Background rounds wait up to ``call_queue_timeout_seconds`` for a
+        global slot and skip the round on timeout (the worker is re-triggered
+        by new messages); ``force=True`` manual runs bypass the queue.
+        """
+        if force:
+            return True
+        timeout = max(0, self.config.int("memory_summary.call_queue_timeout_seconds", 20))
+        if timeout <= 0:
+            await self._summary_call_semaphore.acquire()
+            return True
+        try:
+            await asyncio.wait_for(self._summary_call_semaphore.acquire(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def maybe_summarize_session(self, ctx: SessionContext, *, force: bool = False) -> str:
         if not force and not self.config.bool("memory_summary.enabled", True):
             return ""
@@ -4065,60 +4089,71 @@ class MemoryCompanionService:
                 logger.warning("[MemoryCompanion] 无可用 Provider，跳过阶段性记忆总结: session=%s", ctx.session_id)
                 return ""
 
+            slot_held = await self._acquire_summary_call_slot(force=force)
+            if not slot_held:
+                logger.info(
+                    "[MemoryCompanion] 摘要调用队列繁忙，本轮跳过，等待下次触发: session=%s",
+                    ctx.session_id,
+                )
+                return ""
             payload = None
             content = ""
             used_summary = {}
             last_error: Exception | None = None
             try:
-                for attempt in summary_attempts:
-                    try:
-                        payload = await self.summarizer.summarize_with_provider(
-                            attempt["provider"],
-                            rows=rows,
-                            session_label=ctx.label,
-                            provider_id=attempt["provider_id"] or attempt["source"],
-                            usage_recorder=self._record_token_usage,
-                            usage_task="memory_summary",
-                        )
-                        content = self.summarizer.compose_memory_content(payload or {})
-                        if content:
-                            used_summary = attempt
-                            break
-                        last_error = RuntimeError("empty summary content")
-                        logger.warning(
-                            "[MemoryCompanion] 阶段性总结候选返回空内容，尝试下一个: session=%s provider=%s",
-                            ctx.session_id,
-                            attempt["provider_id"] or attempt["source"],
-                        )
-                    except Exception as exc:
-                        last_error = exc
-                        error_text = self._describe_exception(exc)
-                        expected_failure = isinstance(exc, (TimeoutError, ValueError)) or type(exc).__name__ in {
-                            "APIConnectionError",
-                            "APITimeoutError",
-                            "ConnectError",
-                            "ConnectTimeout",
-                            "ReadError",
-                            "ReadTimeout",
-                        }
-                        expected_failure = expected_failure or self._summary_failure_is_transient(error_text)
-                        if expected_failure:
-                            logger.info(
-                                "[MemoryCompanion] 阶段性总结候选暂不可用，尝试下一个: session=%s provider=%s error=%s",
-                                ctx.session_id,
-                                attempt["provider_id"] or attempt["source"],
-                                error_text,
+                try:
+                    for attempt in summary_attempts:
+                        try:
+                            payload = await self.summarizer.summarize_with_provider(
+                                attempt["provider"],
+                                rows=rows,
+                                session_label=ctx.label,
+                                provider_id=attempt["provider_id"] or attempt["source"],
+                                usage_recorder=self._record_token_usage,
+                                usage_task="memory_summary",
                             )
-                        else:
+                            content = self.summarizer.compose_memory_content(payload or {})
+                            if content:
+                                used_summary = attempt
+                                break
+                            last_error = RuntimeError("empty summary content")
                             logger.warning(
-                                "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
+                                "[MemoryCompanion] 阶段性总结候选返回空内容，尝试下一个: session=%s provider=%s",
                                 ctx.session_id,
                                 attempt["provider_id"] or attempt["source"],
-                                error_text,
-                                exc_info=True,
                             )
-            except Exception as exc:
-                last_error = exc
+                        except Exception as exc:
+                            last_error = exc
+                            error_text = self._describe_exception(exc)
+                            expected_failure = isinstance(exc, (TimeoutError, ValueError)) or type(exc).__name__ in {
+                                "APIConnectionError",
+                                "APITimeoutError",
+                                "ConnectError",
+                                "ConnectTimeout",
+                                "ReadError",
+                                "ReadTimeout",
+                            }
+                            expected_failure = expected_failure or self._summary_failure_is_transient(error_text)
+                            if expected_failure:
+                                logger.info(
+                                    "[MemoryCompanion] 阶段性总结候选暂不可用，尝试下一个: session=%s provider=%s error=%s",
+                                    ctx.session_id,
+                                    attempt["provider_id"] or attempt["source"],
+                                    error_text,
+                                )
+                            else:
+                                logger.warning(
+                                    "[MemoryCompanion] 阶段性总结候选失败，尝试下一个: session=%s provider=%s error=%s",
+                                    ctx.session_id,
+                                    attempt["provider_id"] or attempt["source"],
+                                    error_text,
+                                    exc_info=True,
+                                )
+                except Exception as exc:
+                    last_error = exc
+            finally:
+                if not force:
+                    self._summary_call_semaphore.release()
             if not content:
                 failure_error = self._describe_exception(last_error) if last_error is not None else "summary failed"
                 transient_failure = self._summary_failure_is_transient(failure_error)
