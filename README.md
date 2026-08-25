@@ -185,6 +185,23 @@ astrbot_plugin_memory_companion
 
 与主动陪伴插件配合时，陪伴插件负责当前状态、即时日程、情绪底色和主动行为提示；MemoryCompanion 只补充长期解释层：为什么这个状态重要、它和用户有什么关系、过去是否有类似情境、还有什么未完成话题可以自然接上。检测到陪伴插件已注入当前状态后，MemoryCompanion 会过滤近期“当前状态复读”型记忆，只保留有关系、承诺、创作或伤痕意义的长期线索。
 
+### 外部插件长期记忆接入口
+
+其他插件或独立 App 可以通过记忆插件公开的 `get_memory_companion_bridge()` 获取桥接对象，并调用 `record_external_memory` 写入一条与用户绑定的长期记忆。上传时只需要指定 `user_id` 和可召回的摘要内容；来源、幂等键、标签和结构化元数据按需提供：
+
+```python
+bridge = memory_plugin.get_memory_companion_bridge()
+result = await bridge.record_external_memory(
+    user_id="用户平台 ID",
+    content="用户最近开始每周慢跑三次，通常在晚饭后进行。",
+    source_plugin="my_health_app",
+    idempotency_key="weekly-summary:2026-08-25",
+    payload={"activity": "running", "frequency_per_week": 3},
+)
+```
+
+该入口会固定写入当前用户的 `private_pair` 私域，不能由调用方改成群聊或公开范围，因此同一用户在 QQ、网页或手机终端的私聊中都能正常召回。重复上传同一 `idempotency_key` 会更新同一条记录，不会无限生成副本。高频原始数据建议先在外部整理成摘要，再上传；若只想暂存候选，可传 `long_term=False`，这类记录默认等待审核，不会直接进入普通召回。
+
 PrivateCompanion 读取日程连续性或每日穿搭时会协商使用 `schedule_fast` / `outfit_fast`：通过短生命周期只读连接，按 Bot 所有者和当前私聊对象隔离后均衡读取相关日程、行动、边界、历史穿搭与自拍，不调用 Embedding、Rerank 或全库候选。两个快速路径可在“陪伴插件协同”中分别关闭并回退完整检索；普通聊天召回始终使用完整检索链。
 
 `private_companion_bridge.cross_window_emotional_continuity_enabled` 默认关闭。只有明确开启并由新版陪伴插件提交精确用户能力上下文后，其他会话的近期情绪余波才会进入当前窗口；不会提供无身份的全局读取。

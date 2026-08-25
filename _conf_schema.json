@@ -892,7 +892,7 @@
       },
       "accept_external_records": {
         "description": "接受外部写入",
-        "hint": "关闭后只保留本插件自动捕获和管理命令写入。",
+        "hint": "控制 record_event 与 record_external_memory 等桥接写入。关闭后只保留本插件自动捕获和管理命令写入。",
         "type": "bool",
         "default": true
       },

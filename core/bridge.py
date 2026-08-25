@@ -927,6 +927,66 @@ class MemoryCompanionBridge:
             occurred_at=occurred_at,
         )
 
+    async def record_external_memory(
+        self,
+        *,
+        user_id: str = "",
+        content: str = "",
+        summary: str = "",
+        payload: dict[str, Any] | None = None,
+        memory_type: str = "external_memory",
+        source_plugin: str = "external",
+        occurred_at: str = "",
+        idempotency_key: str = "",
+        memory_id: str = "",
+        importance: float = 0.62,
+        confidence: float = 0.82,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        long_term: bool = True,
+    ) -> dict[str, Any]:
+        """Write one user-scoped long-term memory from an external source.
+
+        ``user_id`` is intentionally the only required identity field.  The
+        memory service fixes the record to that user's private scope, so an
+        external plugin cannot accidentally write a group/public memory by
+        passing arbitrary session fields.
+        """
+        writer = getattr(self._plugin, "record_external_memory", None)
+        if not callable(writer):
+            return {
+                "ok": False,
+                "state": "unsupported",
+                "memory_id": "",
+                "deduplicated": False,
+                "error_code": "record_external_memory_unavailable",
+            }
+        result = await writer(
+            user_id=user_id,
+            content=content,
+            summary=summary,
+            payload=payload,
+            memory_type=memory_type,
+            source_plugin=source_plugin,
+            occurred_at=occurred_at,
+            idempotency_key=idempotency_key,
+            memory_id=memory_id,
+            importance=importance,
+            confidence=confidence,
+            tags=tags,
+            metadata=metadata,
+            long_term=long_term,
+        )
+        if isinstance(result, dict):
+            return dict(result)
+        return {
+            "ok": bool(result),
+            "state": "stored" if result else "degraded",
+            "memory_id": clean_text(result, 120),
+            "deduplicated": False,
+            "error_code": None if result else "invalid_result",
+        }
+
     async def record_bot_action(self, *, content: str, **kwargs: Any) -> str:
         kwargs.setdefault("memory_type", "self_action")
         kwargs.setdefault("visibility", "bot_self")
@@ -2019,6 +2079,7 @@ class MemoryCompanionBridge:
             "methods",
             [
                 "record_event",
+                "record_external_memory",
                 "record_visible_turn",
                 "register_private_companion",
                 "register_bot_personal_producer",

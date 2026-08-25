@@ -1677,6 +1677,156 @@ class MemoryCompanionService:
             )
         return memory_id
 
+    async def record_external_memory(
+        self,
+        *,
+        user_id: str = "",
+        content: str = "",
+        summary: str = "",
+        payload: Mapping[str, Any] | None = None,
+        memory_type: str = "external_memory",
+        source_plugin: str = "external",
+        occurred_at: str = "",
+        idempotency_key: str = "",
+        memory_id: str = "",
+        importance: float = 0.62,
+        confidence: float = 0.82,
+        tags: list[str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        long_term: bool = True,
+    ) -> dict[str, Any]:
+        """Store a user-scoped memory supplied by another plugin or app.
+
+        This is deliberately narrower than ``record_external_event``: callers
+        do not choose a group/session scope, and the record is always attached
+        to the supplied user so it can be recalled from that user's private
+        conversations.  High-frequency integrations can pass ``long_term``
+        false until they have produced a useful summary.
+        """
+        result = {
+            "ok": False,
+            "state": "rejected",
+            "memory_id": "",
+            "deduplicated": False,
+            "long_term": bool(long_term),
+            "scope": "private",
+            "visibility": "private_pair",
+            "error_code": None,
+        }
+        if not self.config.bool("private_companion_bridge.accept_external_records", True):
+            return {**result, "error_code": "external_records_disabled"}
+
+        normalized_user_id = clean_text(user_id, 160)
+        if not normalized_user_id:
+            return {**result, "error_code": "user_id_required"}
+
+        normalized_source = clean_text(source_plugin, 100) or "external"
+        normalized_type = clean_text(memory_type, 80) or "external_memory"
+        normalized_content = clean_text(content or summary, 4000)
+        if payload is not None and not isinstance(payload, Mapping):
+            return {**result, "error_code": "payload_invalid"}
+        if metadata is not None and not isinstance(metadata, Mapping):
+            return {**result, "error_code": "metadata_invalid"}
+        try:
+            supplied_payload = dict(payload) if isinstance(payload, Mapping) else {}
+            supplied_metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        except (TypeError, ValueError):
+            return {**result, "error_code": "metadata_invalid"}
+        if not normalized_content and supplied_payload:
+            # A summary is still required for durable recall; accepting the
+            # common aliases makes small integrations less verbose without
+            # turning arbitrary telemetry into a long-term memory sentence.
+            for key in ("summary", "content", "text", "label"):
+                candidate = clean_text(supplied_payload.get(key), 4000)
+                if candidate:
+                    normalized_content = candidate
+                    break
+        if not normalized_content:
+            return {**result, "error_code": "content_required"}
+
+        try:
+            safe_metadata = sanitize_bot_personal_value(supplied_metadata, path="metadata")
+            safe_payload = sanitize_bot_personal_value(supplied_payload, path="payload") if supplied_payload else {}
+        except BotPersonalValidationError as exc:
+            return {**result, "error_code": clean_text(exc.error_code, 80) or "metadata_invalid"}
+        if not isinstance(safe_metadata, dict) or not isinstance(safe_payload, dict):
+            return {**result, "error_code": "metadata_invalid"}
+
+        normalized_key = clean_text(idempotency_key, 180)
+        normalized_occurred_at = clean_text(occurred_at, 80)
+        stable_memory_id = clean_text(memory_id, 120)
+        if not stable_memory_id:
+            stable_memory_id = self.stable_id(
+                "external_memory",
+                normalized_source,
+                normalized_user_id,
+                normalized_key or normalized_content,
+                normalized_occurred_at,
+            )
+        existing = None
+        getter = getattr(self.store, "get_memory", None)
+        if callable(getter):
+            try:
+                existing = await getter(stable_memory_id)
+            except Exception:
+                existing = None
+
+        safe_tags: list[str] = []
+        for tag in tags or []:
+            normalized_tag = clean_text(tag, 60)
+            if normalized_tag and normalized_tag not in safe_tags:
+                safe_tags.append(normalized_tag)
+        if not safe_tags:
+            safe_tags = ["external", normalized_type]
+        if bool(long_term) and "long_term" not in safe_tags:
+            safe_tags.append("long_term")
+
+        safe_metadata.update({
+            "external_memory": True,
+            "source_plugin": normalized_source,
+            "idempotency_key": normalized_key,
+            "long_term": bool(long_term),
+            "memory_type": normalized_type,
+            "owner_user_id": normalized_user_id,
+        })
+        if safe_payload:
+            safe_metadata.setdefault("structured_data", safe_payload)
+
+        record = self.classifier.external_record(
+            content=normalized_content,
+            memory_type=normalized_type,
+            subject=EntityRef(kind="user", id=normalized_user_id, role="external_memory_owner"),
+            object=EntityRef.bot_self(),
+            # Keep this independent of the source platform so a memory
+            # reported by an app can be recalled in QQ, web, or phone chats.
+            scope="private",
+            session_id=f"external:{normalized_source}:{normalized_user_id}",
+            platform="",
+            visibility="private_pair",
+            sayability="direct",
+            reality_level="external_observation",
+            lifecycle="stable_memory" if bool(long_term) else "raw_event",
+            confidence=confidence,
+            importance=importance,
+            review_status="auto" if bool(long_term) else "pending",
+            tags=safe_tags,
+            metadata=safe_metadata,
+            source_plugin=normalized_source,
+            occurred_at=normalized_occurred_at,
+        )
+        record.id = stable_memory_id
+        self.importance.calibrate(record, source="external_memory")
+        stored_id = await self.store.insert_memory(record)
+        self._schedule_memory_embedding(stored_id, record)
+        deduplicated = bool(existing is not None or stored_id != stable_memory_id)
+        return {
+            **result,
+            "ok": True,
+            "state": "deduplicated" if deduplicated else "stored",
+            "memory_id": stored_id,
+            "deduplicated": deduplicated,
+        }
+
     async def record_bot_personal_archive(self, envelope: BotPersonalArchiveDTO | dict[str, Any]) -> dict[str, Any]:
         """Persist one Bot Personal envelope in its isolated memory domain."""
         result = {
