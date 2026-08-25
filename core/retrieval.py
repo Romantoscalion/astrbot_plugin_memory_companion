@@ -2595,7 +2595,11 @@ class RetrievalEngine:
         elif temporal_aggregate:
             min_hits = min(2, max(1, len(terms)))
         elif contextual_recall:
-            min_hits = 1 if len(terms) <= 3 else 2
+            # Contextual follow-ups often contain mostly scaffolding words
+            # ("之前", "那个", "为什么"). One concrete overlap is enough to
+            # keep a candidate alive; ranking and ACL/lifecycle checks still
+            # decide whether it is actually returned.
+            min_hits = 1
         elif exact_phrases:
             min_hits = min(3, max(2, len(exact_phrases[0]) // 3))
         elif len(terms) >= 4:

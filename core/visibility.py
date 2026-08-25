@@ -53,21 +53,27 @@ class VisibilityPolicy:
             owner_ok, owner_reason = self._bot_owner_visible(memory, ctx)
             if not owner_ok:
                 return False, owner_reason
+            # A session id is the strongest ownership signal.  Imported rows
+            # may carry a legacy platform prefix (usually ``default``), so
+            # do not let that placeholder hide an otherwise identical window.
+            if memory.session_id and memory.session_id == ctx.session_id:
+                return True, "same_private_session"
             memory_platform = _clean_id(memory.platform).lower()
             current_platform = _clean_id(ctx.platform).lower()
-            if memory_platform == "unknown":
+            placeholder_platforms = {"", "unknown", "default"}
+            if memory_platform in placeholder_platforms:
                 memory_platform = ""
-            if current_platform == "unknown":
+            if current_platform in placeholder_platforms:
                 current_platform = ""
             if memory_platform and current_platform and memory_platform != current_platform:
                 return False, "other_platform"
-            if memory.session_id and memory.session_id == ctx.session_id:
-                return True, "same_private_session"
             if ctx.scope != "private":
                 return False, "private_pair_not_current_private"
             ids = {memory.subject.id, memory.object.id}
             if ctx.user_id and ctx.user_id in ids:
-                return True, "same_private_user"
+                if memory_platform and current_platform:
+                    return True, "same_private_user"
+                return True, "same_private_user_legacy_platform"
             if ctx.user_id and session_target_id(memory.session_id, "private") == ctx.user_id:
                 return True, "same_private_session_target"
             return False, "other_private_pair"

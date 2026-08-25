@@ -274,6 +274,22 @@ class PrivateToGroupAclRecallTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("番茄鸡蛋面", other_bot)
         self.assertNotIn("番茄鸡蛋面", other_platform)
 
+    async def test_legacy_default_platform_private_memory_is_recalled_for_same_user(self) -> None:
+        service = self.make_service()
+        memory = self.private_memory("迁移摘要：中午吃过番茄鸡蛋面。")
+        memory.platform = "default"
+        memory.session_id = "default:FriendMessage:u1"
+        await service.store.insert_memory(memory)
+        await self.allow_private_to_group(service)
+
+        injection = await service._compose_memory_injection(
+            self.group_context(),
+            max_chars=3200,
+            write_log=False,
+        )
+
+        self.assertIn("番茄鸡蛋面", injection)
+
     async def test_seamless_acl_use_is_limited_to_private_memory_owner(self) -> None:
         service = self.make_service()
         await service.store.insert_memory(self.private_memory())

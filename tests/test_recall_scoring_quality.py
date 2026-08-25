@@ -130,6 +130,23 @@ class ImportanceGatingTests(unittest.TestCase):
         high_score, _ = self.engine._score(high, self.terms, self.ctx, profile, {})
         self.assertAlmostEqual(0.55 * 0.7, high_score - low_score)
 
+    def test_contextual_followup_survives_single_term_overlap(self) -> None:
+        memory = _memory("context", "之前聊过蓝风铃的养护")
+        profile = {
+            **_profile(min_hits=2),
+            "contextual_recall": True,
+            "query_text": "你再想想之前一直提什么蓝风铃花语原因",
+        }
+        score, reason = self.engine._score(
+            memory,
+            ["蓝风铃", "花语", "原因", "之前"],
+            self.ctx,
+            profile,
+            {},
+        )
+        self.assertGreater(score, 0.0)
+        self.assertNotIn("keyword_hit_too_weak", reason)
+
 
 class RouteBonusInScoreTests(unittest.TestCase):
     def test_multi_route_bonus_adds_to_score_and_reason(self) -> None:
