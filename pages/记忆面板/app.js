@@ -456,14 +456,15 @@ async function apiPost(path, payload = {}) {
 
 async function apiRequest(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
-  const bridge = await waitForBridge();
+  const httpFallbackAvailable = canUsePageHttpFallback();
+  const bridge = getBridge() || (httpFallbackAvailable ? null : await waitForBridge());
   let data;
   if (bridge && typeof bridge.apiGet === "function" && typeof bridge.apiPost === "function") {
     data = await bridgeRequest(bridge, path, method, options.body);
-  } else if (new URLSearchParams(window.location.search).get("debug_http") === "1") {
+  } else if (httpFallbackAvailable) {
     data = await httpRequest(path, method, options.body);
   } else {
-    throw new Error("未检测到 AstrBot 官方插件 Page 桥接，请从 AstrBot 后台的插件拓展页打开");
+    throw new Error("未检测到 AstrBot 页面桥接，且当前页面不能使用同源 Web API");
   }
   if (typeof data === "string") {
     try {
@@ -474,6 +475,11 @@ async function apiRequest(path, options = {}) {
   }
   if (!data || data.success === false) throw new Error(data?.error || "请求失败");
   return data.data ?? data;
+}
+
+function canUsePageHttpFallback() {
+  // AstrBot's Web UI can open plugin pages directly on the authenticated dashboard origin.
+  return ["http:", "https:"].includes(window.location.protocol) && typeof window.fetch === "function";
 }
 
 async function waitForBridge() {
@@ -513,6 +519,7 @@ async function httpRequest(path, method, body) {
   const response = await fetch(`${API}${path}`, {
     method,
     cache: "no-store",
+    credentials: "same-origin",
     headers: body ? { "Content-Type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -4774,9 +4781,14 @@ async function saveRetrievalConfig(form) {
     embedding_backfill_enabled: data.get("embedding_backfill_enabled") === "on",
     embedding_backfill_batch_size: Math.max(1, Math.round(num("embedding_backfill_batch_size", 50))),
   };
-  await apiPost("/retrieval/config/update", payload);
+  const result = await apiPost("/retrieval/config/update", payload);
+  if (!result?.retrieval) throw new Error("检索配置未返回确认结果");
   showToast("检索配置已保存");
-  await loadArchive();
+  try {
+    await loadArchive();
+  } catch (error) {
+    showToast("检索配置已保存，但刷新页面数据失败", "error");
+  }
 }
 
 async function showMemory(id) {

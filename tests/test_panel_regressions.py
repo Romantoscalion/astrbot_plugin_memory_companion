@@ -50,6 +50,26 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertNotIn('apiPost("/memory/visibility"', block)
         self.assertNotIn('apiPost("/memory/lifecycle"', block)
 
+    def test_panel_uses_authenticated_same_origin_http_when_page_bridge_is_unavailable(self) -> None:
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function canUsePageHttpFallback", script)
+        self.assertIn("const httpFallbackAvailable = canUsePageHttpFallback();", script)
+        self.assertIn("getBridge() || (httpFallbackAvailable ? null : await waitForBridge())", script)
+        self.assertIn("} else if (httpFallbackAvailable) {", script)
+        self.assertIn('credentials: "same-origin"', script)
+        self.assertNotIn('get("debug_http")', script)
+
+    def test_retrieval_config_save_requires_backend_confirmation(self) -> None:
+        script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
+        start = script.index("async function saveRetrievalConfig")
+        end = script.index("async function showMemory", start)
+        block = script[start:end]
+
+        self.assertIn('const result = await apiPost("/retrieval/config/update", payload);', block)
+        self.assertIn('if (!result?.retrieval) throw new Error("检索配置未返回确认结果");', block)
+        self.assertIn('showToast("检索配置已保存")', block)
+
     def test_non_qq_private_sessions_are_not_labeled_as_qq_users(self) -> None:
         script = (ROOT / "pages" / "记忆面板" / "app.js").read_text(encoding="utf-8")
 
@@ -155,7 +175,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn("height:calc(100% - 16px)", image_block.group(1))
         self.assertIn("object-fit:contain", image_block.group(1))
         self.assertIn("height:clamp(480px, 62vh, 820px)", drawer_block.group(1))
-        self.assertIn("app.css?v=1.10.4-ui-v1", page)
+        self.assertIn("app.css?v=1.10.5-ui-v1", page)
 
     def test_microscope_has_explicit_context_and_non_overlapping_results(self) -> None:
         page = (ROOT / "pages" / "记忆面板" / "index.html").read_text(encoding="utf-8")
@@ -288,7 +308,7 @@ class PanelRegressionTests(unittest.TestCase):
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-workspace .object-rail', styles)
         self.assertIn(':root[data-overview-layout="standard"] .film-app.is-personal-memory .schedule-film', styles)
         self.assertIn("@media(max-width:760px)", styles)
-        self.assertIn("app.js?v=1.10.4-ui-v1", page)
+        self.assertIn("app.js?v=1.10.5-ui-v1", page)
 
         ids = re.findall(r'\bid="([^"]+)"', page)
         self.assertEqual(len(ids), len(set(ids)), "记忆面板不能包含重复 HTML id")
