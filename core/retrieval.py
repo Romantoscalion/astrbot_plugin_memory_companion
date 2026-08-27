@@ -58,6 +58,9 @@ class RetrievalEngine:
         private_topology_enabled: bool = True,
         group_topology_enabled: bool = True,
         usage_recorder: Any | None = None,
+        relax_keyword_min_hits: bool = False,
+        proactive_message_score_penalty: float = 1.0,
+        dedupe_content_ratio: float = 0.0,
     ):
         self.store = store
         self.policy = policy
@@ -88,6 +91,16 @@ class RetrievalEngine:
         self.private_topology_enabled = bool(private_topology_enabled)
         self.group_topology_enabled = bool(group_topology_enabled)
         self.usage_recorder = usage_recorder if callable(usage_recorder) else None
+        # relax_keyword_min_hits=False 时词法复核 min_hits 与历史版本完全一致；
+        # 开启后把 temporal_aggregate/exact_phrases/长词 分支的 min_hits 降到 1，
+        # 让语义相关但关键词不重叠的候选更容易通过词法复核。
+        self.relax_keyword_min_hits = bool(relax_keyword_min_hits)
+        # proactive_message_score_penalty：proactive_message（主动消息原文）类记忆的评分乘数。
+        # 1.0=不降权（历史行为）；<1.0 降权；0=完全排除。
+        self.proactive_message_score_penalty = max(0.0, min(1.0, float(proactive_message_score_penalty or 1.0)))
+        # dedupe_content_ratio：检索结果内容级去重阈值（规范化文本 difflib ratio）。
+        # 0.0=关闭（历史行为）；>0 时同主题高相似候选只保留评分最高的一条。
+        self.dedupe_content_ratio = max(0.0, min(1.0, float(dedupe_content_ratio or 0.0)))
         self._rank_path_info: dict[str, Any] = {}
         self.last_path_info: dict[str, Any] = {
             "mode": self.retrieval_mode,
@@ -242,6 +255,10 @@ class RetrievalEngine:
     ) -> tuple[list[SearchResult], list[dict[str, str]]]:
         results, blocked = await self._rank_candidates(query, ctx, time_intent=time_intent)
         results = await self._maybe_rerank_results(query, results, max(1, int(top_k or 1)))
+        # relax：内容级去重（规范化文本 difflib ratio >= 阈值时只留评分最高者）。
+        # 默认 0.0 关闭，行为与历史版本完全一致；MMR 多样化仍然保留。
+        if self.dedupe_content_ratio > 0:
+            results = self._dedupe_by_content(results, self.dedupe_content_ratio)
         results = await self._mmr_diversify_async(results, max(1, int(top_k or 1)))
         selected = results[: max(1, int(top_k or 1))]
         selected, mutable_blocked = self._collapse_mutable_fact_results(query, ctx, selected)
@@ -681,6 +698,44 @@ class RetrievalEngine:
         selected_ids = {id(item) for item in selected}
         tail = [item for item in ranked if id(item) not in selected_ids]
         return [*selected, *tail]
+
+    def _dedupe_by_content(self, ranked: list[SearchResult], ratio_threshold: float) -> list[SearchResult]:
+        """Collapse near-identical memory contents, keeping the highest-scoring one.
+
+        Compares normalized (whitespace-stripped) content with difflib ratio.
+        Enabled only when dedupe_content_ratio > 0 (default off, historical behavior).
+        """
+        if len(ranked) < 2 or ratio_threshold <= 0:
+            return ranked
+        import difflib
+
+        def norm(text: str) -> str:
+            return re.sub(r"\s+", "", text or "")
+
+        kept: list[SearchResult] = []
+        for item in ranked:
+            content = norm(item.memory.content)
+            if not content:
+                kept.append(item)
+                continue
+            duplicate_of = None
+            for other in kept:
+                other_content = norm(other.memory.content)
+                if not other_content:
+                    continue
+                try:
+                    ratio = difflib.SequenceMatcher(None, content, other_content).ratio()
+                except Exception:
+                    ratio = 0.0
+                if ratio >= ratio_threshold:
+                    duplicate_of = other
+                    break
+            if duplicate_of is None or (item.score or 0.0) > (duplicate_of.score or 0.0):
+                if duplicate_of is not None:
+                    kept.remove(duplicate_of)
+                kept.append(item)
+            # else: drop this item (duplicate with lower/equal score)
+        return kept
 
     def _strong_lexical_match(self, query: str, memory: MemoryRecord) -> bool:
         terms = self._terms(query)
@@ -2752,6 +2807,9 @@ class RetrievalEngine:
             min_hits = min(3, max(2, len(exact_phrases[0]) // 3))
         elif len(terms) >= 4:
             min_hits = 2
+        # relax：把剩余分支的 min_hits 统一降到 1（默认关闭时行为与历史版本一致）。
+        if self.relax_keyword_min_hits:
+            min_hits = min(min_hits, 1)
         return {
             "query_text": compact,
             "exact_phrases": exact_phrases,
@@ -3119,6 +3177,9 @@ class RetrievalEngine:
             score = scope_bonus + memory.importance * 0.8 + age_bonus + vector_bonus + persona_bonus + dynamics_bonus + route_bonus + rrf_bonus
         lifecycle = evaluate_memory_lifecycle(memory, ctx)
         score = apply_lifecycle_score(score, lifecycle)
+        # relax：proactive_message（主动消息原文）类记忆评分降权（默认 1.0 不降权，行为与历史版本一致）。
+        if self.proactive_message_score_penalty < 1.0 and clean_text(memory.memory_type, 120).lower() == "proactive_message":
+            score = score * self.proactive_message_score_penalty
         return score, (
             f"hits={term_hits};exact={int(exact_hit)};profile={int(profile_hit)};bm25={bm25:.2f};"
             f"vector={vector_score:.3f};importance={memory.importance:.2f};"

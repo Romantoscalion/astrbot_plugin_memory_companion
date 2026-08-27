@@ -12,6 +12,11 @@ class ImportanceEvaluator:
 
     version = "persona_dimensions_v5"
 
+    def __init__(self, mention_policy_relax: bool = False) -> None:
+        # mention_policy_relax=False 时行为与历史版本完全一致；
+        # 开启后放宽写入侧 mention_policy 的 tone_only 降级（见 _mention_policy）。
+        self.mention_policy_relax = mention_policy_relax
+
     def calibrate(self, record: MemoryRecord, *, source: str = "") -> MemoryRecord:
         base = self._base_importance(record.importance)
         dimensions = self.persona_dimensions(record)
@@ -314,8 +319,7 @@ class ImportanceEvaluator:
         rounded["memory_reason"] = self._memory_reason(active, rounded)
         return rounded
 
-    @staticmethod
-    def _mention_policy(record: MemoryRecord, weights: dict[str, Any]) -> tuple[str, float]:
+    def _mention_policy(self, record: MemoryRecord, weights: dict[str, Any]) -> tuple[str, float]:
         memory_type = clean_text(record.memory_type, 120).lower()
         visibility = clean_text(record.visibility, 80).lower()
         reality = clean_text(record.reality_level, 80).lower()
@@ -343,8 +347,14 @@ class ImportanceEvaluator:
         if visibility == "bot_self" or reality in {"bot_action", "persona_life", "fictional_content"}:
             if max(open_loop, promise, creative) >= 0.58:
                 return "soft_echo", 0.56
+            # relax：Bot 自我时间线背景记忆从 tone_only 提为 soft_echo，让注入侧有内容可用
+            if self.mention_policy_relax:
+                return "soft_echo", 0.52
             return "tone_only", 0.34
         if max(scar, emotional_debt, emotional) >= 0.66:
+            # relax：情绪重的记忆从 tone_only 提为 soft_echo（conversation_summary 主来源）
+            if self.mention_policy_relax:
+                return "soft_echo", 0.50
             return "tone_only", 0.36
         vulnerability = weight("vulnerability_weight")
         intimacy = weight("intimacy_weight")
