@@ -98,6 +98,37 @@ class UiBackendContractTests(unittest.TestCase):
         self.assertIn('const response = await apiGet("/memory?id=" + encodeURIComponent(memoryId));', self.frontend_source)
         self.assertIn('const memory = response && response.memory ? response.memory : response;', self.frontend_source)
 
+    def test_memory_category_filters_expand_to_persisted_types(self) -> None:
+        filters = literal(assignment(self.tree, "MEMORY_TYPE_FILTERS"))
+        self.assertIn("user_profile", filters["profile"])
+        self.assertIn("user_preference", filters["preference"])
+        self.assertIn("relationship_phase_summary", filters["relationship"])
+        self.assertIn("important_event", filters["event"])
+        self.assertIn("schedule_fragment", filters["schedule"])
+        self.assertIn("memory_types=memory_types", self.backend_source)
+        self.assertIn('user_profile: "画像"', self.frontend_source)
+
+    def test_memory_category_filter_uses_store_in_query(self) -> None:
+        store_source = (ROOT / "core" / "store.py").read_text(encoding="utf-8")
+        self.assertIn("memory_types=memory_types", self.backend_source)
+        self.assertIn("memory_types: list[str] | tuple[str, ...] | None = None", store_source)
+        self.assertIn("memory_type IN ({marks})", store_source)
+
+    def test_lifecycle_filters_expand_to_persisted_states(self) -> None:
+        filters = literal(assignment(self.tree, "MEMORY_LIFECYCLE_FILTERS"))
+        self.assertIn("stable_memory", filters["stable"])
+        self.assertIn("current_window", filters["active"])
+        self.assertIn("planned_projection", filters["active"])
+        self.assertIn("recent", filters["fading"])
+        self.assertIn("lifecycle_values=lifecycle_values", self.backend_source)
+
+    def test_scope_and_visibility_filters_use_persisted_values(self) -> None:
+        backend = self.backend_source
+        self.assertIn('"public": ("public", "group_public")', backend)
+        self.assertIn('"private": ("private", "private_pair")', backend)
+        self.assertIn('scope="" if scope in {"profile", "external"} else scope', backend)
+        self.assertIn('source_plugin_exclude=PLUGIN_NAME if scope == "external" else ""', backend)
+
     def test_every_backend_only_route_has_an_explicit_exposure_reason(self) -> None:
         routes = self.route_paths()
         frontend = self.frontend_paths()

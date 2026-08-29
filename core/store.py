@@ -8949,6 +8949,10 @@ class MemoryStore:
         session_id: str = "",
         group_id: str = "",
         entity_id: str = "",
+        memory_types: list[str] | tuple[str, ...] | None = None,
+        lifecycle_values: list[str] | tuple[str, ...] | None = None,
+        visibility_values: list[str] | tuple[str, ...] | None = None,
+        source_plugin_exclude: str = "",
     ) -> list[MemoryRecord]:
         return await self._run_recoverable_database_operation(
             self._list_memories_sync,
@@ -8964,6 +8968,10 @@ class MemoryStore:
             session_id,
             group_id,
             entity_id,
+            memory_types,
+            lifecycle_values,
+            visibility_values,
+            source_plugin_exclude,
         )
 
     def _list_memories_sync(
@@ -8980,6 +8988,10 @@ class MemoryStore:
         session_id: str,
         group_id: str,
         entity_id: str,
+        memory_types: list[str] | tuple[str, ...] | None,
+        lifecycle_values: list[str] | tuple[str, ...] | None,
+        visibility_values: list[str] | tuple[str, ...] | None,
+        source_plugin_exclude: str,
     ) -> list[MemoryRecord]:
         params: list[Any] = []
         where = "1=1"
@@ -8993,19 +9005,37 @@ class MemoryStore:
                 " OR session_id LIKE ? ESCAPE '\\' OR group_id LIKE ? ESCAPE '\\')"
             )
             params.extend([like] * 9)
-        if memory_type:
+        requested_types = [clean_text(value, 80) for value in (memory_types or ()) if clean_text(value, 80)]
+        if requested_types:
+            marks = ",".join("?" for _ in requested_types)
+            where += f" AND memory_type IN ({marks})"
+            params.extend(requested_types)
+        elif memory_type:
             where += " AND memory_type=?"
             params.append(clean_text(memory_type, 80))
         if scope:
             where += " AND scope=?"
             params.append(clean_text(scope, 40))
-        if visibility:
+        requested_visibilities = [clean_text(value, 40) for value in (visibility_values or ()) if clean_text(value, 40)]
+        if requested_visibilities:
+            marks = ",".join("?" for _ in requested_visibilities)
+            where += f" AND visibility IN ({marks})"
+            params.extend(requested_visibilities)
+        elif visibility:
             where += " AND visibility=?"
             params.append(clean_text(visibility, 40))
+        if source_plugin_exclude:
+            where += " AND source_plugin != ?"
+            params.append(clean_text(source_plugin_exclude, 120))
         if review_status:
             where += " AND review_status=?"
             params.append(clean_text(review_status, 40))
-        if lifecycle:
+        requested_lifecycles = [clean_text(value, 40) for value in (lifecycle_values or ()) if clean_text(value, 40)]
+        if requested_lifecycles:
+            marks = ",".join("?" for _ in requested_lifecycles)
+            where += f" AND lifecycle IN ({marks})"
+            params.extend(requested_lifecycles)
+        elif lifecycle:
             where += " AND lifecycle=?"
             params.append(clean_text(lifecycle, 40))
         if session_id:

@@ -544,18 +544,36 @@ const SCOPE_META = {
 
 const TYPE_LABEL = {
   profile: "画像",
+  user_profile: "画像",
+  user_habit: "习惯",
   preference: "偏好",
+  user_preference: "偏好",
   relationship: "关系",
+  relationship_claim: "关系",
+  relationship_phase_summary: "关系阶段",
   fact: "事实",
+  stable_fact: "稳定事实",
+  user_fact: "用户事实",
+  manual_memory: "手动记忆",
+  explicit_memory: "明确记忆",
   event: "事件",
+  conversation_event: "会话事件",
+  important_event: "重要事件",
+  timeline_event: "时间线事件",
   state: "稳定状态",
+  current_state: "当前状态",
+  stable_state: "稳定状态",
   plan: "计划",
   promise: "承诺",
   emotion: "情绪",
   schedule: "日程",
+  schedule_fragment: "日程片段",
+  daily_digest: "每日摘要",
   action: "行为",
   image_action: "图像行为",
   thought: "想法",
+  companion_note: "陪伴想法",
+  internal_note: "内部想法",
   summary: "摘要",
   note: "备注",
   rule: "规则",
@@ -1117,7 +1135,11 @@ defineView("inspect", {
     const result = await apiGet("/memories?" + params.join("&"));
     let memories = Array.isArray(result.memories) ? result.memories : [];
     if (filters.scope === "profile") {
-      memories = memories.filter((m) => ["profile", "preference", "relationship"].includes(compact(m.memory_type)));
+      memories = memories.filter((m) => [
+        "profile", "user_profile", "user_habit",
+        "preference", "user_preference",
+        "relationship", "relationship_claim", "relationship_phase_summary",
+      ].includes(compact(m.memory_type)));
     }
     return { memories, filters };
   },

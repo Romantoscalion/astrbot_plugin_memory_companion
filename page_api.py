@@ -128,6 +128,38 @@ UI_VIEW_ENDPOINTS = {
         "/acl/delete",
     ),
 }
+
+# The panel uses stable, user-facing categories while the store keeps the
+# more specific memory types written by each producer. Keep this mapping at
+# the API boundary so filtering a category does not accidentally query a
+# literal type that is never persisted.
+MEMORY_TYPE_FILTERS = {
+    "profile": ("profile", "user_profile", "user_habit"),
+    "preference": ("preference", "user_preference"),
+    "relationship": ("relationship", "relationship_claim", "relationship_phase_summary"),
+    "fact": ("fact", "stable_fact", "user_fact", "manual_memory", "explicit_memory"),
+    "event": ("event", "conversation_event", "important_event", "timeline_event"),
+    "state": ("state", "current_state", "stable_state", "stable_fact"),
+    "promise": ("promise", "promise_memory"),
+    "schedule": ("schedule", "schedule_fragment", "daily_digest"),
+    "thought": ("thought", "companion_note", "internal_note"),
+}
+
+MEMORY_LIFECYCLE_FILTERS = {
+    "active": ("active", "current_window", "recent", "open_loop", "planned_projection", "stable_memory"),
+    "stable": ("stable", "stable_memory"),
+    "fading": ("fading", "recent"),
+    "archived": ("archived",),
+    "expired": ("expired",),
+}
+
+MEMORY_VISIBILITY_FILTERS = {
+    "public": ("public", "group_public"),
+    "private": ("private", "private_pair"),
+    "group_shared": ("group_shared", "group_public"),
+    "bot_self": ("bot_self",),
+    "restricted": ("restricted", "internal"),
+}
 UI_ENDPOINT_EXPOSURE = {
     "/ui/capabilities": {"exposure": "internal", "reason": "前端启动时用于自校验，不作为业务按钮"},
     "/memory/visibility": {"exposure": "compat", "reason": "由统一 memory/update 表单覆盖"},
@@ -904,15 +936,25 @@ class PluginPageApi:
         scope = clean_text(request.args.get("scope", ""), 40)
         visibility = clean_text(request.args.get("visibility", ""), 40)
         lifecycle = clean_text(request.args.get("lifecycle", ""), 40)
+        lifecycle_values = MEMORY_LIFECYCLE_FILTERS.get(lifecycle)
+        visibility_values = MEMORY_VISIBILITY_FILTERS.get(visibility)
+        requested_type = clean_text(request.args.get("memory_type", ""), 80)
+        memory_types = MEMORY_TYPE_FILTERS.get(requested_type)
+        if scope == "profile" and not memory_types:
+            memory_types = MEMORY_TYPE_FILTERS["profile"] + MEMORY_TYPE_FILTERS["preference"] + MEMORY_TYPE_FILTERS["relationship"]
         records = await self.plugin.service.store.list_memories(
             limit=limit,
             include_pending=False,
             query=query,
-            memory_type=clean_text(request.args.get("memory_type", ""), 80),
-            scope=scope,
-            visibility=visibility,
+            memory_type="" if memory_types else requested_type,
+            memory_types=memory_types,
+            scope="" if scope in {"profile", "external"} else scope,
+            visibility="" if visibility_values else visibility,
+            visibility_values=visibility_values,
+            source_plugin_exclude=PLUGIN_NAME if scope == "external" else "",
             review_status="",
-            lifecycle=lifecycle,
+            lifecycle="" if lifecycle_values else lifecycle,
+            lifecycle_values=lifecycle_values,
             session_id=clean_text(request.args.get("session_id", ""), 200),
             group_id=clean_text(request.args.get("group_id", ""), 120),
             entity_id=clean_text(request.args.get("entity_id", ""), 120),
