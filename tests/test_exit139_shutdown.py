@@ -102,13 +102,16 @@ class StoreCloseBarrierTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_operation_rejected_after_closing(self) -> None:
         store, temp_dir = make_store()
         self.addCleanup(temp_dir.cleanup)
-        store._closing = True
-        with self.assertRaises(Exception):
-            await asyncio.to_thread(
-                store._guard_operation_sync,
-                lambda: None,
-            )
-        store._closing = False
+        try:
+            store._closing = True
+            with self.assertRaises(Exception):
+                await asyncio.to_thread(
+                    store._guard_operation_sync,
+                    lambda: None,
+                )
+        finally:
+            store._closing = False
+            store.close()
 
     async def test_recoverable_operation_under_barrier(self) -> None:
         """F2: _run_recoverable_database_operation 路径也被关闭屏障覆盖。"""
@@ -153,6 +156,7 @@ class CaptureAsyncRegistrationTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         self._service._closed = True
+        self._service.store.close()
         self._store.close()
 
     async def test_spawn_background_registers_and_cleans(self) -> None:
@@ -186,6 +190,7 @@ class AcloseSummaryWorkerTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         self._service._closed = True
+        self._service.store.close()
         self._store.close()
 
     async def test_aclose_waits_summary_workers(self) -> None:
@@ -209,6 +214,7 @@ class ShutdownEvidenceTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         self._service._closed = True
+        self._service.store.close()
         self._store.close()
 
     async def test_shutdown_evidence_shape(self) -> None:
