@@ -2519,6 +2519,11 @@ class RetrievalEngine:
             }
         ):
             return "self_timeline"
+        # conversation_summary 优先归 summary 槽：避免被 open_loop 权重判定
+        # 吸进 open_loop 槽（limit=1）导致 summary 槽空置。群聊总结已在
+        # _memory_is_open_loop 内排除该判定，私聊总结同样应优先归 summary 槽。
+        if memory_type == "conversation_summary" or "summary" in tags:
+            return "conversation_summary"
         if self._memory_is_open_loop(memory, metadata):
             return "open_loop"
         if (

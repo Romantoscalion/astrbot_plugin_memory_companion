@@ -106,7 +106,13 @@ def evaluate_memory_lifecycle(
 
     owner_bot_id = clean_text(_field(memory, "owner_bot_id", ""), 160)
     context_bot_id = clean_text(getattr(ctx, "bot_id", ""), 160)
-    if owner_bot_id and (not context_bot_id or owner_bot_id != context_bot_id):
+    # owner_bot_id 为 '' 或 'self' 时视为「无特定 bot owner」放行（对齐
+    # visibility._bot_owner_visible 对 'self' 的排除）。写入侧经 bridge
+    # 记录时 bot_id 可能缺失并回退为 'self'，此处避免这类记忆在检索时
+    # 因 owner_bot_mismatch 被永久剔除。
+    if owner_bot_id and owner_bot_id != "self" and (
+        not context_bot_id or owner_bot_id != context_bot_id
+    ):
         return LifecycleScore(False, "owner_bot_mismatch", 0.0, 0.0, 0.0)
     persona_id = clean_text(_field(memory, "persona_id", ""), 96)
     context_persona_id = clean_text(getattr(ctx, "persona_id", ""), 96)
