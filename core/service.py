@@ -279,13 +279,17 @@ class MemoryCompanionService:
         self.classifier = MemoryClassifier(
             capture_min_chars=self.config.int("memory_capture.capture_min_chars", 2)
         )
-        self.injection = InjectionComposer()
+        self.injection = InjectionComposer(
+            instruction_relax=self.config.bool("memory_injection.relax_instruction", False)
+        )
         self.summarizer = MemorySummarizer(
             max_input_chars=self.config.int("memory_summary.max_input_chars", 6000),
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),
             provider_timeout_seconds=self.config.int("memory_summary.provider_timeout_seconds", 180),
         )
-        self.importance = ImportanceEvaluator()
+        self.importance = ImportanceEvaluator(
+            mention_policy_relax=self.config.bool("memory_capture.relax_mention_policy", False)
+        )
         self._summary_locks: dict[str, asyncio.Lock] = {}
         self._summary_lock_ts: dict[str, float] = {}
         self._summary_workers: dict[str, asyncio.Task[Any]] = {}
@@ -3325,6 +3329,11 @@ class MemoryCompanionService:
             private_topology_enabled=self._scope_feature_enabled("private", "topology"),
             group_topology_enabled=self._scope_feature_enabled("group", "topology"),
             usage_recorder=self._record_token_usage,
+            relax_keyword_min_hits=self.config.bool("retrieval_advanced.relax_keyword_min_hits", False),
+            proactive_message_score_penalty=self.config.float(
+                "retrieval_advanced.proactive_message_score_penalty", 1.0
+            ),
+            dedupe_content_ratio=self.config.float("retrieval_advanced.dedupe_content_ratio", 0.0),
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -10189,6 +10198,10 @@ class MemoryCompanionService:
                 return "tone", "open_loop_tone_only"
             return "mention", "open_loop_or_emotional_debt"
         if decision.layer in {"recent_context", "current_correction", "low_information", "short_context_followup"}:
+            # relax：route_layer 命中的记忆从 tone 提为 candidate（给内容但标注条件候选），
+            # 默认关闭时行为与历史版本完全一致。
+            if self.config.bool("memory_injection.relax_route_layer_tone", False):
+                return "candidate", f"route_layer:{decision.layer}"
             return "tone", f"route_layer:{decision.layer}"
         if decision.layer == "current_state_chat":
             return "mention", "current_state_recent_context"

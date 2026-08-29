@@ -68,6 +68,12 @@
         "hint": "记录群成员归属等结构化关系。身份冒领类关系声明不会自动沉淀为稳定记忆。",
         "type": "bool",
         "default": true
+      },
+      "relax_mention_policy": {
+        "description": "放宽写入侧提及策略",
+        "hint": "默认关闭（行为与旧版一致）。开启后，写入新记忆时把「Bot 自我时间线」「情绪较重」两类记忆的 mention_policy 从 tone_only 提为 soft_echo，使注入侧能给出这些记忆的内容而非纯语气提示。只影响之后新写入的记忆；存量记忆需回填或依赖注入侧放宽参数。",
+        "type": "bool",
+        "default": false
       }
     }
   },
@@ -547,6 +553,24 @@
         "hint": "FTS 候选少于该数量时才执行多列 LIKE 回退；设为 0 可完全关闭宽泛 LIKE 回退。",
         "type": "int",
         "default": 80
+      },
+      "relax_keyword_min_hits": {
+        "description": "放宽词法复核门槛",
+        "hint": "默认关闭（行为与旧版一致）。开启后，语义候选的词法复核 min_hits 统一降到 1——语义相关但关键词不重叠的记忆更容易通过复核（配合调大向量合并数量效果明显），噪声由评分与注入条数兜底。",
+        "type": "bool",
+        "default": false
+      },
+      "proactive_message_score_penalty": {
+        "description": "主动消息记忆降权",
+        "hint": "proactive_message（主动消息原文）类记忆的评分乘数。1.0=不降权（默认，行为与旧版一致）；设为 0.3 表示评分乘 0.3、让位给有价值记忆；0=完全排除。该类记忆多为天气播报等低信息量原文，占用候选池。",
+        "type": "float",
+        "default": 1.0
+      },
+      "dedupe_content_ratio": {
+        "description": "内容级去重阈值",
+        "hint": "检索结果中规范化文本相似度达到该比例（difflib ratio，0-1）的候选只保留评分最高的一条，避免同一事实的多条措辞变体占用注入名额。0=关闭（默认，行为与旧版一致）；建议 0.75-0.85。",
+        "type": "float",
+        "default": 0.0
       }
     }
   },
@@ -608,6 +632,36 @@
         "hint": "单轮注入调试日志最多打印多少字符。调大可查看完整注入块，调小可避免日志过长。",
         "type": "int",
         "default": 12000
+      },
+      "relax_route_layer_tone": {
+        "description": "放宽上下文路由层记忆",
+        "hint": "默认关闭（行为与旧版一致）。开启后，检索被路由到「近上下文/当前纠正/低信息/短跟随」层的记忆从 tone（只给语气提示）提为 candidate（给内容但标注条件候选），日常闲聊轮也能看到记忆正文。",
+        "type": "bool",
+        "default": false
+      },
+      "relax_bot_self_tone": {
+        "description": "放宽 Bot 自我时间线记忆",
+        "hint": "默认关闭（行为与旧版一致）。开启后，Bot 自我时间线（self_timeline）背景记忆非显式回忆时从 tone 提为 candidate，让这类记忆的内容可被注入。",
+        "type": "bool",
+        "default": false
+      },
+      "relax_summary_tone": {
+        "description": "放宽近期对话总结记忆",
+        "hint": "默认关闭（行为与旧版一致）。开启后，非显式回忆的 conversation_summary/timeline_event 中较新的（天数 <= relax_summary_max_age_days）从 tone 提为 candidate，较旧的仍保持 tone。",
+        "type": "bool",
+        "default": false
+      },
+      "relax_summary_max_age_days": {
+        "description": "总结记忆放宽的最大天数",
+        "hint": "配合 relax_summary_tone 使用：created_at 距今不超过该天数的对话总结才放宽为 candidate。",
+        "type": "int",
+        "default": 3
+      },
+      "relax_instruction": {
+        "description": "放宽注入包使用指引",
+        "hint": "默认关闭（措辞与旧版一致）。开启后，<MemoryCompanion-Context> 的 <instruction> 改为允许模型直接自然地引用、呼应或转述注入的记忆条目，而不只是「自然相关时融入」。",
+        "type": "bool",
+        "default": false
       }
     }
   },
@@ -643,7 +697,7 @@
     "items": {
       "recent_events_for_followup": {
         "description": "追问补全事件数",
-        "hint": "处理\u201c还有的吧\u201d\u201c刚才那个\u201d等连续追问时，最多读取多少条最近群聊事件来补全检索词。",
+        "hint": "处理“还有的吧”“刚才那个”等连续追问时，最多读取多少条最近群聊事件来补全检索词。",
         "type": "int",
         "default": 12
       },
