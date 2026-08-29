@@ -113,6 +113,8 @@ class VisibilityPolicy:
                 return False, "ambiguous_bot_owner"
             return True, "no_specific_bot_owner"
         current_bot_id = _clean_id(ctx.bot_id)
+        if not current_bot_id:
+            return False, "owner_bot_context_missing"
         if current_bot_id and current_bot_id in specific_bot_ids:
             return True, "same_bot_owner"
         return False, "other_bot_owner"

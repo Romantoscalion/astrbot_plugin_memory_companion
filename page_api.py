@@ -64,6 +64,7 @@ UI_VIEW_ENDPOINTS = {
         "/memories",
         "/memory",
         "/memory/update",
+        "/memory/rebind-owner",
         "/memory/delete",
         "/portrait/profiles",
         "/portrait/profile",
@@ -178,6 +179,7 @@ class PluginPageApi:
             ("/memories", self.memories, ["GET"], "MemoryCompanion Page memories"),
             ("/memory", self.memory_detail, ["GET"], "MemoryCompanion Page memory detail"),
             ("/memory/update", self.memory_update, ["POST"], "MemoryCompanion Page memory update"),
+            ("/memory/rebind-owner", self.memory_rebind_owner, ["POST"], "MemoryCompanion Page memory owner rebind"),
             ("/memory/delete", self.memory_delete, ["POST"], "MemoryCompanion Page memory delete"),
             ("/memory/visibility", self.memory_visibility, ["POST"], "MemoryCompanion Page memory visibility"),
             ("/memory/lifecycle", self.memory_lifecycle, ["POST"], "MemoryCompanion Page memory lifecycle"),
@@ -982,6 +984,17 @@ class PluginPageApi:
         if not ok:
             return self._err("memory not found", 404)
         return self._ok({"updated": ok})
+
+    async def memory_rebind_owner(self):
+        payload = await self._json()
+        try:
+            result = await self.plugin.service.rebind_memory_owners(payload)
+            return self._ok({"result": result})
+        except ValueError as exc:
+            return self._err(str(exc), 400)
+        except Exception as exc:
+            logger.exception("记忆 Bot 归属修正失败")
+            return self._err(f"记忆 Bot 归属修正失败: {exc}", 500)
 
     async def memory_delete(self):
         payload = await self._json()

@@ -41,6 +41,10 @@ _ACL_UNSET = object()
 class MemoryStore:
     EMBEDDING_CANDIDATE_CACHE_MAX = 64
     SCHEMA_VERSION = "memory-atom-v2"
+    # Redaction is idempotent but scanning the whole history at every startup
+    # is needlessly expensive for large installations.  Bump this when the
+    # storage redaction rules change so existing data gets one fresh pass.
+    SENSITIVE_REDACTION_VERSION = "storage-redaction-v1"
 
     PROFILE_MEMORY_TYPES = frozenset({"user_profile", "user_preference", "user_habit"})
 
@@ -904,6 +908,7 @@ class MemoryStore:
             self._ensure_portrait_columns_sync()
             self._ensure_memory_fts_sync()
             self._ensure_knowledge_trgm_sync()
+            self._ensure_redaction_tracking_triggers_sync()
             self._ensure_retrieval_revision_sync()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_fingerprint ON memories(content_fingerprint)"
@@ -1105,6 +1110,11 @@ class MemoryStore:
 
     def _redact_existing_sensitive_rows_sync(self) -> None:
         """Idempotently scrub legacy rows before recall, embedding, or export."""
+        marker = self._conn.execute(
+            "SELECT value FROM schema_metadata WHERE key='sensitive_redaction_version'"
+        ).fetchone()
+        if marker is not None and clean_text(marker["value"], 80) == self.SENSITIVE_REDACTION_VERSION:
+            return
         rekeyed = False
         for row in self._conn.execute("SELECT id, content, evidence, metadata FROM memories").fetchall():
             content = redact_sensitive_text(row["content"])
@@ -1144,6 +1154,58 @@ class MemoryStore:
         self._redact_legacy_auxiliary_tables_sync()
         if rekeyed:
             self._backfill_memory_atom_v2_sync()
+        self._conn.execute(
+            """INSERT INTO schema_metadata(key,value,updated_at) VALUES('sensitive_redaction_version',?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            (self.SENSITIVE_REDACTION_VERSION, utc_now()),
+        )
+
+    def _ensure_redaction_tracking_triggers_sync(self) -> None:
+        """Invalidate the startup redaction marker when protected text changes."""
+        self._conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_redaction_memories_insert
+            AFTER INSERT ON memories
+            WHEN EXISTS (
+                SELECT 1 FROM schema_metadata
+                WHERE key='sensitive_redaction_version' AND value <> ''
+            )
+            BEGIN
+                UPDATE schema_metadata SET value='', updated_at=datetime('now')
+                WHERE key='sensitive_redaction_version';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_redaction_memories_update
+            AFTER UPDATE OF content,evidence,metadata ON memories
+            WHEN EXISTS (
+                SELECT 1 FROM schema_metadata
+                WHERE key='sensitive_redaction_version' AND value <> ''
+            )
+            BEGIN
+                UPDATE schema_metadata SET value='', updated_at=datetime('now')
+                WHERE key='sensitive_redaction_version';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_redaction_timeline_insert
+            AFTER INSERT ON timeline
+            WHEN EXISTS (
+                SELECT 1 FROM schema_metadata
+                WHERE key='sensitive_redaction_version' AND value <> ''
+            )
+            BEGIN
+                UPDATE schema_metadata SET value='', updated_at=datetime('now')
+                WHERE key='sensitive_redaction_version';
+            END;
+            CREATE TRIGGER IF NOT EXISTS trg_redaction_timeline_update
+            AFTER UPDATE OF content,metadata ON timeline
+            WHEN EXISTS (
+                SELECT 1 FROM schema_metadata
+                WHERE key='sensitive_redaction_version' AND value <> ''
+            )
+            BEGIN
+                UPDATE schema_metadata SET value='', updated_at=datetime('now')
+                WHERE key='sensitive_redaction_version';
+            END;
+            """
+        )
 
     def _redact_legacy_auxiliary_tables_sync(self) -> None:
         """Scrub older secondary projections that can surface memory text."""
@@ -9929,6 +9991,52 @@ class MemoryStore:
             ).fetchall()
         return {row["id"]: MemoryRecord.from_row(row) for row in rows}
 
+    async def update_memory_owner_bot(self, memory_id: str, owner_bot_id: str) -> bool:
+        """Update the Memory Atom owner and its mirrored metadata field."""
+        return await self._run_recoverable_database_operation(
+            self._update_memory_owner_bot_sync,
+            memory_id,
+            owner_bot_id,
+        )
+
+    def _update_memory_owner_bot_sync(self, memory_id: str, owner_bot_id: str) -> bool:
+        memory_id = clean_text(memory_id, 120)
+        owner_bot_id = clean_text(owner_bot_id, 120)
+        if not memory_id or not owner_bot_id or owner_bot_id.casefold() in {"self", "bot", "bot_self"}:
+            return False
+        with self._lock:
+            with self._transaction_sync():
+                row = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+                if not row:
+                    return False
+                metadata = json_loads(row["metadata"], {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata["owner_bot_id"] = owner_bot_id
+                atom = self._memory_atom_record_for_row(
+                    row,
+                    metadata=json_dumps(metadata),
+                    owner_bot_id=owner_bot_id,
+                )
+                cur = self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET owner_bot_id=?, metadata=?, canonical_key=?, content_fingerprint=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        owner_bot_id,
+                        json_dumps(metadata),
+                        atom.canonical_key,
+                        atom.content_fingerprint,
+                        utc_now(),
+                        memory_id,
+                    ),
+                )
+                refreshed = self._conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+                self._upsert_memory_fts_row(refreshed)
+                return cur.rowcount > 0
+
     async def update_memory_payload(
         self,
         memory_id: str,
@@ -10649,7 +10757,18 @@ class MemoryStore:
                             ),
                         )
                         merged += 1
-                fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled else 0
+                # A repair pass runs automatically shortly after startup.  Rebuilding
+                # the complete FTS table on every pass needlessly holds the write lock
+                # and can starve the event loop while other plugins are active.  Only
+                # rebuild when repair changed indexed content, or when the row counts
+                # show that an index is genuinely incomplete.  Explicit index rebuilds
+                # remain available through ``rebuild_memory_indexes``.
+                fts_rebuild_needed = bool(fingerprint_fixed or merged)
+                if self._fts_enabled and not fts_rebuild_needed:
+                    memory_count = int(self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] or 0)
+                    fts_count = int(self._conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] or 0)
+                    fts_rebuild_needed = memory_count != fts_count
+                fts_rebuilt = self._rebuild_memory_fts_sync() if self._fts_enabled and fts_rebuild_needed else 0
         return {
             "manual_visibility_fixed": manual_fixed,
             "internal_bot_self_scope_fixed": internal_bot_self_fixed,

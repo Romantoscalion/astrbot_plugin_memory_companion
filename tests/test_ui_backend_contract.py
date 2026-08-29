@@ -77,6 +77,27 @@ class UiBackendContractTests(unittest.TestCase):
         missing = self.frontend_paths() - self.route_paths()
         self.assertEqual(set(), missing, f"frontend endpoints without backend routes: {sorted(missing)}")
 
+    def test_page_bridge_uses_registered_namespace_and_separates_query_params(self) -> None:
+        self.assertIn('const API = "/api/v1/plugins/extensions/astrbot_plugin_memory_companion/page"', self.frontend_source)
+        self.assertIn('const PAGE_ENDPOINT_PREFIX = "page"', self.frontend_source)
+        self.assertIn("data = await bridgeRequest(bridge, path, method, options.body);", self.frontend_source)
+        self.assertIn("const bridge = getBridge() || await waitForBridge();", self.frontend_source)
+        self.assertIn("url.pathname.replace(/^\\/+/, \"\")", self.frontend_source)
+        self.assertIn("Object.fromEntries(url.searchParams.entries())", self.frontend_source)
+        self.assertIn("bridge.apiGet(endpoint, Object.keys(params).length ? params : undefined)", self.frontend_source)
+        self.assertIn('data.status === "error"', self.frontend_source)
+
+    def test_personal_album_uses_bridge_loaded_data_urls(self) -> None:
+        self.assertIn("data-album-image-src", self.frontend_source)
+        self.assertIn("async function hydratePersonalAlbumImages", self.frontend_source)
+        self.assertIn('apiGet(endpoint)', self.frontend_source)
+        self.assertIn('result.data_url', self.frontend_source)
+        self.assertIn('personal-photo-data', self.frontend_source)
+
+    def test_starmap_detail_unwraps_memory_api_payload(self) -> None:
+        self.assertIn('const response = await apiGet("/memory?id=" + encodeURIComponent(memoryId));', self.frontend_source)
+        self.assertIn('const memory = response && response.memory ? response.memory : response;', self.frontend_source)
+
     def test_every_backend_only_route_has_an_explicit_exposure_reason(self) -> None:
         routes = self.route_paths()
         frontend = self.frontend_paths()

@@ -273,7 +273,7 @@ class MemoryCompanionService:
                 f"旧记忆规范化失败 [legacy_memory.normalize]: {type(exc).__name__}: {exc}"
             ) from exc
 
-        self.identity = IdentityResolver()
+        self.identity = IdentityResolver(self._resolve_default_bot_id)
         self.reply_chain = ReplyChainResolver()
         self.intent_builder = RetrievalIntentBuilder()
         self.classifier = MemoryClassifier(
@@ -370,6 +370,51 @@ class MemoryCompanionService:
         self._load_relationship_phase_state()
         self.provenance_ledger = ProvenanceLedger(self.data_dir / "provenance_ledger.json")
         self._last_p5_gate_status: dict[str, Any] = {"state": "disabled", "enabled": False}
+
+    def _resolve_default_bot_id(self, _event: Any = None) -> str:
+        """Return a Bot ID only when the runtime exposes one unambiguous value."""
+        ids: set[str] = set()
+
+        def add(value: Any) -> None:
+            value = clean_text(value, 120)
+            if value and value.casefold() not in {"self", "bot", "bot_self", "unknown"}:
+                ids.add(value)
+
+        context = self.context
+        for source in (
+            context,
+            getattr(context, "platform_manager", None),
+            getattr(_event, "message_obj", None),
+            _event,
+        ):
+            if source is None:
+                continue
+            for attr in ("bot_user_id", "bot_self_id", "self_id", "client_self_id"):
+                add(getattr(source, attr, ""))
+
+        manager = getattr(context, "platform_manager", None)
+        for instance in list(getattr(manager, "platform_insts", []) or []):
+            for attr in ("self_id", "bot_self_id", "bot_user_id", "client_self_id"):
+                add(getattr(instance, attr, ""))
+            bot = getattr(instance, "bot", None)
+            for attr in ("self_id", "bot_self_id", "bot_user_id"):
+                add(getattr(bot, attr, ""))
+
+        getter = getattr(context, "get_all_stars", None)
+        if callable(getter):
+            try:
+                stars = getter() or []
+            except Exception:
+                stars = []
+            for star in stars:
+                for attr in ("bot_user_id", "bot_self_id", "self_id"):
+                    add(getattr(star, attr, ""))
+                star_config = getattr(star, "config", None)
+                if isinstance(star_config, dict):
+                    for key in ("bot_user_id", "bot_self_id", "self_id"):
+                        add(star_config.get(key))
+
+        return next(iter(ids)) if len(ids) == 1 else ""
 
     def _p5_gate_enabled(self, sink: str) -> bool:
         key = (
@@ -623,6 +668,90 @@ class MemoryCompanionService:
         if isinstance(rebind, dict):
             rebind["embeddings_scheduled"] = embeddings_scheduled
         return result
+
+    async def rebind_memory_owners(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Preview or apply a narrowly selected Bot-owner repair.
+
+        Unowned legacy rows are the default repair target.  Rebinding rows
+        already owned by another Bot requires an explicit source owner, which
+        keeps multi-Bot isolation intact while still allowing migrations.
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        target_bot_id = clean_text(payload.get("target_bot_id") or payload.get("bot_id"), 120)
+        if not target_bot_id or target_bot_id.casefold() in {"self", "bot", "bot_self"}:
+            raise ValueError("target_bot_id 必须是明确的 Bot ID")
+
+        raw_ids = payload.get("memory_ids")
+        memory_ids = [clean_text(item, 120) for item in raw_ids] if isinstance(raw_ids, list) else []
+        memory_ids = list(dict.fromkeys(item for item in memory_ids if item))
+        selector = {
+            "session_id": clean_text(payload.get("session_id"), 200),
+            "source_plugin": clean_text(payload.get("source_plugin"), 120),
+            "memory_type": clean_text(payload.get("memory_type"), 80),
+            "visibility": clean_text(payload.get("visibility"), 40),
+            "scope": clean_text(payload.get("scope"), 40),
+        }
+        if not memory_ids and not any(selector.values()):
+            raise ValueError("请提供 memory_ids，或至少一个精确筛选条件")
+        if len(memory_ids) > 2000:
+            raise ValueError("一次最多重新绑定 2000 条记忆")
+
+        if memory_ids:
+            records_by_id = await self.store.get_memories_by_ids(memory_ids)
+            records = [records_by_id[item] for item in memory_ids if item in records_by_id]
+        else:
+            records = await self.store.list_memories(
+                limit=min(2000, max(1, int(payload.get("limit") or 500))),
+                include_pending=True,
+                session_id=selector["session_id"],
+                memory_type=selector["memory_type"],
+                visibility=selector["visibility"],
+                scope=selector["scope"],
+            )
+            if selector["source_plugin"]:
+                records = [item for item in records if clean_text(item.source_plugin, 120) == selector["source_plugin"]]
+
+        source_owner_present = "source_bot_id" in payload or "from_owner_bot_id" in payload
+        source_owner = clean_text(payload.get("source_bot_id") or payload.get("from_owner_bot_id"), 120)
+        candidates: list[MemoryRecord] = []
+        skipped: dict[str, int] = {}
+        for record in records:
+            metadata = record.metadata if isinstance(record.metadata, dict) else {}
+            current_owner = clean_text(record.owner_bot_id or metadata.get("owner_bot_id"), 120)
+            if source_owner_present:
+                if current_owner != source_owner:
+                    skipped["source_owner_mismatch"] = skipped.get("source_owner_mismatch", 0) + 1
+                    continue
+            elif current_owner and current_owner != "self":
+                skipped["already_owned"] = skipped.get("already_owned", 0) + 1
+                continue
+            candidates.append(record)
+
+        preview = {
+            "count": len(candidates),
+            "sample_ids": [record.id for record in candidates[:20]],
+            "skipped": skipped,
+            "target_bot_id": target_bot_id,
+            "selector": {key: value for key, value in selector.items() if value},
+            "source_owner": source_owner if source_owner_present else "<empty-or-self>",
+        }
+        if not bool(payload.get("confirm")):
+            return {"mode": "preview", "preview": preview}
+        if not candidates:
+            return {"mode": "applied", "updated": 0, "preview": preview}
+
+        backup = self.store.backup(".before_memory_owner_rebind")
+        updated = 0
+        for record in candidates:
+            if await self.store.update_memory_owner_bot(record.id, target_bot_id):
+                updated += 1
+        self._retrieval_result_cache.clear()
+        return {
+            "mode": "applied",
+            "updated": updated,
+            "preview": preview,
+            "backup_path": str(backup),
+        }
 
     @staticmethod
     def _prepare_rule_profile_write(record: MemoryRecord) -> tuple[str, str]:
@@ -6574,7 +6703,17 @@ class MemoryCompanionService:
         backup = ""
         if self.config.bool("maintenance.sleep_backup_enabled", False):
             backup = str(self.store.backup(".before_sleep_maintenance"))
-        repair = await self.store.maintenance_repair()
+        # The scheduled pass runs while normal message and dashboard traffic is
+        # already active.  A full repair takes the store write lock for every
+        # memory row and makes synchronous compatibility reads stall the whole
+        # event loop.  Keep repair available to the explicit maintenance command,
+        # but let the periodic natural-forgetting pass do only its bounded tasks.
+        scheduled = str(reason or "").startswith("scheduled_")
+        repair = (
+            {"skipped": "scheduled_pass"}
+            if scheduled
+            else await self.store.maintenance_repair()
+        )
         raw_retention = await self._run_raw_event_retention()
         knowledge_graph = await self._backfill_knowledge_graph()
         decay = await self._run_memory_decay()
@@ -8037,6 +8176,7 @@ class MemoryCompanionService:
                 f"session: {clean_text(ctx.session_id, 200)}",
                 f"scope: {clean_text(ctx.scope, 40)}",
                 f"target: {clean_text(ctx.label, 240)}",
+                f"bot_id: {clean_text(ctx.bot_id, 120) or '<missing>'}",
                 f"query_source: {clean_text(getattr(intent, 'source', ''), 80)}",
                 f"query: {clean_text(getattr(intent, 'query', ''), 1000)}",
                 f"current_user_message: {clean_text(ctx.message_text, 1000)}",

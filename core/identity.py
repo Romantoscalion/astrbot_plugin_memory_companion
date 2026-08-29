@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .models import EntityRef, SessionContext, clean_text
 
@@ -76,6 +76,12 @@ def _tail_after_token(original: str, normalized: str, token: str) -> str:
 
 
 class IdentityResolver:
+    def __init__(self, bot_id_fallback: Callable[[Any], Any] | None = None):
+        # Some adapters/wrappers do not expose get_self_id().  The fallback is
+        # deliberately supplied by the host service so identity.py stays
+        # independent from AstrBot internals.
+        self.bot_id_fallback = bot_id_fallback
+
     async def resolve_event_context(self, event: Any) -> SessionContext:
         session_id = clean_text(getattr(event, "unified_msg_origin", "") or "", 200)
         platform = await self._call(event, "get_platform_name")
@@ -111,6 +117,11 @@ class IdentityResolver:
 
         user_name = await self._call(event, "get_sender_name")
         bot_id = await self._call(event, "get_self_id")
+        if not bot_id and callable(self.bot_id_fallback):
+            try:
+                bot_id = await maybe_await(self.bot_id_fallback(event))
+            except Exception:
+                bot_id = ""
         persona_id = clean_text(
             getattr(event, "private_companion_persona_id", "")
             or getattr(event, "persona_id", ""),

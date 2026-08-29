@@ -1,566 +1,94 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <title>记忆面板</title>
+  <title>记忆面板 · 我会牢牢记住你</title>
   <script>
     (() => {
-      const key = "memory_companion_overview_layout";
-      let layout = "standard";
+      const themeKey = "memory_companion_theme";
+      const navKey = "memory_companion_nav";
+      let theme = "dark";
       try {
-        const saved = window.localStorage.getItem(key);
-        if (saved === "standard" || saved === "cinema") layout = saved;
-      } catch (_) {
-        // WebView 隐私模式下可能禁用本地存储，保持常规总览即可。
-      }
-      document.documentElement.dataset.overviewLayout = layout;
+        const saved = window.localStorage.getItem(themeKey);
+        if (saved === "dark" || saved === "light") theme = saved;
+      } catch (_) { /* 隐私模式下保持深色 */ }
+      document.documentElement.dataset.theme = theme;
+      try {
+        const savedNav = window.localStorage.getItem(navKey);
+        if (savedNav) document.documentElement.dataset.initialNav = savedNav;
+      } catch (_) { /* 忽略 */ }
     })();
   </script>
-  <link rel="stylesheet" href="./app.css?v=1.10.5-ui-v1" />
+  <link rel="stylesheet" href="./app.css?v=2.0.0-ui-v1" />
 </head>
 <body>
-  <main id="app" class="film-app">
-    <nav id="overviewLayoutSwitch" class="overview-layout-switch" role="radiogroup" aria-label="界面模式">
-      <button class="overview-layout-option" data-overview-layout="standard" type="button" role="radio" aria-checked="false" aria-controls="standardOverview workspace">
-        简洁管理
-      </button>
-      <button class="overview-layout-option" data-overview-layout="cinema" type="button" role="radio" aria-checked="false" aria-controls="cinemaOverview workspace">
-        放映馆界面
-      </button>
-    </nav>
-    <span id="overviewLayoutAnnouncement" class="sr-only" aria-live="polite"></span>
-    <div id="uiCompatibilityBanner" class="ui-compatibility-banner" role="alert" hidden></div>
-
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">我会牢牢记住你</p>
-        <h1>记忆放映馆</h1>
+  <div class="shell" id="shell">
+    <aside class="rail" id="rail" aria-label="主导航">
+      <div class="rail-brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-copy">
+          <b>记忆面板</b>
+          <small>我会牢牢记住你</small>
+        </span>
       </div>
-    </header>
-
-    <section id="standardOverview" class="standard-overview" aria-label="常规记忆总览">
-      <header class="standard-overview-head">
-        <div>
-          <p class="eyebrow">Memory Companion</p>
-          <h1>记忆总览</h1>
-          <p class="standard-overview-summary">当前记忆库、会话范围与常用入口</p>
-        </div>
-        <button class="overview-primary-action" data-overview-view="microscope" type="button">
-          <span>检索记忆</span>
-          <span class="overview-action-arrow" aria-hidden="true">&rsaquo;</span>
+      <nav class="rail-nav" id="railNav" role="navigation"></nav>
+      <div class="rail-foot">
+        <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换深浅主题">
+          <span class="theme-toggle-track"><span class="theme-toggle-knob"></span></span>
+          <span class="theme-toggle-label" id="themeToggleLabel">深色</span>
         </button>
+        <div class="rail-status" id="railStatus">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="railStatusText">正在连接…</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <header class="topbar">
+        <div class="topbar-copy">
+          <p class="eyebrow" id="viewEyebrow">Memory Companion</p>
+          <h1 id="viewTitle">总览</h1>
+          <p class="topbar-hint" id="viewHint">记忆库、范围与联动的整体状态</p>
+        </div>
+        <div class="topbar-tools">
+          <div class="topbar-search">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></svg>
+            <input id="globalSearch" type="search" placeholder="搜索记忆内容、证据或 ID" autocomplete="off" />
+          </div>
+          <button class="tool-btn" id="refreshBtn" type="button" title="刷新当前视图">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.75"/><path d="M13.4 2.2v3.1h-3.1"/></svg>
+            <span>刷新</span>
+          </button>
+        </div>
       </header>
 
-      <section id="standardStats" class="overview-kpi-grid" aria-label="记忆库统计" aria-live="polite">
-        <article class="overview-kpi is-loading"><span>记忆</span><b>--</b></article>
-        <article class="overview-kpi is-loading"><span>记忆大小</span><b>--</b></article>
-        <article class="overview-kpi is-loading"><span>私聊记忆</span><b>--</b></article>
-        <article class="overview-kpi is-loading"><span>群聊记忆</span><b>--</b></article>
-      </section>
+      <div class="content" id="content" tabindex="-1"></div>
+    </main>
+  </div>
 
-      <div class="standard-overview-body">
-        <section class="overview-destinations" aria-labelledby="overviewDestinationsTitle">
-          <div class="overview-section-head">
-            <div>
-              <p class="eyebrow">Workspace</p>
-              <h2 id="overviewDestinationsTitle">功能入口</h2>
-            </div>
-            <span>6 个工作区</span>
-          </div>
-          <div class="overview-entry-grid">
-            <button class="overview-entry is-private" data-overview-view="relations" data-user-memory-filter="private" type="button">
-              <span class="overview-entry-index">01</span>
-              <span class="overview-entry-copy"><b>用户档案与记忆</b><small>私聊 · 画像 · 偏好 · 关系</small></span>
-              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
-            </button>
-            <button class="overview-entry is-group" data-overview-view="film" type="button">
-              <span class="overview-entry-index">02</span>
-              <span class="overview-entry-copy"><b>群聊记忆</b><small>群聊 · 成员 · 上下文</small></span>
-              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
-            </button>
-            <button class="overview-entry is-personal" data-overview-view="review" type="button">
-              <span class="overview-entry-index">03</span>
-              <span class="overview-entry-copy"><b>个人记忆</b><small>日程 · 相册 · 主观记忆</small></span>
-              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
-            </button>
-            <button class="overview-entry is-graph" data-overview-view="objects" type="button">
-              <span class="overview-entry-index">04</span>
-              <span class="overview-entry-copy"><b>知识图谱</b><small>节点 · 关系 · 时间线</small></span>
-              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
-            </button>
-            <button class="overview-entry is-search" data-overview-view="microscope" type="button">
-              <span class="overview-entry-index">05</span>
-              <span class="overview-entry-copy"><b>记忆显微镜</b><small>模拟召回 · 注入检查</small></span>
-              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
-            </button>
-            <button class="overview-entry is-archive is-wide" data-overview-view="archive" type="button">
-              <span class="overview-entry-index">06</span>
-              <span class="overview-entry-copy"><b>维护 / 迁移 / 配置</b><small>运行状态 · 备份 · 导入 · 配置</small></span>
-              <span class="overview-entry-arrow" aria-hidden="true">&rsaquo;</span>
-            </button>
-          </div>
-        </section>
-
-        <aside class="overview-side-column" aria-label="最近范围与快捷入口">
-          <section class="overview-recent-scopes" aria-labelledby="recentScopesTitle">
-            <div class="overview-section-head is-compact">
-              <div>
-                <p class="eyebrow">Recent</p>
-                <h2 id="recentScopesTitle">最近记忆范围</h2>
-              </div>
-              <span id="overviewScopeMeta">正在读取</span>
-            </div>
-            <div id="standardRecentBuckets" class="overview-scope-list" aria-live="polite">
-              <p class="overview-empty">正在读取最近范围...</p>
-            </div>
-          </section>
-
-          <section class="overview-quick-tools" aria-labelledby="quickToolsTitle">
-            <div class="overview-section-head is-compact">
-              <div>
-                <p class="eyebrow">Shortcuts</p>
-                <h2 id="quickToolsTitle">快捷入口</h2>
-              </div>
-            </div>
-            <div class="overview-quick-grid">
-              <button data-overview-view="microscope" type="button"><b>检索检查</b><small>查看召回结果</small></button>
-              <button data-overview-view="archive" type="button"><b>维护中心</b><small>备份与配置</small></button>
-            </div>
-          </section>
-        </aside>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="记忆详情">
+    <div class="drawer-head">
+      <div>
+        <p class="eyebrow" id="drawerEyebrow">记忆</p>
+        <h2 id="drawerTitle">未选择</h2>
       </div>
-    </section>
-
-    <section id="cinemaOverview" class="projection-stage" aria-label="记忆放映馆首页">
-      <button class="filmstrip" style="--a:-18deg;--z:2;--off:240px"  data-view="objects"    data-tip-title="知识图谱" data-tip-sub="关系 · 线程 · 时间线"     type="button"><span class="strip-label"><b>知识图谱</b><small>关系 · 节点</small></span></button>
-      <button class="filmstrip" style="--a:76deg; --z:4;--off:-200px" data-view="film"       data-tip-title="群聊记忆" data-tip-sub="群聊范围内的记忆"      type="button"><span class="strip-label"><b>群聊记忆</b><small>群聊 · 记忆</small></span></button>
-      <button class="filmstrip" style="--a:44deg; --z:7;--off:260px"  data-view="microscope" data-tip-title="记忆显微镜" data-tip-sub="模拟召回 · 检查注入"     type="button"><span class="strip-label" style="--label-edge:-260px"><b>记忆显微镜</b><small>模拟召回</small></span></button>
-      <button class="filmstrip" style="--a:14deg; --z:5;--off:-225px;--tx:-440px" data-view="relations" data-user-memory-filter="all" data-tip-title="用户档案与记忆" data-tip-sub="私聊 · 画像 · 偏好 · 关系" type="button"><span class="strip-label" style="--label-edge:380px"><b>用户档案与记忆</b><small>按用户统一查看</small></span></button>
-      <button class="filmstrip" style="--a:162deg;--z:1;--off:215px;--tx:-260px" data-view="review"     data-tip-title="个人记忆"       data-tip-sub="Bot 日程 · 生活细化"         type="button"><span class="strip-label is-flipped"><b>个人记忆</b><small>日程 · 细化</small></span></button>
-      <button class="filmstrip" style="--a:136deg;--z:3;--off:-390px" data-view="archive"    data-tip-title="维护/迁移/配置"   data-tip-sub="工具 · 迁移 · 配置"        type="button"><span class="strip-label is-flipped"><b>维护/迁移/配置</b><small>工具 · 配置</small></span></button>
-
-      <section class="overview-core" aria-live="polite">
-        <div class="core-ring"></div>
-        <p class="eyebrow">Memory Cinema</p>
-        <h2>记忆放映馆</h2>
-        <p id="subtitle" class="subtitle">正在读取结构化记忆库...</p>
-        <div id="stats" class="stats-grid"></div>
-      </section>
-    </section>
-
-    <section id="workspace" class="workspace-frame" aria-label="二级工作区">
-      <div class="workspace-head">
-        <div>
-          <p id="workspaceEyebrow" class="eyebrow">Locked Frame</p>
-          <h2 id="workspaceTitle">对象</h2>
-          <p id="workspaceHint">选择左侧对象后，所有检查视图都会收束到同一范围。</p>
-        </div>
-        <div class="workspace-tools">
-          <div class="top-actions workspace-actions">
-            <span id="activeTarget" class="target-pill">全部记忆</span>
-            <div class="projection-controls" role="toolbar" aria-label="放映控制">
-              <button id="backHomeBtn" class="projection-control control-home hidden" type="button" title="返回总览" aria-label="返回总览">
-                <span class="control-icon" aria-hidden="true"></span>
-                <span class="control-text">总览</span>
-              </button>
-              <button id="refreshBtn" class="projection-control control-refresh" type="button" title="刷新当前页面" aria-label="刷新当前页面">
-                <span class="control-icon" aria-hidden="true"></span>
-                <span class="control-text">刷新</span>
-              </button>
-            </div>
-          </div>
-          <div class="workspace-search">
-            <input id="globalSearch" type="search" placeholder="搜索内容、证据或 ID" />
-            <button id="loadActiveBtn" type="button">重载当前帧</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="workspace-grid">
-        <aside class="object-rail">
-          <div class="rail-head">
-            <b>观察对象</b>
-            <button id="clearTargetBtn" type="button">全部</button>
-          </div>
-          <div class="bucket-window">
-            <div id="bucketList" class="bucket-list"></div>
-          </div>
-        </aside>
-
-        <section class="workspace-main">
-          <section id="view-objects" class="view is-active">
-              <div class="section-head">
-                <h3>知识图谱</h3>
-                <p>查看记忆节点、关系边、跨窗口线程和时间线概览。</p>
-              </div>
-            <div id="contextPanel" class="page-panel-stack"></div>
-            </section>
-
-          <section id="view-film" class="view">
-            <div class="section-head">
-              <div>
-                <h3 id="groupMemoryTitle">群聊记忆</h3>
-                <p id="groupMemoryHint">查看群聊范围内可被召回和管理的结构化记忆。顶部开关作用于所有群聊窗口。</p>
-              </div>
-              <div class="section-actions scoped-clear-actions">
-                <div class="scope-control-panel">
-                  <div id="groupScopeControl" class="scope-control-host"></div>
-                  <button class="scope-control-link" type="button" data-archive-jump="topology">按窗口设置</button>
-                </div>
-                <button id="clearCurrentGroupMemoryBtn" class="danger subtle" type="button" disabled>清空当前群</button>
-                <div class="group-member-clear">
-                  <input id="clearGroupMemberUserId" type="text" inputmode="numeric" placeholder="群成员 QQ" disabled />
-                  <button id="clearGroupMemberMemoryBtn" class="danger subtle" type="button" disabled>清空群成员</button>
-                </div>
-              </div>
-            </div>
-            <div id="groupMemoryList" class="row-list"></div>
-          </section>
-
-          <section id="view-microscope" class="view">
-            <div class="section-head">
-              <h3>记忆显微镜</h3>
-              <p>对比全部可检索记忆与指定私聊、群聊中的实际召回结果。</p>
-            </div>
-            <div class="microscope-box">
-              <div class="microscope-context-bar">
-                <label class="microscope-context-field" for="microscopeContext">
-                  <span>检索范围</span>
-                  <select id="microscopeContext" aria-describedby="microscopeContextMeta">
-                    <option value="all">全部可检索记忆（管理检索）</option>
-                  </select>
-                </label>
-                <span id="microscopeContextMeta" class="microscope-context-meta" role="status">管理检索 · 全部可检索记忆</span>
-              </div>
-              <textarea id="searchQuery" rows="4" placeholder="例如：你最近写了什么 / 那个蓝色渐变小猪是什么"></textarea>
-              <button id="runSearchBtn" type="button">开始检索</button>
-            </div>
-            <div id="searchResult" class="result-grid" aria-live="polite" aria-busy="false"></div>
-          </section>
-
-          <section id="view-relations" class="view">
-            <div class="section-head">
-              <div>
-                <h3 id="userMemoryTitle">用户档案与记忆</h3>
-                <p id="userMemoryHint">选择左侧用户后，在同一工作区查看私聊、画像、偏好和关系记忆。</p>
-              </div>
-              <div class="section-actions">
-                <div class="scope-control-panel">
-                  <div id="privateScopeControl" class="scope-control-host"></div>
-                  <button class="scope-control-link" type="button" data-archive-jump="topology">按窗口设置</button>
-                </div>
-                <button id="clearCurrentPrivateMemoryBtn" class="danger subtle" type="button" disabled>清空当前用户</button>
-              </div>
-            </div>
-            <div class="user-memory-filter" role="tablist" aria-label="用户记忆分类">
-              <button class="is-active" data-user-memory-filter="all" type="button" role="tab" aria-selected="true">全部</button>
-              <button data-user-memory-filter="profile" type="button" role="tab" aria-selected="false">画像</button>
-              <button data-user-memory-filter="preference" type="button" role="tab" aria-selected="false">偏好</button>
-              <button data-user-memory-filter="relationship" type="button" role="tab" aria-selected="false">关系</button>
-              <button data-user-memory-filter="explicit" type="button" role="tab" aria-selected="false">明确记住</button>
-              <button data-user-memory-filter="private" type="button" role="tab" aria-selected="false">私聊记忆</button>
-            </div>
-            <section id="portraitGovernance" class="page-panel-stack" aria-label="统一用户画像治理"></section>
-            <div id="relationList" class="row-list"></div>
-          </section>
-
-          <section id="view-review" class="view">
-            <div class="section-head">
-              <h3>个人记忆</h3>
-              <p>查看 Bot 自身的每日生活日程、当前状态和细化片段。</p>
-            </div>
-            <div id="personalMemoryList" class="row-list"></div>
-          </section>
-
-          <section id="view-maintain" class="view">
-            <div class="section-head">
-              <div>
-                <h3 id="privateMemoryTitle">私聊记忆</h3>
-                <p id="privateMemoryHint">查看私聊范围内的对话、偏好、事实和稳定记忆。</p>
-              </div>
-              <div class="section-actions">
-                <div id="privateLegacyScopeControl" class="scope-control-host"></div>
-                <span class="compatibility-note">此旧入口已合并到“用户档案与记忆”。</span>
-              </div>
-            </div>
-            <div id="privateMemoryList" class="row-list"></div>
-          </section>
-
-          <section id="view-archive" class="view">
-            <div class="section-head">
-              <h3>维护 / 迁移 / 配置</h3>
-              <p>执行维护、LivingMemory 迁移、清理和导入修复。</p>
-            </div>
-            <div class="archive-grid">
-              <section class="archive-section" data-archive-section="core-memory">
-                <div class="archive-section-head">
-                  <h4>核心记忆</h4>
-                  <button id="newCoreMemoryBtn" class="subtle" type="button">新建核心块</button>
-                </div>
-                <div class="core-memory-workspace">
-                  <form id="coreMemoryForm" class="context-form core-memory-form" autocomplete="off">
-                    <input name="id" type="hidden" />
-                    <input name="expected_revision" type="hidden" value="0" />
-                    <div class="core-memory-fields">
-                      <label>Label
-                        <input name="label" type="text" maxlength="80" placeholder="例如 preferred_address" required />
-                      </label>
-                      <label>类型
-                        <select name="kind">
-                          <option value="rule">规则</option>
-                          <option value="boundary">边界</option>
-                          <option value="preference">偏好</option>
-                          <option value="profile">画像</option>
-                          <option value="fact" selected>事实</option>
-                          <option value="state">稳定状态</option>
-                        </select>
-                      </label>
-                      <label>作用域
-                        <select name="scope">
-                          <option value="global">全局 / Bot</option>
-                          <option value="private">私聊用户</option>
-                          <option value="group">群聊</option>
-                        </select>
-                      </label>
-                      <label>目标 ID
-                        <input name="target_id" type="text" maxlength="160" placeholder="私聊用户或群聊 ID" />
-                      </label>
-                      <label>Bot ID
-                        <input name="bot_id" type="text" maxlength="120" placeholder="留空表示全部 Bot" />
-                      </label>
-                      <label>人格 ID
-                        <input name="persona_id" type="text" maxlength="120" placeholder="留空表示全部人格" />
-                      </label>
-                      <label>优先级
-                        <input name="priority" type="number" min="0" max="100" step="1" value="50" />
-                      </label>
-                      <label class="core-memory-enabled">启用
-                        <input name="enabled" type="checkbox" checked />
-                      </label>
-                    </div>
-                    <label>内容
-                      <textarea name="content" rows="5" maxlength="4000" required></textarea>
-                    </label>
-                    <div class="context-form-actions">
-                      <span id="coreMemoryFormState">新建核心块</span>
-                      <div class="inline-actions">
-                        <button id="cancelCoreMemoryEditBtn" class="subtle" type="button">重置</button>
-                        <button type="submit">保存核心块</button>
-                      </div>
-                    </div>
-                  </form>
-                  <div id="coreMemoryList" class="core-memory-list" aria-live="polite"></div>
-                </div>
-              </section>
-              <section class="archive-section" data-archive-section="retrieval">
-                <h4>模块配置</h4>
-                <div id="selfMemoryList" class="config-panel-stack"></div>
-              </section>
-              <section class="archive-section is-active" data-archive-section="maintenance">
-                <h4>维护 / 迁移 / 清理</h4>
-                <div class="maintenance-box">
-                  <p class="archive-note">推荐先选择运行预设并查看诊断，再执行迁移或维护。所有导入与清空操作都会先备份数据库。</p>
-                  <div class="maintenance-tool-grid">
-                    <section class="maintenance-action">
-                      <b>1. 运行预设</b>
-                      <p class="archive-note">轻量模式关闭外部检索调用；标准模式平衡功能和成本；陪伴模式提高关系与连续性记忆预算。已有 Provider 选择不会被覆盖。</p>
-                      <div class="inline-actions">
-                        <button type="button" data-operation-preset="light">轻量</button>
-                        <button type="button" data-operation-preset="standard">标准</button>
-                        <button type="button" data-operation-preset="companion">陪伴</button>
-                      </div>
-                    </section>
-                    <section class="maintenance-action">
-                      <b>2. 运维诊断</b>
-                      <p class="archive-note">查看检索路径、缓存命中率、模型 Token 与耗时，以及可能重复注入的记忆插件目录。</p>
-                      <button id="operationsDiagnosticsBtn" type="button">生成诊断</button>
-                    </section>
-                    <section class="maintenance-action">
-                      <b>3. 可移植数据</b>
-                      <p class="archive-note">仅用于本插件导出的 UTF-8 JSONL，包含记忆、身份、关系、时间线与 ACL；QQChatExporter 聊天记录 JSON 请使用“历史聊天导入 / 文件导入”。</p>
-                      <input id="portableArchivePath" type="text" placeholder="导入时填写 JSONL 路径；导出无需填写" />
-                      <div class="inline-actions">
-                        <button id="portableExportBtn" type="button">导出</button>
-                        <button id="portablePreviewBtn" type="button">预览</button>
-                        <button id="portableImportBtn" type="button">导入</button>
-                      </div>
-                    </section>
-                    <section class="maintenance-action">
-                      <b>4. LivingMemory 导入</b>
-                      <p class="archive-note">先预览可导入数量和跳过原因，再执行导入。当前策略只导入完整摘要，跳过派生碎片。</p>
-                      <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
-                      <div class="inline-actions">
-                        <button id="previewImportBtn" type="button">预览导入</button>
-                        <button id="runImportBtn" type="button">执行导入</button>
-                      </div>
-                    </section>
-                    <section class="maintenance-action">
-                      <b>5. 内容修复</b>
-                      <p class="archive-note">用于修复早期导入后只剩旧库编号的记忆。建议先确认 LivingMemory 数据库路径，再执行修复。</p>
-                      <input class="livingmemory-path" type="text" placeholder="LivingMemory 数据库路径，可留空自动扫描" />
-                      <button id="repairLivingMemoryBtn" type="button">修复 LivingMemory 内容</button>
-                    </section>
-                    <section class="maintenance-action">
-                      <b>6. 维护检查</b>
-                      <p class="archive-note">修复索引、刷新统计并整理数据库状态。适合导入、清理或配置调整后手动执行一次。</p>
-                      <button id="maintenanceBtn" type="button">运行维护</button>
-                    </section>
-                    <section class="maintenance-action memory-audit-action">
-                      <b>7. 可回滚记忆审计</b>
-                      <p class="archive-note">仅在配置中启用后可用。先生成证据约束的预览，再明确应用；已应用批次可回滚。</p>
-                      <div class="memory-audit-controls">
-                        <label>候选上限
-                          <input id="memoryAuditLimit" type="number" min="0" max="100" value="0" inputmode="numeric" />
-                        </label>
-                        <button id="memoryAuditPreviewBtn" type="button">生成预览</button>
-                      </div>
-                      <div class="memory-audit-controls">
-                        <label>批次 ID
-                          <input id="memoryAuditBatchId" type="text" placeholder="audit_..." autocomplete="off" />
-                        </label>
-                        <button id="memoryAuditStatusBtn" class="subtle" type="button">读取状态</button>
-                      </div>
-                      <div id="memoryAuditResult" class="memory-audit-result" aria-live="polite"></div>
-                    </section>
-                    <section class="maintenance-action">
-                      <b>8. 危险清理</b>
-                      <p class="archive-note">清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份、注入日志和导入批次。</p>
-                      <button id="clearAllMemoryBtn" class="danger" type="button">清空全部记忆</button>
-                    </section>
-                  </div>
-                </div>
-              </section>
-              <section class="archive-section conversation-import-archive-section" data-archive-section="conversation-import">
-                <div class="conversation-import-page-head">
-                  <span>
-                    <h4>历史聊天导入</h4>
-                    <small>从当前 QQ 连接读取指定时段，或导入已有聊天文件；两种来源共用身份确认和记忆整理流程。</small>
-                  </span>
-                  <button id="historicalChatRecentTopBtn" class="subtle" type="button">继续最近任务</button>
-                </div>
-                <div class="conversation-import-tabs" role="tablist" aria-label="历史聊天来源">
-                  <button class="is-active" data-import-source-tab="qq" type="button" role="tab" aria-selected="true">QQ 直接读取</button>
-                  <button data-import-source-tab="file" type="button" role="tab" aria-selected="false" tabindex="-1">文件导入</button>
-                  <button data-import-source-tab="recent" type="button" role="tab" aria-selected="false" tabindex="-1">最近任务</button>
-                </div>
-                <div class="conversation-import-layout">
-                  <section class="conversation-import-source" data-import-source="qq">
-                    <div class="conversation-import-source-head">
-                      <span><b>QQ 直接读取</b><small>通过 NapCat / aiocqhttp 的好友历史接口读取，不碰本地加密数据库。</small></span>
-                      <button id="qqHistoryCapabilityBtn" class="subtle" type="button">重新检测</button>
-                    </div>
-                    <div id="qqHistoryCapability" class="qq-history-capability" role="status">
-                      正在检测当前 QQ 连接...
-                    </div>
-                    <div class="qq-history-form">
-                      <label>当前 Bot 连接
-                        <select id="qqHistoryPlatform" disabled>
-                          <option value="">等待能力检测</option>
-                        </select>
-                        <small>多 Bot 环境必须选对连接，避免把历史归到错误人格。</small>
-                      </label>
-                      <label>目标好友 QQ
-                        <input id="qqHistoryUserId" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="20" placeholder="输入纯数字 QQ 号" autocomplete="off" />
-                        <small>只读取该好友与你当前 Bot 的私聊历史。</small>
-                      </label>
-                      <div class="qq-history-range">
-                        <label>开始时间
-                          <input id="qqHistoryStartAt" type="datetime-local" />
-                        </label>
-                        <label>结束时间
-                          <input id="qqHistoryEndAt" type="datetime-local" />
-                        </label>
-                      </div>
-                      <div id="qqHistoryValidation" class="chat-import-validation is-error" role="status">请先完成能力检测并填写 QQ 与时间范围。</div>
-                      <button id="qqHistoryPreviewBtn" type="button" disabled>读取并生成预览</button>
-                    </div>
-                  </section>
-
-                  <section class="conversation-import-source" data-import-source="file" hidden>
-                    <div class="conversation-import-source-head">
-                      <span><b>文件导入</b><small>适合 QQ 接口不可用、历史太久或已经有导出文件的情况。</small></span>
-                    </div>
-                    <label id="historicalChatDropzone" class="chat-import-dropzone" for="historicalChatFile" tabindex="0">
-                      <input id="historicalChatFile" class="visually-hidden" type="file" accept=".txt,.log,.md,.json,text/plain,text/markdown,application/json" />
-                      <span class="chat-import-drop-icon" aria-hidden="true">＋</span>
-                      <b>拖入聊天记录，或点击选择文件</b>
-                      <small id="historicalChatFileMeta">支持 TXT、LOG、Markdown 和 QQChatExporter 私聊 JSON，最大 8 MiB</small>
-                    </label>
-                    <div class="chat-import-inline-fields">
-                      <label>缺失年份起点
-                        <input id="historicalChatBaseYear" type="number" min="1970" max="2200" inputmode="numeric" placeholder="通常留空" />
-                        <small>仅当文件开头就是“12-14 15:10:22”这类无年份时间时填写。</small>
-                      </label>
-                      <button id="historicalChatPreviewBtn" type="button" disabled>解析并预览</button>
-                    </div>
-                    <details class="chat-import-format-help">
-                      <summary>查看支持的文件格式</summary>
-                      <pre>烛雨: 2025-12-14 15:10:22
-消息正文，可包含多行
-
-Bot: 12-14 15:10:30
-缺失年份可由前文自动补推
-
-也兼容字段式导出：
-发送者：烛雨
-时间：2026-07-19 16:55:36
-内容：消息正文</pre>
-                      <p>也支持 <code>QQChatExporter</code> 导出的私聊 JSON。系统会保留原始消息 ID、序号和发送者 QQ，并将图片、语音等非文本消息标为可读占位；群聊包含多位用户，当前不能套入单用户私聊记忆。</p>
-                    </details>
-                  </section>
-
-                  <section class="conversation-import-source" data-import-source="recent" hidden>
-                    <div class="conversation-import-source-head">
-                       <span><b>历史任务</b><small>查看并修正升级前或当前版本的已完成批次，也可继续中断任务或回滚。</small></span>
-                      <button id="historicalChatRecentRefreshBtn" class="subtle" type="button">刷新列表</button>
-                    </div>
-                    <div id="historicalChatRecentList" class="chat-import-recent-list">
-                      <div class="empty-state">正在读取最近任务...</div>
-                    </div>
-                  </section>
-
-                  <section class="conversation-import-output" aria-live="polite">
-                    <div class="chat-import-steps" aria-label="历史聊天导入步骤">
-                      <span class="is-active"><i>1</i>选择来源</span>
-                      <span><i>2</i>读取预览</span>
-                      <span><i>3</i>确认身份</span>
-                      <span><i>4</i>生成记忆</span>
-                    </div>
-                    <div id="historicalChatEmptyState" class="chat-import-empty-state">
-                      <b>预览会显示在这里</b>
-                      <span>先选择 QQ 时段或聊天文件。系统只会在你确认用户与 Bot 身份后开始生成记忆。</span>
-                    </div>
-                    <div id="historicalChatPanel" class="chat-import-panel" hidden></div>
-                    <div id="conversationImportResult" class="archive-result" hidden></div>
-                  </section>
-                </div>
-              </section>
-              <section class="archive-section" data-archive-section="topology">
-                <div class="archive-section-head">
-                  <h4>权限拓扑</h4>
-                  <div id="topologyScopeControl" class="scope-control-host"></div>
-                </div>
-                <div id="aclTopologyContainer" class="acl-topology-container"></div>
-              </section>
-            </div>
-            <div id="importResult" class="archive-result" hidden></div>
-          </section>
-        </section>
-
-        <aside id="detailDrawer" class="detail-drawer empty">
-          选择一条记忆查看详情。
-        </aside>
-      </div>
-    </section>
-    <div class="screen-film-wipe" aria-hidden="true"><span id="transitionFace" class="screen-film-face">(๑•̀ㅂ•́)و✧</span></div>
-    <div id="busyLayer" class="busy-layer" aria-hidden="true">
-      <span></span>
-      <b id="busyText">正在处理...</b>
+      <button class="icon-btn" id="drawerClose" type="button" aria-label="关闭详情">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+      </button>
     </div>
-    <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  </main>
+    <div class="drawer-body" id="drawerBody"></div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <div class="busy-layer" id="busyLayer" aria-hidden="true">
+    <span class="busy-ring"></span>
+    <b id="busyText">正在处理…</b>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
   <script src="/api/plugin/page/bridge-sdk.js"></script>
-  <script src="./app.js?v=1.10.5-ui-v1"></script>
+  <script src="./app.js?v=2.0.0-ui-v1"></script>
 </body>
 </html>
