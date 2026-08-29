@@ -126,6 +126,28 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("m4", _ids(bundle["ranked_candidates"]))
         self.assertNotIn("m5", _ids(bundle["ranked_candidates"]))
 
+    async def test_bot_personal_archive_rows_are_excluded_from_regular_candidates(self) -> None:
+        store = self.make_store()
+        self.seed(store)
+        bridge_row = _memory("bot-personal-1", "今天的天气很好，适合散步", importance=1.0)
+        bridge_row.source_plugin = "bot_personal_bridge"
+        bridge_row.visibility = "bot_self"
+        store._insert_memory_sync(bridge_row)
+
+        bundle = await store.list_retrieval_candidate_bundle(
+            materialize_limit=100,
+            current_window={"scope": "private", "session_id": "s1", "user_id": "u1", "group_id": "", "limit": 50},
+            fts_terms=["天气"],
+            fts_limit=50,
+            keyword_terms=["天气"],
+            keyword_limit=50,
+            keyword_fallback_min_fts=50,
+            time_window=("2026-08-25T00:00:00+00:00", "2026-08-26T00:00:00+00:00", 50),
+            include_pending=False,
+        )
+        for key in ("ranked_candidates", "current_window_candidates", "fts_candidates", "keyword_candidates", "time_window_candidates"):
+            self.assertNotIn("bot-personal-1", _ids(bundle[key]))
+
     def test_from_row_light_matches_from_row_for_stored_rows(self) -> None:
         store = self.make_store()
         # Seed a record carrying sensitive-looking metadata to prove the light

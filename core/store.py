@@ -12,7 +12,6 @@ import re
 import sqlite3
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -88,11 +87,6 @@ class MemoryStore:
         self._read_lock = threading.RLock()
         self._operation_condition = threading.Condition()
         self._active_tracked_operations = 0
-        self._operation_waiters = 0
-        self._operation_owner_stack = ""
-        # 置 True 时 _guard_operation_sync 记录在飞操作的调用栈，供关闭超时取证
-        # （EXIT_139_FIX_PLAN.md F2「记录未归零的操作栈」）。
-        self._record_operation_stacks = False
         self._closing = False
         self._closed = False
         self._fts_enabled = False
@@ -229,14 +223,7 @@ class MemoryStore:
             return operation(*args)
 
     async def _run_recoverable_database_operation(self, operation: Any, *args: Any) -> Any:
-        # 统一经 _guard_operation_sync 计数：recoverable 路径同样受关闭屏障保护，
-        # 避免 close() 在只读/恢复查询在飞时关闭连接（exit=139 fix: INV-2）。
-        return await asyncio.to_thread(
-            self._guard_operation_sync,
-            self._run_with_database_recovery_sync,
-            operation,
-            *args,
-        )
+        return await asyncio.to_thread(self._run_with_database_recovery_sync, operation, *args)
 
     async def _run_tracked_operation(
         self,
@@ -257,16 +244,14 @@ class MemoryStore:
             finally:
                 with self._operation_condition:
                     self._active_tracked_operations -= 1
-                    if self._operation_waiters:
-                        self._operation_condition.notify_all()
+                    self._operation_condition.notify_all()
 
         try:
             future = asyncio.get_running_loop().run_in_executor(None, run)
         except BaseException:
             with self._operation_condition:
                 self._active_tracked_operations -= 1
-                if self._operation_waiters:
-                    self._operation_condition.notify_all()
+                self._operation_condition.notify_all()
             raise
         return await asyncio.shield(future)
 
@@ -289,7 +274,7 @@ class MemoryStore:
         }
 
     async def wal_health(self, *, checkpoint: bool = False) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._wal_health_sync, checkpoint)
+        return await asyncio.to_thread(self._wal_health_sync, checkpoint)
 
     def _wal_health_sync(self, checkpoint: bool = False) -> dict[str, Any]:
         result = self._database_file_snapshot()
@@ -333,7 +318,7 @@ class MemoryStore:
         above ``min_wal_bytes`` and no write transaction is active; a busy
         result is not an error.
         """
-        return await asyncio.to_thread(self._guard_operation_sync, self._wal_checkpoint_truncate_sync, min_wal_bytes)
+        return await asyncio.to_thread(self._wal_checkpoint_truncate_sync, min_wal_bytes)
 
     def _wal_checkpoint_truncate_sync(self, min_wal_bytes: int) -> dict[str, Any]:
         result = self._database_file_snapshot()
@@ -1711,7 +1696,7 @@ class MemoryStore:
         source_scope: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_portrait_person_projection_sync,
+            self._upsert_portrait_person_projection_sync,
             deepcopy(person_ref),
             deepcopy(capability_summary),
             source_scope,
@@ -1798,7 +1783,7 @@ class MemoryStore:
         return {"ok": True, "code": "profile_exact", "state": "ready", "portrait_revision": portrait_revision}
 
     async def portrait_projection_decision(self, person_ref: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._portrait_projection_decision_sync, deepcopy(person_ref))
+        return await asyncio.to_thread(self._portrait_projection_decision_sync, deepcopy(person_ref))
 
     def _portrait_projection_decision_sync(self, person_ref: dict[str, Any]) -> dict[str, Any]:
         person_id = clean_text(person_ref.get("person_id"), 80)
@@ -1825,7 +1810,7 @@ class MemoryStore:
         return {"ok": True, "code": "profile_exact"}
 
     async def add_portrait_evidence(self, evidence: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._add_portrait_evidence_sync, deepcopy(evidence))
+        return await asyncio.to_thread(self._add_portrait_evidence_sync, deepcopy(evidence))
 
     def _add_portrait_evidence_sync(self, evidence: dict[str, Any]) -> dict[str, Any]:
         person_id = clean_text(evidence.get("person_id"), 80)
@@ -1944,7 +1929,7 @@ class MemoryStore:
         return int(row["portrait_revision"] or 0) if row is not None else 0
 
     async def upsert_portrait_fact(self, fact: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._upsert_portrait_fact_sync, deepcopy(fact))
+        return await asyncio.to_thread(self._upsert_portrait_fact_sync, deepcopy(fact))
 
     def _upsert_portrait_fact_sync(self, fact: dict[str, Any]) -> dict[str, Any]:
         fact = redact_sensitive_value(fact)
@@ -2080,7 +2065,7 @@ class MemoryStore:
         }
 
     async def list_portrait_evidence(self, person_id: str, *, limit: int = 64) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_portrait_evidence_sync, person_id, limit)
+        return await asyncio.to_thread(self._list_portrait_evidence_sync, person_id, limit)
 
     def _list_portrait_evidence_sync(self, person_id: str, limit: int) -> list[dict[str, Any]]:
         with self._lock:
@@ -2098,10 +2083,10 @@ class MemoryStore:
         ]
 
     async def enqueue_portrait_learning(self, *, person_id: str, fact_id: str, evidence_hash: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._enqueue_portrait_learning_sync, person_id, fact_id, evidence_hash)
+        return await asyncio.to_thread(self._enqueue_portrait_learning_sync, person_id, fact_id, evidence_hash)
 
     async def list_pending_portrait_people(self, *, limit: int = 500) -> list[str]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_pending_portrait_people_sync, limit)
+        return await asyncio.to_thread(self._list_pending_portrait_people_sync, limit)
 
     def _list_pending_portrait_people_sync(self, limit: int) -> list[str]:
         with self._lock:
@@ -2147,7 +2132,7 @@ class MemoryStore:
         attempt_limit: int = 2,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._run_portrait_daily_batch_sync,
+            self._run_portrait_daily_batch_sync,
             person_id,
             run_day,
             min_independent_evidence,
@@ -2318,7 +2303,7 @@ class MemoryStore:
         inferred_freshness_days: int = 90,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._portrait_summary_sync,
+            self._portrait_summary_sync,
             person_id,
             scope,
             legacy_scope,
@@ -2408,7 +2393,7 @@ class MemoryStore:
         }
 
     async def upsert_portrait_suppression(self, marker: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._upsert_portrait_suppression_sync, deepcopy(marker))
+        return await asyncio.to_thread(self._upsert_portrait_suppression_sync, deepcopy(marker))
 
     def _upsert_portrait_suppression_sync(self, marker: dict[str, Any]) -> dict[str, Any]:
         key = clean_text(marker.get("suppression_key"), 80)
@@ -2447,10 +2432,10 @@ class MemoryStore:
         return {"ok": True, "code": "suppression_upserted", "revision": revision}
 
     async def list_portrait_people(self, *, limit: int = 100) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_portrait_people_sync, limit)
+        return await asyncio.to_thread(self._list_portrait_people_sync, limit)
 
     async def portrait_status(self, person_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._portrait_status_sync, person_id)
+        return await asyncio.to_thread(self._portrait_status_sync, person_id)
 
     def _portrait_status_sync(self, person_id: str) -> dict[str, Any]:
         person_id = clean_text(person_id, 80)
@@ -2500,7 +2485,7 @@ class MemoryStore:
         ]
 
     async def portrait_governance_detail(self, person_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._portrait_governance_detail_sync, person_id)
+        return await asyncio.to_thread(self._portrait_governance_detail_sync, person_id)
 
     def _portrait_governance_detail_sync(self, person_id: str) -> dict[str, Any]:
         person_id = clean_text(person_id, 80)
@@ -2551,7 +2536,7 @@ class MemoryStore:
         expires_at: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._govern_portrait_fact_sync,
+            self._govern_portrait_fact_sync,
             person_id,
             fact_id,
             action,
@@ -2609,7 +2594,7 @@ class MemoryStore:
         return {**result, "fact_id": fact_id, "action": action}
 
     async def portrait_migration(self, *, operation_id: str, dry_run: bool = True) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._portrait_migration_sync, operation_id, dry_run)
+        return await asyncio.to_thread(self._portrait_migration_sync, operation_id, dry_run)
 
     def _portrait_migration_sync(self, operation_id: str, dry_run: bool) -> dict[str, Any]:
         operation_id = clean_text(operation_id, 120)
@@ -2633,7 +2618,7 @@ class MemoryStore:
         return {"ok": True, "code": "migration_applied", "operation_id": operation_id, "legacy_candidate_count": count}
 
     async def rollback_portrait_migration(self, *, operation_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._rollback_portrait_migration_sync, operation_id)
+        return await asyncio.to_thread(self._rollback_portrait_migration_sync, operation_id)
 
     def _rollback_portrait_migration_sync(self, operation_id: str) -> dict[str, Any]:
         operation_id = clean_text(operation_id, 120)
@@ -2719,78 +2704,13 @@ class MemoryStore:
             )
         return len(rows)
 
-    def _guard_operation_sync(self, operation: Any, *args: Any) -> Any:
-        """Run a DB operation under the shutdown barrier (sync context).
-
-        Increments the tracked-operation counter for the whole duration of the
-        operation so that ``close()`` waits for it before closing any SQLite
-        connection (exit=139 fix: INV-2, no SQLite op in flight during close).
-        When a barrier wait times out, the leaked stack is recorded on the
-        instance so it can be surfaced in ``shutdown_state()``.
-
-        Raises:
-            sqlite3.OperationalError: If the store is closing/closed, so a
-                caller never starts a query on a half-closed connection.
-        """
-        with self._operation_condition:
-            if self._closing or self._closed:
-                raise sqlite3.OperationalError("database is closing")
-            self._active_tracked_operations += 1
-            self._operation_owner_stack = (
-                "".join(traceback.format_stack(limit=8))
-                if getattr(self, "_record_operation_stacks", False)
-                else ""
-            )
-        try:
-            return operation(*args)
-        finally:
-            with self._operation_condition:
-                self._active_tracked_operations -= 1
-                if self._operation_waiters:
-                    self._operation_condition.notify_all()
-                if getattr(self, "_record_operation_stacks", False):
-                    self._operation_owner_stack = ""
-
-    def shutdown_state(self) -> dict[str, Any]:
-        """Return structured evidence of resource state for shutdown logging."""
-        with self._operation_condition:
-            tracked = int(self._active_tracked_operations)
-            owner_stack = self._operation_owner_stack
-        return {
-            "main_conn_closed": self._closed,
-            "read_conn_closed": self._read_conn is None,
-            "tracked_ops": tracked,
-            "operation_owner_stack": owner_stack,
-        }
-
     def close(self) -> None:
-        close_timeout = float(
-            getattr(self, "_close_timeout_seconds", None) or 10.0
-        )
-        deadline = time.monotonic() + close_timeout
         with self._operation_condition:
             if self._closed:
                 return
             self._closing = True
-            if self._active_tracked_operations:
-                self._operation_waiters += 1
-                try:
-                    while self._active_tracked_operations:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            leaked_stack = self._operation_owner_stack or "（未开启操作栈记录）"
-                            logger.warning(
-                                "[MemoryCompanion] store.close 等待在飞操作归零超时 %.1fs，"
-                                "仍有 %s 个操作未归零，强制关闭（存在 exit=139 风险）；"
-                                "在飞操作栈:\n%s",
-                                close_timeout,
-                                self._active_tracked_operations,
-                                leaked_stack,
-                            )
-                            break
-                        self._operation_condition.wait(timeout=remaining)
-                finally:
-                    self._operation_waiters -= 1
+            while self._active_tracked_operations:
+                self._operation_condition.wait()
         with self._lock:
             if self._closed:
                 return
@@ -2815,7 +2735,7 @@ class MemoryStore:
         return target
 
     async def clear_all_memory_data(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._clear_all_memory_data_sync)
+        return await asyncio.to_thread(self._clear_all_memory_data_sync)
 
     def _clear_all_memory_data_sync(self) -> dict[str, Any]:
         backup = self.backup(".before_clear_all")
@@ -2868,7 +2788,7 @@ class MemoryStore:
         user_id: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._scoped_memory_clear_sync,
+            self._scoped_memory_clear_sync,
             target_type,
             group_id,
             user_id,
@@ -2883,7 +2803,7 @@ class MemoryStore:
         user_id: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._scoped_memory_clear_sync,
+            self._scoped_memory_clear_sync,
             target_type,
             group_id,
             user_id,
@@ -3944,7 +3864,7 @@ class MemoryStore:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._list_rule_portrait_facts_sync,
+            self._list_rule_portrait_facts_sync,
             person_id,
             source_scope,
             include_inactive,
@@ -5453,7 +5373,7 @@ class MemoryStore:
         confidence: float = 0.6,
     ) -> str:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_identity_sync,
+            self._upsert_identity_sync,
             platform,
             entity,
             aliases or [],
@@ -5524,7 +5444,7 @@ class MemoryStore:
         return row_id
 
     async def list_identities(self, limit: int = 1000, *, offset: int = 0) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_identities_sync, limit, offset)
+        return await asyncio.to_thread(self._list_identities_sync, limit, offset)
 
     def _list_identities_sync(self, limit: int, offset: int) -> list[dict[str, Any]]:
         with self._lock:
@@ -5665,6 +5585,7 @@ class MemoryStore:
         self,
         limit: int = 20,
         entity_id: str = "",
+        memory_types: list[str] | tuple[str, ...] | None = None,
         scope: str = "",
         session_id: str = "",
         group_id: str = "",
@@ -5672,9 +5593,10 @@ class MemoryStore:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._list_relationships_sync,
+            self._list_relationships_sync,
             limit,
             entity_id,
+            memory_types,
             scope,
             session_id,
             group_id,
@@ -5685,6 +5607,7 @@ class MemoryStore:
         self,
         limit: int,
         entity_id: str,
+        memory_types: list[str] | tuple[str, ...] | None,
         scope: str,
         session_id: str,
         group_id: str,
@@ -5728,7 +5651,7 @@ class MemoryStore:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_knowledge_node_sync,
+            self._upsert_knowledge_node_sync,
             node_type,
             label,
             scope,
@@ -5814,7 +5737,7 @@ class MemoryStore:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_knowledge_edge_sync,
+            self._upsert_knowledge_edge_sync,
             source_node_id,
             target_node_id,
             relation_type,
@@ -5897,7 +5820,7 @@ class MemoryStore:
         node: str = "",
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._list_knowledge_edges_sync,
+            self._list_knowledge_edges_sync,
             limit,
             scope,
             session_id,
@@ -5969,7 +5892,7 @@ class MemoryStore:
         before exposing any returned evidence.
         """
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._query_knowledge_paths_sync,
+            self._query_knowledge_paths_sync,
             terms,
             tag,
             node_type,
@@ -6146,7 +6069,7 @@ class MemoryStore:
         limit: int = 12,
     ) -> list[str]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._related_knowledge_terms_sync,
+            self._related_knowledge_terms_sync,
             terms,
             scope,
             session_id,
@@ -6253,7 +6176,6 @@ class MemoryStore:
         occurred_at: str = "",
     ) -> str:
         return await asyncio.to_thread(
-            self._guard_operation_sync,
             self._add_timeline_event_sync,
             event_type,
             session_id,
@@ -6329,14 +6251,14 @@ class MemoryStore:
         return row_id
 
     async def add_historical_timeline_events(self, rows: list[dict[str, Any]]) -> dict[str, str]:
-        inserted, _ = await asyncio.to_thread(self._guard_operation_sync, self._add_historical_timeline_events_sync, rows)
+        inserted, _ = await asyncio.to_thread(self._add_historical_timeline_events_sync, rows)
         return inserted
 
     async def add_historical_timeline_events_with_status(
         self,
         rows: list[dict[str, Any]],
     ) -> tuple[dict[str, str], set[str]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._add_historical_timeline_events_sync, rows)
+        return await asyncio.to_thread(self._add_historical_timeline_events_sync, rows)
 
     def _add_historical_timeline_events_sync(
         self,
@@ -6398,7 +6320,7 @@ class MemoryStore:
         return inserted, newly_inserted
 
     async def upsert_chat_import_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._upsert_chat_import_batch_sync, payload)
+        return await asyncio.to_thread(self._upsert_chat_import_batch_sync, payload)
 
     def _upsert_chat_import_batch_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         batch_id = clean_text(payload.get("id"), 120)
@@ -6447,7 +6369,7 @@ class MemoryStore:
         return self._get_chat_import_batch_sync(batch_id) or {}
 
     async def get_chat_import_batch(self, batch_id: str) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self._guard_operation_sync, self._get_chat_import_batch_sync, batch_id)
+        return await asyncio.to_thread(self._get_chat_import_batch_sync, batch_id)
 
     def _get_chat_import_batch_sync(self, batch_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -6463,7 +6385,7 @@ class MemoryStore:
         return result
 
     async def list_chat_import_batches(self, limit: int | None = 20) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_chat_import_batches_sync, limit)
+        return await asyncio.to_thread(self._list_chat_import_batches_sync, limit)
 
     def _list_chat_import_batches_sync(self, limit: int | None) -> list[dict[str, Any]]:
         with self._lock:
@@ -6485,7 +6407,7 @@ class MemoryStore:
         return results
 
     async def update_chat_import_batch(self, batch_id: str, **changes: Any) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_chat_import_batch_sync, batch_id, changes)
+        return await asyncio.to_thread(self._update_chat_import_batch_sync, batch_id, changes)
 
     def _update_chat_import_batch_sync(self, batch_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
         allowed = {
@@ -6509,7 +6431,7 @@ class MemoryStore:
         return self._get_chat_import_batch_sync(batch_id)
 
     async def replace_chat_import_segments(self, batch_id: str, segments: list[dict[str, Any]]) -> int:
-        return await asyncio.to_thread(self._guard_operation_sync, self._replace_chat_import_segments_sync, batch_id, segments)
+        return await asyncio.to_thread(self._replace_chat_import_segments_sync, batch_id, segments)
 
     def _replace_chat_import_segments_sync(self, batch_id: str, segments: list[dict[str, Any]]) -> int:
         batch_id = clean_text(batch_id, 120)
@@ -6540,7 +6462,7 @@ class MemoryStore:
         return len(segments)
 
     async def chat_import_segments(self, batch_id: str, *, statuses: set[str] | None = None) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._chat_import_segments_sync, batch_id, statuses)
+        return await asyncio.to_thread(self._chat_import_segments_sync, batch_id, statuses)
 
     def _chat_import_segments_sync(self, batch_id: str, statuses: set[str] | None) -> list[dict[str, Any]]:
         params: list[Any] = [clean_text(batch_id, 120)]
@@ -6563,7 +6485,7 @@ class MemoryStore:
         return results
 
     async def update_chat_import_segment(self, segment_id: str, **changes: Any) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_chat_import_segment_sync, segment_id, changes)
+        return await asyncio.to_thread(self._update_chat_import_segment_sync, segment_id, changes)
 
     def _update_chat_import_segment_sync(self, segment_id: str, changes: dict[str, Any]) -> bool:
         allowed = {"status", "attempts", "result", "summary_memory_id", "error"}
@@ -6582,10 +6504,10 @@ class MemoryStore:
         return cur.rowcount > 0
 
     async def rollback_chat_import_batch(self, batch_id: str) -> dict[str, int]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._rollback_chat_import_batch_sync, batch_id)
+        return await asyncio.to_thread(self._rollback_chat_import_batch_sync, batch_id)
 
     async def chat_import_memory_counts(self, batch_id: str) -> dict[str, int]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._chat_import_memory_counts_sync, batch_id)
+        return await asyncio.to_thread(self._chat_import_memory_counts_sync, batch_id)
 
     def _chat_import_memory_counts_sync(self, batch_id: str) -> dict[str, int]:
         with self._lock:
@@ -6606,7 +6528,7 @@ class MemoryStore:
         bot_id: str,
     ) -> bool:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._private_memory_context_exists_sync,
+            self._private_memory_context_exists_sync,
             session_id,
             user_id,
             bot_id,
@@ -6622,7 +6544,7 @@ class MemoryStore:
         exclude_import_batch_id: str = "",
     ) -> bool:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._private_memory_context_exists_sync,
+            self._private_memory_context_exists_sync,
             session_id,
             user_id,
             bot_id,
@@ -6704,7 +6626,7 @@ class MemoryStore:
         backup_path: str = "",
     ) -> dict[str, int]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._rebind_chat_import_batch_sync,
+            self._rebind_chat_import_batch_sync,
             batch_id,
             session_id,
             platform,
@@ -7153,7 +7075,7 @@ class MemoryStore:
         entity_links: dict[str, dict[str, dict[str, str]]] | None = None,
     ) -> dict[str, int]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._repair_chat_import_identity_links_sync,
+            self._repair_chat_import_identity_links_sync,
             batch_id,
             session_id,
             entity_links or {},
@@ -7262,7 +7184,7 @@ class MemoryStore:
         }
 
     async def neutralize_chat_import_summary_perspective(self, batch_id: str) -> dict[str, int]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._neutralize_chat_import_summary_perspective_sync, batch_id)
+        return await asyncio.to_thread(self._neutralize_chat_import_summary_perspective_sync, batch_id)
 
     def _neutralize_chat_import_summary_perspective_sync(self, batch_id: str) -> dict[str, int]:
         batch_id = clean_text(batch_id, 120)
@@ -7343,7 +7265,7 @@ class MemoryStore:
         detail_schema_version: int,
     ) -> dict[str, int]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._update_chat_import_summary_detail_sync,
+            self._update_chat_import_summary_detail_sync,
             memory_id,
             detailed_summary,
             canonical_summary,
@@ -7426,7 +7348,7 @@ class MemoryStore:
         detail_schema_version: int,
     ) -> dict[str, int]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._update_chat_import_daily_digest_sync,
+            self._update_chat_import_daily_digest_sync,
             batch_id,
             date,
             detailed_summary,
@@ -7609,7 +7531,7 @@ class MemoryStore:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._recent_timeline_sync,
+            self._recent_timeline_sync,
             limit,
             scope,
             session_id,
@@ -7700,7 +7622,7 @@ class MemoryStore:
         limit: int = 48,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._recent_cross_window_timeline_sync,
+            self._recent_cross_window_timeline_sync,
             source_scope,
             current_session_id,
             since_at,
@@ -7745,7 +7667,7 @@ class MemoryStore:
         entity_id: str = "",
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._timeline_window_sync,
+            self._timeline_window_sync,
             start_at,
             end_at,
             limit,
@@ -7822,7 +7744,7 @@ class MemoryStore:
         after_timeline_id: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._unsummarized_timeline_window_sync,
+            self._unsummarized_timeline_window_sync,
             session_id,
             scope,
             limit,
@@ -7888,7 +7810,7 @@ class MemoryStore:
         }
 
     async def mark_timeline_summarized(self, event_ids: list[str]) -> int:
-        return await asyncio.to_thread(self._guard_operation_sync, self._mark_timeline_summarized_sync, event_ids)
+        return await asyncio.to_thread(self._mark_timeline_summarized_sync, event_ids)
 
     def _mark_timeline_summarized_sync(self, event_ids: list[str]) -> int:
         ids = [clean_text(event_id, 120) for event_id in event_ids if clean_text(event_id, 120)]
@@ -7904,7 +7826,7 @@ class MemoryStore:
         return int(cur.rowcount or 0)
 
     async def get_summary_failure(self, session_id: str) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self._guard_operation_sync, self._get_summary_failure_sync, session_id)
+        return await asyncio.to_thread(self._get_summary_failure_sync, session_id)
 
     def _get_summary_failure_sync(self, session_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -7929,7 +7851,7 @@ class MemoryStore:
         metadata: dict[str, Any] | None = None,
     ) -> int:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._record_summary_failure_sync,
+            self._record_summary_failure_sync,
             session_id,
             scope,
             start_timeline_id,
@@ -7984,11 +7906,11 @@ class MemoryStore:
         return int(row["retry_count"] if row else 1)
 
     async def clear_summary_failure(self, session_id: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._clear_summary_failure_sync, session_id)
+        return await asyncio.to_thread(self._clear_summary_failure_sync, session_id)
 
     async def mark_summary_failure_dead_letter(self, session_id: str, max_retries: int) -> bool:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._mark_summary_failure_dead_letter_sync,
+            self._mark_summary_failure_dead_letter_sync,
             session_id,
             max_retries,
         )
@@ -8001,7 +7923,7 @@ class MemoryStore:
         state: str = "transient_cooldown",
     ) -> bool:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._mark_summary_failure_state_sync,
+            self._mark_summary_failure_state_sync,
             session_id,
             clean_text(state, 40) or "transient_cooldown",
             {
@@ -8067,7 +7989,7 @@ class MemoryStore:
         metadata: dict[str, Any] | None = None,
     ) -> str:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._create_cross_window_thread_sync,
+            self._create_cross_window_thread_sync,
             from_session,
             to_session,
             topic,
@@ -8121,7 +8043,7 @@ class MemoryStore:
         limit: int = 20,
         session_id: str = "",
     ) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_cross_window_threads_sync, status, limit, session_id)
+        return await asyncio.to_thread(self._list_cross_window_threads_sync, status, limit, session_id)
 
     def _list_cross_window_threads_sync(
         self,
@@ -8150,7 +8072,7 @@ class MemoryStore:
         return [dict(row) for row in rows]
 
     async def update_cross_window_thread_status(self, thread_id: str, status: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_cross_window_thread_status_sync, thread_id, status)
+        return await asyncio.to_thread(self._update_cross_window_thread_status_sync, thread_id, status)
 
     def _update_cross_window_thread_status_sync(self, thread_id: str, status: str) -> bool:
         with self._lock:
@@ -8172,7 +8094,7 @@ class MemoryStore:
         injection_chars: int,
     ) -> str:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._add_injection_log_sync,
+            self._add_injection_log_sync,
             session_id,
             scope,
             query,
@@ -8220,7 +8142,7 @@ class MemoryStore:
         scope: str = "",
         session_id: str = "",
     ) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._recent_injection_logs_sync, limit, scope, session_id)
+        return await asyncio.to_thread(self._recent_injection_logs_sync, limit, scope, session_id)
 
     def _recent_injection_logs_sync(self, limit: int, scope: str, session_id: str) -> list[dict[str, Any]]:
         params: list[Any] = []
@@ -8263,7 +8185,9 @@ class MemoryStore:
         limit: int,
         include_pending: bool,
     ) -> list[Any]:
-        where = "lifecycle != 'archived'"
+        # Bot Personal archive references are served by a dedicated bridge and
+        # are not ordinary memory documents.
+        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge')"
         params: list[Any] = []
         if not include_pending:
             where += " AND review_status != 'pending'"
@@ -8392,7 +8316,7 @@ class MemoryStore:
     ) -> list[MemoryRecord]:
         """Read a small schedule-focused snapshot without waiting on the shared writer lock."""
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._list_schedule_context_memories_sync,
+            self._list_schedule_context_memories_sync,
             session_id,
             user_id,
             bot_id,
@@ -8486,6 +8410,8 @@ class MemoryStore:
                 """
             )
             params.extend([*profile_types, session_id, user_id, user_id, bot_id, bot_id, bot_id])
+        # This is the dedicated Companion schedule context path; Bot Personal
+        # records remain available here and are not part of ordinary recall.
         where = "lifecycle!='archived' AND review_status!='pending' AND (" + " OR ".join(clauses) + ")"
         if strict_session_only:
             if not session_id:
@@ -8586,7 +8512,7 @@ class MemoryStore:
             params.extend([user_id, user_id])
         if not clauses:
             return []
-        where = "lifecycle != 'archived' AND (" + " OR ".join(clauses) + ")"
+        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge') AND (" + " OR ".join(clauses) + ")"
         if not include_pending:
             where += " AND review_status != 'pending'"
         return conn.execute(
@@ -8639,7 +8565,7 @@ class MemoryStore:
         end = clean_text(end_at, 80)
         if not start or not end:
             return []
-        where = "lifecycle != 'archived'"
+        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge')"
         params: list[Any] = [start, end, start, end, start, end]
         if not include_pending:
             where += " AND review_status != 'pending'"
@@ -8686,7 +8612,6 @@ class MemoryStore:
         Corresponds to optimization_plan.md §6.1/§6.2.
         """
         return await asyncio.to_thread(
-            self._guard_operation_sync,
             self._list_retrieval_candidate_bundle_sync,
             materialize_limit,
             current_window or {},
@@ -8788,7 +8713,7 @@ class MemoryStore:
         query = self._fts_match_query(terms)
         if not query:
             return []
-        where = "m.lifecycle != 'archived'"
+        where = "m.lifecycle != 'archived' AND m.source_plugin NOT IN ('bot_personal_bridge')"
         params: list[Any] = [query]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
@@ -8874,7 +8799,7 @@ class MemoryStore:
         if not cleaned_terms:
             return []
 
-        where = "lifecycle != 'archived'"
+        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge')"
         params: list[Any] = []
         if not include_pending:
             where += " AND review_status != 'pending'"
@@ -8924,7 +8849,7 @@ class MemoryStore:
         return await self._run_recoverable_database_operation(self._recent_memories_sync, limit, include_pending)
 
     def _recent_memories_sync(self, limit: int, include_pending: bool) -> list[MemoryRecord]:
-        where = "1=1"
+        where = "source_plugin NOT IN ('bot_personal_bridge')"
         if not include_pending:
             where += " AND review_status != 'pending'"
         with self._lock:
@@ -9239,13 +9164,13 @@ class MemoryStore:
         include_raw_events: bool = False,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._list_memory_buckets_sync,
+            self._list_memory_buckets_sync,
             limit,
             include_raw_events,
         )
 
     async def preferred_private_session_id(self, user_id: str, bot_id: str = "") -> str:
-        return await asyncio.to_thread(self._guard_operation_sync, self._preferred_private_session_id_sync, user_id, bot_id)
+        return await asyncio.to_thread(self._preferred_private_session_id_sync, user_id, bot_id)
 
     def _preferred_private_session_id_sync(self, user_id: str, bot_id: str = "") -> str:
         user_id = clean_text(user_id, 120)
@@ -9668,7 +9593,7 @@ class MemoryStore:
         enabled_only: bool = True,
     ) -> list[dict[str, Any]]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._list_acl_rules_sync,
+            self._list_acl_rules_sync,
             owner_scope,
             owner_id,
             reader_scope,
@@ -9728,7 +9653,7 @@ class MemoryStore:
         note: str = "",
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_acl_rule_sync,
+            self._upsert_acl_rule_sync,
             owner_scope,
             owner_id,
             reader_scope,
@@ -9792,7 +9717,7 @@ class MemoryStore:
         return self._acl_rule_from_row(row) if row else data
 
     async def delete_acl_rule(self, rule_id: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._delete_acl_rule_sync, rule_id)
+        return await asyncio.to_thread(self._delete_acl_rule_sync, rule_id)
 
     def _delete_acl_rule_sync(self, rule_id: str) -> bool:
         with self._lock:
@@ -9811,7 +9736,7 @@ class MemoryStore:
         return item
 
     async def get_acl_policy(self, window_scope: str, window_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._get_acl_policy_sync, window_scope, window_id)
+        return await asyncio.to_thread(self._get_acl_policy_sync, window_scope, window_id)
 
     def _get_acl_policy_sync(self, window_scope: str, window_id: str) -> dict[str, Any]:
         window_scope = clean_text(window_scope, 40)
@@ -9826,7 +9751,7 @@ class MemoryStore:
         return self._acl_policy_from_row(row)
 
     async def list_acl_policies(self) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_acl_policies_sync)
+        return await asyncio.to_thread(self._list_acl_policies_sync)
 
     def _list_acl_policies_sync(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -9844,7 +9769,7 @@ class MemoryStore:
         recall_enabled: Any = _ACL_UNSET,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._upsert_acl_policy_sync,
+            self._upsert_acl_policy_sync,
             window_scope,
             window_id,
             read_mode,
@@ -10287,7 +10212,7 @@ class MemoryStore:
         emotional_delta: float = 0.0,
     ) -> bool:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._update_memory_reaction_feedback_sync,
+            self._update_memory_reaction_feedback_sync,
             memory_id,
             reaction,
             evidence,
@@ -10382,7 +10307,7 @@ class MemoryStore:
             return cur.rowcount > 0
 
     async def delete_memory(self, memory_id: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._delete_memory_sync, memory_id)
+        return await asyncio.to_thread(self._delete_memory_sync, memory_id)
 
     def _delete_memory_sync(self, memory_id: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -10397,7 +10322,7 @@ class MemoryStore:
                 return cur.rowcount > 0
 
     async def update_review_status(self, memory_id: str, status: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_review_status_sync, memory_id, status)
+        return await asyncio.to_thread(self._update_review_status_sync, memory_id, status)
 
     def _update_review_status_sync(self, memory_id: str, status: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -10561,7 +10486,7 @@ class MemoryStore:
                 return True
 
     async def approve_livingmemory_imports(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._approve_livingmemory_imports_sync)
+        return await asyncio.to_thread(self._approve_livingmemory_imports_sync)
 
     def _approve_livingmemory_imports_sync(self) -> dict[str, Any]:
         now = utc_now()
@@ -10603,7 +10528,7 @@ class MemoryStore:
         }
 
     async def list_livingmemory_content_repair_candidates(self) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_livingmemory_content_repair_candidates_sync)
+        return await asyncio.to_thread(self._list_livingmemory_content_repair_candidates_sync)
 
     def _list_livingmemory_content_repair_candidates_sync(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -10622,7 +10547,7 @@ class MemoryStore:
         return candidates
 
     async def update_livingmemory_import_payload(self, memory_id: str, payload: dict[str, Any]) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_livingmemory_import_payload_sync, memory_id, payload)
+        return await asyncio.to_thread(self._update_livingmemory_import_payload_sync, memory_id, payload)
 
     def _update_livingmemory_import_payload_sync(self, memory_id: str, payload: dict[str, Any]) -> bool:
         with self._lock:
@@ -10664,7 +10589,7 @@ class MemoryStore:
             return cur.rowcount > 0
 
     async def update_memory_visibility(self, memory_id: str, visibility: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_memory_visibility_sync, memory_id, visibility)
+        return await asyncio.to_thread(self._update_memory_visibility_sync, memory_id, visibility)
 
     def _update_memory_visibility_sync(self, memory_id: str, visibility: str) -> bool:
         memory_id = clean_text(memory_id, 120)
@@ -10692,7 +10617,7 @@ class MemoryStore:
                 return cur.rowcount > 0
 
     async def update_memory_lifecycle(self, memory_id: str, lifecycle: str) -> bool:
-        return await asyncio.to_thread(self._guard_operation_sync, self._update_memory_lifecycle_sync, memory_id, lifecycle)
+        return await asyncio.to_thread(self._update_memory_lifecycle_sync, memory_id, lifecycle)
 
     def _update_memory_lifecycle_sync(self, memory_id: str, lifecycle: str) -> bool:
         lifecycle = clean_text(lifecycle, 40)
@@ -10710,7 +10635,7 @@ class MemoryStore:
             return cur.rowcount > 0
 
     async def maintenance_repair(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._maintenance_repair_sync)
+        return await asyncio.to_thread(self._maintenance_repair_sync)
 
     def _maintenance_repair_sync(self) -> dict[str, Any]:
         with self._lock:
@@ -10809,7 +10734,7 @@ class MemoryStore:
         }
 
     async def list_decay_candidate_pool(self, limit: int = 2000) -> list[MemoryRecord]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_decay_candidate_pool_sync, limit)
+        return await asyncio.to_thread(self._list_decay_candidate_pool_sync, limit)
 
     def _list_decay_candidate_pool_sync(self, limit: int) -> list[MemoryRecord]:
         with self._lock:
@@ -10829,7 +10754,7 @@ class MemoryStore:
         return [MemoryRecord.from_row(row) for row in rows]
 
     async def archive_raw_events_older_than(self, cutoff_at: str, limit: int = 1000) -> int:
-        return await asyncio.to_thread(self._guard_operation_sync, self._archive_raw_events_older_than_sync, cutoff_at, limit)
+        return await asyncio.to_thread(self._archive_raw_events_older_than_sync, cutoff_at, limit)
 
     def _archive_raw_events_older_than_sync(self, cutoff_at: str, limit: int) -> int:
         cutoff_at = clean_text(cutoff_at, 80)
@@ -10881,7 +10806,7 @@ class MemoryStore:
         limit: int = 2000,
     ) -> dict[str, int]:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._prune_retained_rows_sync,
+            self._prune_retained_rows_sync,
             summarized_timeline_cutoff,
             injection_log_cutoff,
             limit,
@@ -10943,7 +10868,7 @@ class MemoryStore:
         supersedes_id: str = "",
     ) -> int:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._archive_memories_sync,
+            self._archive_memories_sync,
             memory_ids,
             reason,
             supersedes_id,
@@ -10989,7 +10914,7 @@ class MemoryStore:
         return archived
 
     async def list_review_queue(self, limit: int = 20) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._guard_operation_sync, self._list_review_queue_sync, limit)
+        return await asyncio.to_thread(self._list_review_queue_sync, limit)
 
     def _list_review_queue_sync(self, limit: int) -> list[dict[str, Any]]:
         with self._lock:
@@ -11122,7 +11047,7 @@ class MemoryStore:
             cached = self._embedding_candidate_cache.get(cache_key)
             if cached is not None:
                 return deepcopy(cached)
-        where = "m.lifecycle != 'archived' AND e.provider_id=?"
+        where = "m.lifecycle != 'archived' AND m.source_plugin NOT IN ('bot_personal_bridge') AND e.provider_id=?"
         params: list[Any] = [provider_id]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
@@ -11225,7 +11150,7 @@ class MemoryStore:
         provider_id = clean_text(provider_id, 160)
         if not provider_id:
             return [], 0, True
-        where = "m.lifecycle != 'archived'"
+        where = "m.lifecycle != 'archived' AND m.source_plugin NOT IN ('bot_personal_bridge')"
         params: list[Any] = [provider_id]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
@@ -11268,7 +11193,7 @@ class MemoryStore:
         return result, next_offset, exhausted
 
     async def mark_accessed(self, memory_ids: list[str]) -> None:
-        await asyncio.to_thread(self._guard_operation_sync, self._mark_accessed_sync, memory_ids)
+        await asyncio.to_thread(self._mark_accessed_sync, memory_ids)
 
     def _mark_accessed_sync(self, memory_ids: list[str]) -> None:
         ids = [memory_id for memory_id in memory_ids if memory_id]
@@ -11290,7 +11215,7 @@ class MemoryStore:
     async def mark_injected(self, memory_ids: list[str], when: str = "") -> int:
         """Record only memories that reached the final injected context."""
 
-        return await asyncio.to_thread(self._guard_operation_sync, self._mark_injected_sync, memory_ids, when)
+        return await asyncio.to_thread(self._mark_injected_sync, memory_ids, when)
 
     def _mark_injected_sync(self, memory_ids: list[str], when: str = "") -> int:
         ids = list(
@@ -11396,7 +11321,7 @@ class MemoryStore:
         stats: dict[str, Any],
     ) -> str:
         return await asyncio.to_thread(
-            self._guard_operation_sync, self._add_import_batch_sync, source_plugin, source_path, mode, stats
+            self._add_import_batch_sync, source_plugin, source_path, mode, stats
         )
 
     def _add_import_batch_sync(

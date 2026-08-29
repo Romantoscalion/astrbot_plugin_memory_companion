@@ -279,17 +279,13 @@ class MemoryCompanionService:
         self.classifier = MemoryClassifier(
             capture_min_chars=self.config.int("memory_capture.capture_min_chars", 2)
         )
-        self.injection = InjectionComposer(
-            instruction_relax=self.config.bool("memory_injection.relax_instruction", False)
-        )
+        self.injection = InjectionComposer()
         self.summarizer = MemorySummarizer(
             max_input_chars=self.config.int("memory_summary.max_input_chars", 6000),
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),
             provider_timeout_seconds=self.config.int("memory_summary.provider_timeout_seconds", 180),
         )
-        self.importance = ImportanceEvaluator(
-            mention_policy_relax=self.config.bool("memory_capture.relax_mention_policy", False)
-        )
+        self.importance = ImportanceEvaluator()
         self._summary_locks: dict[str, asyncio.Lock] = {}
         self._summary_lock_ts: dict[str, float] = {}
         self._summary_workers: dict[str, asyncio.Task[Any]] = {}
@@ -911,12 +907,7 @@ class MemoryCompanionService:
             # 关于本轮回复的采集写入（写时间线、写关系、抽取事实、调度向量化等）
             # 对"本轮要不要出回复"毫无贡献，移入后台执行，不阻塞请求关键路径。
             # 对应 optimization_plan.md §3.2「把写操作移出请求关键路径」。
-            # 必须经 _spawn_background 注册进 _background_tasks，否则 terminate 时
-            # 无法 cancel 该任务，会在 store 半关闭状态下继续写 DB（exit=139 根因之一）。
-            self._spawn_background(
-                self._capture_async(ctx, event, req, reply_chain),
-                label="capture-async",
-            )
+            asyncio.create_task(self._capture_async(ctx, event, req, reply_chain))
         stage_timer.mark("finalize")
         self._emit_hook_stage_timing(stage_timer, ctx, note="ok")
 
@@ -3458,11 +3449,6 @@ class MemoryCompanionService:
             private_topology_enabled=self._scope_feature_enabled("private", "topology"),
             group_topology_enabled=self._scope_feature_enabled("group", "topology"),
             usage_recorder=self._record_token_usage,
-            relax_keyword_min_hits=self.config.bool("retrieval_advanced.relax_keyword_min_hits", False),
-            proactive_message_score_penalty=self.config.float(
-                "retrieval_advanced.proactive_message_score_penalty", 1.0
-            ),
-            dedupe_content_ratio=self.config.float("retrieval_advanced.dedupe_content_ratio", 0.0),
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -3947,6 +3933,10 @@ class MemoryCompanionService:
 
     def _schedule_memory_embedding(self, memory_id: str, record: MemoryRecord | None = None) -> None:
         if not self.config.bool("retrieval.embedding_enabled", False):
+            return
+        # Bot Personal archive rows are served by their dedicated bridge. The
+        # display-reference text is not a normal memory document.
+        if record is not None and clean_text(record.source_plugin, 120) == "bot_personal_bridge":
             return
         memory_id = clean_text(memory_id, 120)
         if not memory_id or memory_id in self._embedding_memory_inflight:
@@ -10286,11 +10276,6 @@ class MemoryCompanionService:
 
         if confidence < 0.5:
             return "uncertain", "low_confidence"
-        # 逃生开关（本地补丁 / PR）：关闭 tone 表达抽象后，所有记忆直接以正文注入。
-        # 默认开启保持作者逻辑；关闭后跳过 tone 判定（统一返回 candidate），
-        # 避免 conversation_summary 等记忆主力被折叠成「语气提示」占位、模型无法引用。
-        if not self.config.bool("memory_injection.enable_tone_abstraction", True):
-            return ("candidate", "tone_abstraction_disabled")
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
         companion_cap_reason = self._companion_memory_mention_cap(ctx, explicit_memory=explicit_memory)
@@ -10343,10 +10328,6 @@ class MemoryCompanionService:
                 return "tone", "open_loop_tone_only"
             return "mention", "open_loop_or_emotional_debt"
         if decision.layer in {"recent_context", "current_correction", "low_information", "short_context_followup"}:
-            # relax：route_layer 命中的记忆从 tone 提为 candidate（给内容但标注条件候选），
-            # 默认关闭时行为与历史版本完全一致。
-            if self.config.bool("memory_injection.relax_route_layer_tone", False):
-                return "candidate", f"route_layer:{decision.layer}"
             return "tone", f"route_layer:{decision.layer}"
         if decision.layer == "current_state_chat":
             return "mention", "current_state_recent_context"
@@ -11460,12 +11441,6 @@ class MemoryCompanionService:
         for task in list(self._background_tasks):
             task.cancel()
         self._background_tasks.clear()
-        for task in list(self._summary_workers.values()):
-            task.cancel()
-        self._summary_workers.clear()
-        self._summary_pending.clear()
-        self._summary_pending_contexts.clear()
-        self._summary_pending_reasons.clear()
         self._save_token_usage(force=True)
         try:
             self.store.close()
@@ -11473,25 +11448,6 @@ class MemoryCompanionService:
             logger.warning("[MemoryCompanion] 关闭记忆库连接失败: %s", exc, exc_info=True)
         finally:
             self._closed = True
-
-    def shutdown_evidence(self) -> dict[str, Any]:
-        """Return structured evidence of resource state after shutdown.
-
-        Consumed by ``terminate()`` to emit an actionable ``shutdown_complete``
-        log (exit=139 fix: F4). Any non-zero field means a task or DB operation
-        was still in flight when the store closed.
-        """
-        store_state = {}
-        try:
-            store_state = self.store.shutdown_state()
-        except Exception:
-            store_state = {"error": "store_shutdown_state_unavailable"}
-        return {
-            "background_tasks": len(self._background_tasks),
-            "summary_workers": len(self._summary_workers),
-            "summary_pending": len(self._summary_pending),
-            "store": store_state,
-        }
 
     async def aclose(self) -> None:
         if self._closed:
@@ -11504,22 +11460,6 @@ class MemoryCompanionService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
-        # 显式等待总结 worker 归零：_summary_workers 是独立 dict，即使其任务已
-        # 经 _spawn_background 注册，也要确保所有 worker 取消并清理完毕，
-        # 避免 close 后仍有总结任务在 store 半关闭状态下执行（exit=139 根因之一）。
-        summary_tasks = [
-            task
-            for task in self._summary_workers.values()
-            if task is not current and not task.done()
-        ]
-        for task in summary_tasks:
-            task.cancel()
-        if summary_tasks:
-            await asyncio.gather(*summary_tasks, return_exceptions=True)
-        self._summary_workers.clear()
-        self._summary_pending.clear()
-        self._summary_pending_contexts.clear()
-        self._summary_pending_reasons.clear()
         self._save_token_usage(force=True)
         try:
             await asyncio.to_thread(self.store.close)
