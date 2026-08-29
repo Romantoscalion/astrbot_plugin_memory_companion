@@ -662,6 +662,12 @@
         "hint": "默认关闭（措辞与旧版一致）。开启后，<MemoryCompanion-Context> 的 <instruction> 改为允许模型直接自然地引用、呼应或转述注入的记忆条目，而不只是「自然相关时融入」。",
         "type": "bool",
         "default": false
+      },
+      "enable_tone_abstraction": {
+        "description": "启用 tone 表达抽象",
+        "hint": "默认开启（作者逻辑）：被判定为 tone 的记忆只给语气提示、不给正文。关闭后所有记忆直接以正文注入（跳过 tone 检查，统一按条件候选处理），用于避免对话总结等记忆主力被折叠成占位提示、模型无法引用。",
+        "type": "bool",
+        "default": true
       }
     }
   },

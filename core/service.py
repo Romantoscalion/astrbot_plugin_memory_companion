@@ -10146,6 +10146,11 @@ class MemoryCompanionService:
 
         if confidence < 0.5:
             return "uncertain", "low_confidence"
+        # 逃生开关（本地补丁 / PR）：关闭 tone 表达抽象后，所有记忆直接以正文注入。
+        # 默认开启保持作者逻辑；关闭后跳过 tone 判定（统一返回 candidate），
+        # 避免 conversation_summary 等记忆主力被折叠成「语气提示」占位、模型无法引用。
+        if not self.config.bool("memory_injection.enable_tone_abstraction", True):
+            return ("candidate", "tone_abstraction_disabled")
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
         companion_cap_reason = self._companion_memory_mention_cap(ctx, explicit_memory=explicit_memory)
