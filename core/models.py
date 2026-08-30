@@ -39,6 +39,22 @@ def clean_text(value: Any, limit: int = 2000) -> str:
     return text
 
 
+def is_memory_placeholder(memory: Any) -> bool:
+    """Return whether a record is an internal, non-recallable placeholder.
+
+    Bot Personal archives are kept in the memory table so the dedicated
+    profile bridge can serve their structured metadata.  Their display text
+    is only a storage reference, however, and must never behave like a normal
+    memory document.  The content check also catches rows written by older
+    versions before ``source_plugin`` was standardized.
+    """
+    source_plugin = clean_text(getattr(memory, "source_plugin", ""), 120).casefold()
+    if source_plugin == "bot_personal_bridge":
+        return True
+    content = clean_text(getattr(memory, "content", ""), 400).casefold()
+    return bool(re.fullmatch(r"bot personal archive reference \[[^\]]+\]", content))
+
+
 def clamp_float(value: Any, low: float = 0.0, high: float = 1.0, default: float = 0.0) -> float:
     try:
         number = float(value)

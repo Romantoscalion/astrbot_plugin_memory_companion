@@ -26,7 +26,17 @@ from .memory_atom import (
     normalize_validity_status,
     validity_where_clause,
 )
-from .models import EntityRef, MemoryRecord, clean_text, json_dumps, json_loads, new_id, stable_fingerprint, utc_now
+from .models import (
+    EntityRef,
+    MemoryRecord,
+    clean_text,
+    is_memory_placeholder,
+    json_dumps,
+    json_loads,
+    new_id,
+    stable_fingerprint,
+    utc_now,
+)
 from .models import memory_embedding_text_hash
 from .portrait import cross_scene_whitelisted_fact
 from .profile_quality import normalize_profile_value, profile_quality_decision
@@ -52,6 +62,17 @@ class MemoryStore:
     PROFILE_RULE_PORTRAIT_VERSIONS = frozenset(
         {"req036.rule.v1", "req036.rule.v2"}
     )
+
+    # Keep storage-only archive references out of every recall index while
+    # retaining the rows for the dedicated Bot Personal profile bridge.
+    @classmethod
+    def _recallable_memory_sql(cls, alias: str = "") -> str:
+        normalized_alias = clean_text(alias, 40)
+        prefix = f"{normalized_alias}." if normalized_alias else ""
+        return (
+            f"{prefix}source_plugin != 'bot_personal_bridge' AND "
+            f"lower({prefix}content) NOT LIKE 'bot personal archive reference [%]'"
+        )
 
     PROFILE_SINGLE_VALUE_DIMENSIONS = frozenset(
         {
@@ -998,12 +1019,45 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_portrait_learning_queue_person ON portrait_learning_queue(person_id, state, updated_at)"
             )
             self._redact_existing_sensitive_rows_sync()
+            self._cleanup_placeholder_memory_indexes_sync()
             self._conn.execute(
                 """INSERT INTO schema_metadata(key,value,updated_at) VALUES('schema_version',?,?)
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
                 (self.SCHEMA_VERSION, utc_now()),
             )
             self._conn.commit()
+
+    def _cleanup_placeholder_memory_indexes_sync(self) -> int:
+        """Remove historical placeholder entries from recall-only indexes.
+
+        The memory rows themselves are intentionally retained because the
+        Bot Personal bridge reads their structured metadata.  Deleting stale
+        FTS/vector entries is sufficient to keep ordinary recall clean and is
+        safe to repeat during startup.
+        """
+        rows = self._conn.execute(
+            f"SELECT id FROM memories WHERE NOT ({self._recallable_memory_sql()})"
+        ).fetchall()
+        memory_ids = [clean_text(row["id"], 120) for row in rows if clean_text(row["id"], 120)]
+        if not memory_ids:
+            return 0
+        deleted = 0
+        for index in range(0, len(memory_ids), 500):
+            chunk = memory_ids[index : index + 500]
+            marks = ",".join("?" for _ in chunk)
+            deleted += int(
+                self._conn.execute(
+                    f"DELETE FROM memory_embeddings WHERE memory_id IN ({marks})",
+                    chunk,
+                ).rowcount
+                or 0
+            )
+            if self._fts_enabled:
+                self._conn.execute(
+                    f"DELETE FROM memory_fts WHERE memory_id IN ({marks})",
+                    chunk,
+                )
+        return deleted
 
     def _backup_before_schema_upgrade_sync(self) -> str:
         """Create a consistent, private rollback copy before mutating an existing schema."""
@@ -1395,7 +1449,14 @@ class MemoryStore:
                 """
             )
             self._fts_enabled = True
-            memory_count = int(self._conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] or 0)
+            # Placeholder rows remain available to the dedicated Bot Personal
+            # bridge, but are intentionally absent from the recall index.
+            memory_count = int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) FROM memories WHERE {self._recallable_memory_sql()}"
+                ).fetchone()[0]
+                or 0
+            )
             fts_count = int(self._conn.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0] or 0)
             if memory_count != fts_count:
                 self._rebuild_memory_fts_sync()
@@ -1457,7 +1518,9 @@ class MemoryStore:
         if not self._fts_enabled:
             return 0
         self._conn.execute("DELETE FROM memory_fts")
-        rows = self._conn.execute("SELECT * FROM memories").fetchall()
+        rows = self._conn.execute(
+            f"SELECT * FROM memories WHERE {self._recallable_memory_sql()}"
+        ).fetchall()
         count = 0
         for row in rows:
             self._upsert_memory_fts_row(row)
@@ -1481,6 +1544,11 @@ class MemoryStore:
         memory_id = clean_text(row["id"], 120)
         if not memory_id:
             return
+        # Do not index storage-only Bot Personal archive references.  This
+        # also removes stale entries when an existing row changes source.
+        if is_memory_placeholder(MemoryRecord.from_row_light(row)):
+            self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
+            return
         search_text = self._memory_fts_text(row)
         self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
         if search_text:
@@ -1497,6 +1565,8 @@ class MemoryStore:
             self._conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
 
     def _memory_fts_text(self, row: sqlite3.Row) -> str:
+        if is_memory_placeholder(MemoryRecord.from_row_light(row)):
+            return ""
         metadata = json_loads(row["metadata"], {})
         if not isinstance(metadata, dict):
             metadata = {}
@@ -8185,9 +8255,10 @@ class MemoryStore:
         limit: int,
         include_pending: bool,
     ) -> list[Any]:
-        # Bot Personal archive references are served by a dedicated bridge and
-        # are not ordinary memory documents.
-        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge')"
+        # Bot Personal archive references (including legacy rows identified by
+        # their display text) are served by a dedicated bridge and are not
+        # ordinary memory documents.
+        where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()}"
         params: list[Any] = []
         if not include_pending:
             where += " AND review_status != 'pending'"
@@ -8512,7 +8583,7 @@ class MemoryStore:
             params.extend([user_id, user_id])
         if not clauses:
             return []
-        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge') AND (" + " OR ".join(clauses) + ")"
+        where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()} AND (" + " OR ".join(clauses) + ")"
         if not include_pending:
             where += " AND review_status != 'pending'"
         return conn.execute(
@@ -8565,7 +8636,7 @@ class MemoryStore:
         end = clean_text(end_at, 80)
         if not start or not end:
             return []
-        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge')"
+        where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()}"
         params: list[Any] = [start, end, start, end, start, end]
         if not include_pending:
             where += " AND review_status != 'pending'"
@@ -8713,7 +8784,7 @@ class MemoryStore:
         query = self._fts_match_query(terms)
         if not query:
             return []
-        where = "m.lifecycle != 'archived' AND m.source_plugin NOT IN ('bot_personal_bridge')"
+        where = f"m.lifecycle != 'archived' AND {self._recallable_memory_sql('m')}"
         params: list[Any] = [query]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
@@ -8799,7 +8870,7 @@ class MemoryStore:
         if not cleaned_terms:
             return []
 
-        where = "lifecycle != 'archived' AND source_plugin NOT IN ('bot_personal_bridge')"
+        where = f"lifecycle != 'archived' AND {self._recallable_memory_sql()}"
         params: list[Any] = []
         if not include_pending:
             where += " AND review_status != 'pending'"
@@ -8849,7 +8920,7 @@ class MemoryStore:
         return await self._run_recoverable_database_operation(self._recent_memories_sync, limit, include_pending)
 
     def _recent_memories_sync(self, limit: int, include_pending: bool) -> list[MemoryRecord]:
-        where = "source_plugin NOT IN ('bot_personal_bridge')"
+        where = self._recallable_memory_sql()
         if not include_pending:
             where += " AND review_status != 'pending'"
         with self._lock:
@@ -11047,7 +11118,7 @@ class MemoryStore:
             cached = self._embedding_candidate_cache.get(cache_key)
             if cached is not None:
                 return deepcopy(cached)
-        where = "m.lifecycle != 'archived' AND m.source_plugin NOT IN ('bot_personal_bridge') AND e.provider_id=?"
+        where = f"m.lifecycle != 'archived' AND {self._recallable_memory_sql('m')} AND e.provider_id=?"
         params: list[Any] = [provider_id]
         if not include_pending:
             where += " AND m.review_status != 'pending'"
@@ -11150,7 +11221,7 @@ class MemoryStore:
         provider_id = clean_text(provider_id, 160)
         if not provider_id:
             return [], 0, True
-        where = "m.lifecycle != 'archived' AND m.source_plugin NOT IN ('bot_personal_bridge')"
+        where = f"m.lifecycle != 'archived' AND {self._recallable_memory_sql('m')}"
         params: list[Any] = [provider_id]
         if not include_pending:
             where += " AND m.review_status != 'pending'"

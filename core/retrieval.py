@@ -15,6 +15,7 @@ from .models import (
     SearchResult,
     SessionContext,
     clean_text,
+    is_memory_placeholder,
     memory_embedding_text,
     memory_embedding_text_hash,
 )
@@ -199,6 +200,9 @@ class RetrievalEngine:
             if not memory_id or memory_id in seen:
                 continue
             seen.add(memory_id)
+            if is_memory_placeholder(memory):
+                blocked.append({"id": memory_id, "reason": "placeholder_memory", "content": ""})
+                continue
             memory_platform = clean_text(getattr(memory, "platform", ""), 80).lower()
             current_platform = clean_text(getattr(ctx, "platform", ""), 80).lower()
             if memory_platform == "unknown":
@@ -2169,6 +2173,8 @@ class RetrievalEngine:
         ctx: SessionContext,
         acl_state: dict[str, object],
     ) -> tuple[str, str]:
+        if is_memory_placeholder(memory):
+            return "", "placeholder_memory"
         quality_allowed, quality_reason = self._profile_retrieval_decision(memory)
         if not quality_allowed:
             return "", quality_reason

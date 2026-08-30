@@ -148,6 +148,61 @@ class CandidateBundleStoreTests(unittest.IsolatedAsyncioTestCase):
         for key in ("ranked_candidates", "current_window_candidates", "fts_candidates", "keyword_candidates", "time_window_candidates"):
             self.assertNotIn("bot-personal-1", _ids(bundle[key]))
 
+    async def test_legacy_placeholder_content_is_excluded_even_with_old_source(self) -> None:
+        store = self.make_store()
+        self.seed(store)
+        legacy = _memory("legacy-placeholder", "Bot Personal archive reference [schedule_fragment]", importance=1.0)
+        legacy.source_plugin = "memory_companion"
+        store._insert_memory_sync(legacy)
+
+        candidates = await store.list_keyword_candidate_memories(
+            ["schedule_fragment"], limit=50, include_pending=False
+        )
+        self.assertNotIn("legacy-placeholder", _ids(candidates))
+
+    def test_startup_cleans_placeholder_indexes_but_keeps_archive_row(self) -> None:
+        store = self.make_store()
+        bridge_row = _memory("bridge-index", "Bot Personal archive reference [schedule_fragment]")
+        bridge_row.source_plugin = "bot_personal_bridge"
+        store._insert_memory_sync(bridge_row)
+        store._conn.execute(
+            "INSERT INTO memory_fts(memory_id, search_text) VALUES(?, ?)",
+            (bridge_row.id, bridge_row.content),
+        )
+        store._conn.execute(
+            """INSERT INTO memory_embeddings(
+                   memory_id,provider_id,text_hash,dimension,vector,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?)""",
+            (bridge_row.id, "provider", "hash", 1, "[0.1]", "now", "now"),
+        )
+        store._conn.commit()
+
+        store.initialize()
+
+        self.assertIsNotNone(store._conn.execute(
+            "SELECT 1 FROM memories WHERE id=?", (bridge_row.id,)
+        ).fetchone())
+        self.assertIsNone(store._conn.execute(
+            "SELECT 1 FROM memory_fts WHERE memory_id=?", (bridge_row.id,)
+        ).fetchone())
+        self.assertIsNone(store._conn.execute(
+            "SELECT 1 FROM memory_embeddings WHERE memory_id=?", (bridge_row.id,)
+        ).fetchone())
+
+    async def test_direct_candidate_filter_blocks_placeholder_memory(self) -> None:
+        store = self.make_store()
+        bridge_row = _memory("bridge-direct", "Bot Personal archive reference [schedule_fragment]")
+        bridge_row.source_plugin = "bot_personal_bridge"
+        engine = RetrievalEngine(store, VisibilityPolicy())
+
+        visible, blocked = await engine.filter_visible_candidates(
+            [bridge_row],
+            SessionContext(scope="private", session_id="s1", user_id="u1"),
+        )
+
+        self.assertEqual([], visible)
+        self.assertEqual("placeholder_memory", blocked[0]["reason"])
+
     def test_from_row_light_matches_from_row_for_stored_rows(self) -> None:
         store = self.make_store()
         # Seed a record carrying sensitive-looking metadata to prove the light
