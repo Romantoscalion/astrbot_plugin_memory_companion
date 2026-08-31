@@ -285,7 +285,9 @@ class MemoryCompanionService:
             max_summary_chars=self.config.int("memory_summary.max_summary_chars", 1200),
             provider_timeout_seconds=self.config.int("memory_summary.provider_timeout_seconds", 180),
         )
-        self.importance = ImportanceEvaluator()
+        self.importance = ImportanceEvaluator(
+            mention_policy_relax=self.config.bool("memory_capture.relax_mention_policy", False)
+        )
         self._summary_locks: dict[str, asyncio.Lock] = {}
         self._summary_lock_ts: dict[str, float] = {}
         self._summary_workers: dict[str, asyncio.Task[Any]] = {}
@@ -3449,6 +3451,11 @@ class MemoryCompanionService:
             private_topology_enabled=self._scope_feature_enabled("private", "topology"),
             group_topology_enabled=self._scope_feature_enabled("group", "topology"),
             usage_recorder=self._record_token_usage,
+            relax_keyword_min_hits=self.config.bool("retrieval_advanced.relax_keyword_min_hits", False),
+            proactive_message_score_penalty=self.config.float(
+                "retrieval_advanced.proactive_message_score_penalty", 1.0
+            ),
+            dedupe_content_ratio=self.config.float("retrieval_advanced.dedupe_content_ratio", 0.0),
         )
 
     async def _resolve_rerank_provider(self, ctx: SessionContext, *, mode: str) -> tuple[Any, str]:
@@ -10276,6 +10283,11 @@ class MemoryCompanionService:
 
         if confidence < 0.5:
             return "uncertain", "low_confidence"
+        # 总闸：关闭 tone 表达抽象后，跳过后续全部判定，所有记忆直接以正文注入
+        # （candidate）。默认开启保持作者逻辑；关闭后 conversation_summary 等
+        # 记忆主力不再被折叠成「语气提示」占位，模型可直接引用正文。
+        if not self.config.bool("memory_injection.enable_tone_abstraction", True):
+            return ("candidate", "tone_abstraction_disabled")
         text = clean_text(query_text or ctx.message_text, 800)
         explicit_memory = self._message_is_contextual_memory_request(text) or self._message_requests_temporal_aggregate(text)
         companion_cap_reason = self._companion_memory_mention_cap(ctx, explicit_memory=explicit_memory)

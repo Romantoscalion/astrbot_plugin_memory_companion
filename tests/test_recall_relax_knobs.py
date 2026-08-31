@@ -16,7 +16,9 @@ from astrbot_plugin_memory_companion.core.importance import ImportanceEvaluator
 from astrbot_plugin_memory_companion.core.injection import InjectionComposer
 from astrbot_plugin_memory_companion.core.models import EntityRef, MemoryRecord, SearchResult, SessionContext
 from astrbot_plugin_memory_companion.core.retrieval import RetrievalEngine
+from astrbot_plugin_memory_companion.core.service import MemoryCompanionService, MemoryRouteDecision
 from astrbot_plugin_memory_companion.core.store import MemoryStore
+from astrbot_plugin_memory_companion.core.time_intent import TimeIntent
 from astrbot_plugin_memory_companion.core.visibility import VisibilityPolicy
 
 
@@ -102,29 +104,62 @@ class MentionPolicyRelaxTests(unittest.TestCase):
             )
 
 
-class InstructionRelaxTests(unittest.TestCase):
+class ToneAbstractionToggleTests(unittest.IsolatedAsyncioTestCase):
+    def make_service(self, tone_abstraction: bool) -> MemoryCompanionService:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        service = MemoryCompanionService(
+            context=None,
+            config={"memory_injection": {"enable_tone_abstraction": tone_abstraction}},
+            plugin_root=ROOT,
+            data_dir=Path(temp_dir.name),
+        )
+        self.addCleanup(service.close)
+        return service
+
     @staticmethod
-    def compose_instruction(relax: bool) -> str:
-        composer = InjectionComposer(instruction_relax=relax)
+    def _decide(service: MemoryCompanionService) -> tuple[str, str]:
         ctx = SessionContext(
             session_id="qq:FriendMessage:u1",
             scope="private",
             platform="qq",
             user_id="u1",
-            message_text="hi",
+            bot_id="b1",
+            message_text="随便聊聊",
         )
-        memory = MemoryRecord(id="m1", memory_type="observation", content="测试记忆。")
-        injected = composer.compose(ctx, [SearchResult(memory=memory, score=1.0)], max_chars=4000)
-        match = re.search(r"<instruction>(.*?)</instruction>", injected, re.S)
-        return match.group(1) if match else injected
+        memory = MemoryRecord(
+            id="s1",
+            memory_type="conversation_summary",
+            subject=EntityRef(kind="user", id="u1", name="user"),
+            object=EntityRef.bot_self("b1"),
+            scope="private",
+            session_id="qq:FriendMessage:u1",
+            visibility="private_pair",
+            reality_level="llm_summary",
+            lifecycle="stable_memory",
+            content="用户和 Bot 昨天聊了特调配方。",
+            confidence=0.72,
+            importance=0.9,
+        )
+        item = SearchResult(memory=memory, score=1.2)
+        decision = MemoryRouteDecision(layer="current_message")
+        return service._memory_expression_decision(
+            ctx, memory, item, "conversation_summary", decision, TimeIntent()
+        )
 
-    def test_instruction_relax_changes_wording(self) -> None:
-        """relax 开启后 instruction 允许模型直接引用注入条目。"""
-        strict = self.compose_instruction(False)
-        relaxed = self.compose_instruction(True)
-        self.assertIn("旧记忆只在自然相关时融入", strict)
-        self.assertIn("可以直接自然地引用、呼应或转述", relaxed)
-        self.assertNotIn("可以直接自然地引用、呼应或转述", strict)
+    async def test_toggle_off_returns_candidate_for_summary(self) -> None:
+        """总闸关闭后，非显式回忆的总结记忆直接给正文（candidate），不再折叠为 tone。"""
+        service = self.make_service(tone_abstraction=False)
+        expression, reason = self._decide(service)
+        self.assertEqual("candidate", expression)
+        self.assertEqual("tone_abstraction_disabled", reason)
+
+    async def test_toggle_on_summary_non_explicit_is_tone(self) -> None:
+        """总闸默认开启（作者逻辑）：非显式回忆的总结记忆仍折叠为 tone 占位。"""
+        service = self.make_service(tone_abstraction=True)
+        expression, reason = self._decide(service)
+        self.assertEqual("tone", expression)
+        self.assertIn("conversation_continuity_background", reason)
 
 
 class KeywordMinHitsRelaxTests(unittest.TestCase):
